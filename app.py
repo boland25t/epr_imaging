@@ -9,9 +9,9 @@ from main_window import MainWindow
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("Video + Sensor Configuration Tool")
+    app.setApplicationName("EPR Video + Sensor Processing Tool")
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     return app.exec()
 
 
