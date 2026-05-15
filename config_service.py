@@ -46,20 +46,28 @@ class ConfigService:
         navigation_file: NavigationConfig | None = None,
         output_directory: str | Path | None = None,
         frame_rate: float | None = None,
-        run_metashape: bool | None = None,
         generate_sensor_rasters: bool | None = None,
         annotate_frames: bool | None = None,
-        metashape_exec: str | None = None,
+        depth_source: SensorFileConfig | None = None,
+        speed_source: SensorFileConfig | None = None,
+        altitude_threshold: float | None = None,
+        depth_threshold: float | None = None,
+        speed_threshold: float | None = None,
+        min_segment_frames: int | None = None,
     ) -> None:
         payload = {
             "video_directory": str(video_directory),
             "video_filename_time_format": video_filename_time_format,
             "output_directory": str(output_directory) if output_directory else None,
             "frame_rate": frame_rate,
-            "run_metashape": run_metashape,
             "generate_sensor_rasters": generate_sensor_rasters,
             "annotate_frames": annotate_frames,
-            "metashape_exec": metashape_exec,
+            "altitude_threshold": altitude_threshold,
+            "depth_threshold": depth_threshold,
+            "speed_threshold": speed_threshold,
+            "min_segment_frames": min_segment_frames,
+            "depth_source": depth_source.to_dict() if depth_source else None,
+            "speed_source": speed_source.to_dict() if speed_source else None,
             "videos": [video.to_dict() for video in videos],
             "navigation_file": navigation_file.to_dict() if navigation_file else None,
             "sensor_files": [sensor.to_dict() for sensor in sensor_files],
@@ -79,11 +87,21 @@ class ConfigService:
         selected_intervals: list[SelectedTimeRange],
         output_directory: str,
         frame_rate: float,
-        run_metashape: bool,
         generate_sensor_tiffs: bool,
         annotate_frames: bool,
-        metashape_executable: str,
         frame_quality: str = "Original",
+        depth_source: SensorFileConfig | None = None,
+        speed_source: SensorFileConfig | None = None,
+        altitude_threshold: float | None = None,
+        depth_threshold: float | None = None,
+        speed_threshold: float | None = None,
+        min_segment_frames: int = 1,
+        applied_steps: list[str] | None = None,
+        sampling_mode: str = "fixed",
+        dynamic_target_spacing_m: float = 2.0,
+        dynamic_min_frequency_hz: float = 0.1,
+        clahe_clip_limit: float = 2.0,
+        clahe_tile_grid_size: int = 8,
     ) -> None:
         base = Path(path).resolve().parent
 
@@ -113,11 +131,21 @@ class ConfigService:
             "selected_intervals": [interval.to_dict() for interval in selected_intervals],
             "output_directory": _to_relative(output_directory, base) or output_directory,
             "frame_rate": frame_rate,
-            "run_metashape": run_metashape,
             "generate_sensor_tiffs": generate_sensor_tiffs,
             "annotate_frames": annotate_frames,
-            "metashape_executable": metashape_executable,
             "frame_quality": frame_quality,
+            "altitude_threshold": altitude_threshold,
+            "depth_threshold": depth_threshold,
+            "speed_threshold": speed_threshold,
+            "min_segment_frames": min_segment_frames,
+            "depth_source": rel_sensor_file(depth_source) if depth_source else None,
+            "speed_source": rel_sensor_file(speed_source) if speed_source else None,
+            "applied_steps": applied_steps or [],
+            "sampling_mode": sampling_mode,
+            "dynamic_target_spacing_m": dynamic_target_spacing_m,
+            "dynamic_min_frequency_hz": dynamic_min_frequency_hz,
+            "clahe_clip_limit": clahe_clip_limit,
+            "clahe_tile_grid_size": clahe_tile_grid_size,
         }
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -141,6 +169,9 @@ class ConfigService:
         video_dir = _resolve(data.get("video_directory"), base)
         output_dir = _resolve(data.get("output_directory"), base)
 
+        depth_source = ConfigService._load_sensor_file(data["depth_source"], base) if data.get("depth_source") else None
+        speed_source = ConfigService._load_sensor_file(data["speed_source"], base) if data.get("speed_source") else None
+
         return {
             "video_directory": str(video_dir) if video_dir else "",
             "filename_datetime_format": data.get("filename_datetime_format", ""),
@@ -149,11 +180,21 @@ class ConfigService:
             "selected_intervals": selected_intervals,
             "output_directory": str(output_dir) if output_dir else "",
             "frame_rate": float(data.get("frame_rate", 1.0)),
-            "run_metashape": bool(data.get("run_metashape", False)),
             "generate_sensor_tiffs": bool(data.get("generate_sensor_tiffs", True)),
             "annotate_frames": bool(data.get("annotate_frames", False)),
-            "metashape_executable": data.get("metashape_executable", ""),
             "frame_quality": data.get("frame_quality", "Original"),
+            "altitude_threshold": data.get("altitude_threshold"),
+            "depth_threshold": data.get("depth_threshold"),
+            "speed_threshold": data.get("speed_threshold"),
+            "min_segment_frames": int(data.get("min_segment_frames", 1)),
+            "depth_source": depth_source,
+            "speed_source": speed_source,
+            "applied_steps": ConfigService._detect_applied_steps(output_dir) if output_dir else data.get("applied_steps", []),
+            "sampling_mode": data.get("sampling_mode", "fixed"),
+            "dynamic_target_spacing_m": float(data.get("dynamic_target_spacing_m", 2.0)),
+            "dynamic_min_frequency_hz": float(data.get("dynamic_min_frequency_hz", 0.1)),
+            "clahe_clip_limit": float(data.get("clahe_clip_limit", 2.0)),
+            "clahe_tile_grid_size": int(data.get("clahe_tile_grid_size", 8)),
         }
 
     @staticmethod
@@ -186,6 +227,15 @@ class ConfigService:
         )
 
     @staticmethod
+    def _parse_dt(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
     def _load_interval(data: dict) -> SelectedTimeRange:
         return SelectedTimeRange(
             start_time=datetime.fromisoformat(data["start_time"]),
@@ -193,5 +243,22 @@ class ConfigService:
         )
 
     @staticmethod
-    def _parse_dt(value: str | None):
-        return datetime.fromisoformat(value) if value else None
+    def _detect_applied_steps(output_dir: Path) -> list[str]:
+        applied = set()
+        if not output_dir.exists():
+            return []
+        for segment_dir in output_dir.iterdir():
+            if segment_dir.is_dir() and segment_dir.name.startswith("segment_"):
+                frames_dir = segment_dir / "frames"
+                sensors_dir = segment_dir / "sensors"
+                annotated_dir = segment_dir / "frames_annotated"
+                master_csv = segment_dir / "master.csv"
+                if frames_dir.exists() and any(frames_dir.glob("*.jpg")):
+                    applied.add("extract_frames")
+                if master_csv.exists():
+                    applied.add("generate_sensor_rasters")  # assuming master implies rasters
+                if sensors_dir.exists() and any(sensors_dir.glob("*.tif")):
+                    applied.add("generate_sensor_rasters")
+                if annotated_dir.exists() and any(annotated_dir.glob("*.jpg")):
+                    applied.add("annotate_frames")
+        return sorted(applied)

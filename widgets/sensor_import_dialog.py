@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import pandas as pd
+
 from models import SensorChannel, SensorFileConfig
 from sensor_service import SensorService
 
@@ -32,6 +34,7 @@ class SensorImportDialog(QDialog):
         self.setWindowTitle("Add Sensor Channel")
         self.resize(900, 600)
         self._result_config: SensorFileConfig | None = None
+        self._full_preview_df = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -59,6 +62,9 @@ class SensorImportDialog(QDialog):
 
         source_form.addRow("CSV file:", path_row)
         source_form.addRow("Timestamp column:", self.timestamp_combo)
+        self.timestamp_parsed_label = QLabel("—")
+        self.timestamp_parsed_label.setStyleSheet("color: gray; font-size: 10px;")
+        source_form.addRow("Parsed as:", self.timestamp_parsed_label)
         source_form.addRow("Value column:", self.value_combo)
         source_form.addRow("Channel name:", self.display_name_edit)
         source_form.addRow("Units:", self.units_edit)
@@ -81,6 +87,7 @@ class SensorImportDialog(QDialog):
         layout.addWidget(buttons)
 
         self.browse_button.clicked.connect(self._browse_file)
+        self.timestamp_combo.currentTextChanged.connect(self._update_timestamp_preview)
         self.value_combo.currentTextChanged.connect(self._sync_default_name)
 
     def _browse_file(self) -> None:
@@ -91,11 +98,34 @@ class SensorImportDialog(QDialog):
         try:
             preview_df = SensorService.read_preview(path, nrows=5)
             columns = SensorService.read_columns(path)
+            self._full_preview_df = SensorService.read_preview(path, nrows=20)
         except Exception as exc:
             QMessageBox.critical(self, "Failed to read CSV", str(exc))
             return
         self._populate_preview_table(preview_df)
         self._populate_column_combos(columns)
+
+    def _update_timestamp_preview(self, column: str) -> None:
+        if not hasattr(self, "_full_preview_df") or not column or column not in self._full_preview_df.columns:
+            self.timestamp_parsed_label.setText("—")
+            return
+        try:
+            normalized = SensorService.normalize_timestamps(self._full_preview_df[column])
+            valid = normalized.dropna()
+            if valid.empty:
+                self.timestamp_parsed_label.setText("No valid timestamps found")
+                self.timestamp_parsed_label.setStyleSheet("color: red; font-size: 10px;")
+                return
+            t_min = pd.to_datetime(valid.min(), unit="s")
+            t_max = pd.to_datetime(valid.max(), unit="s")
+            raw_sample = self._full_preview_df[column].iloc[0]
+            text = f"{t_min.strftime('%Y-%m-%d %H:%M:%S')}  →  {t_max.strftime('%Y-%m-%d %H:%M:%S')}  (raw sample: {raw_sample})"
+            ok = t_min.year >= 2000
+            self.timestamp_parsed_label.setText(text)
+            self.timestamp_parsed_label.setStyleSheet(f"color: {'#2ca02c' if ok else 'red'}; font-size: 10px;")
+        except Exception as exc:
+            self.timestamp_parsed_label.setText(f"Parse error: {exc}")
+            self.timestamp_parsed_label.setStyleSheet("color: red; font-size: 10px;")
 
     def _populate_preview_table(self, df) -> None:
         self.preview_table.clear()

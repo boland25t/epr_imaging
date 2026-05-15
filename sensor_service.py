@@ -40,16 +40,20 @@ class SensorService:
             if finite.empty:
                 return cleaned
             median = float(np.nanmedian(finite))
-            if median > 1e14:
+            if median > 1e16:     # nanoseconds  (~1.74e18 for 2026)
                 return cleaned / 1e9
-            if median > 1e11:
+            if median > 1e13:     # microseconds (~1.74e15 for 2026)
+                return cleaned / 1e6
+            if median > 1e10:     # milliseconds (~1.74e12 for 2026)
                 return cleaned / 1e3
-            return cleaned
+            return cleaned        # seconds      (~1.74e9  for 2026)
 
         dt = pd.to_datetime(series, errors="coerce", utc=False)
-        ints = dt.astype("int64", copy=False)
+        unit = np.datetime_data(dt.dtype)[0]  # "ns", "us", "ms", or "s"
+        scale = {"ns": 1e9, "us": 1e6, "ms": 1e3, "s": 1.0}.get(unit, 1e9)
+        ints = dt.astype("int64")
         ints = ints.where(dt.notna(), np.nan)
-        return ints / 1e9
+        return ints / scale
 
     @staticmethod
     def build_config(
