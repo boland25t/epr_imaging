@@ -7,8 +7,18 @@
 
 from __future__ import annotations
 
+import os
 import sys  # Needed to pass command-line arguments to QApplication and to exit cleanly.
 
+# WSL2 exposes both WAYLAND_DISPLAY and DISPLAY simultaneously.  Qt 6.7+ prefers
+# Wayland when both are present, but WSLg's Wayland compositor causes the window
+# to render blank (invisible), ignore input, and flash red in the taskbar.
+# Forcing XCB (X11) avoids this without affecting non-WSL systems.
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+from pathlib import Path
+
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication  # The root Qt object; exactly one must exist per process.
 
 from main_window import MainWindow  # The single top-level window that contains all UI and logic.
@@ -29,7 +39,13 @@ def main() -> int:
 
     # Application name shown in window title bars, OS task-switchers, and
     # platform-specific "About" dialogs.
-    app.setApplicationName("EPR Video + Sensor Processing Tool")
+    app.setApplicationName("Sampling Tool")
+
+    # Set the window icon so WSLg passes the WHOI logo to the Windows taskbar
+    # thumbnail instead of the default Linux penguin.
+    icon_path = Path(__file__).parent / "whoilogo.png"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
 
     # Build the main window.  The constructor wires all child widgets and
     # connects all internal signals before the window is visible.

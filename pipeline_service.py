@@ -50,7 +50,7 @@ from scipy.interpolate import griddata      # Scattered-point spatial interpolat
 # Internal imports
 # ---------------------------------------------------------------------------
 from dynamicsampling import create_dynamic_sample_schedule  # Distance-adaptive frame schedule
-from models import AnnotationConfig, NavigationConfig, SegmentRecord, SelectedTimeRange, SensorFileConfig, VideoRecord
+from models import AnnotationConfig, NavigationConfig, SegmentRecord, SelectedTimeRange, SensorFileConfig, ThresholdConfig, VideoRecord
 from sensor_service import SensorService   # Timeseries loading and linear interpolation helpers
 from video_service import VideoService     # Directory scan + filename-based start-time parsing
 
@@ -100,15 +100,15 @@ class PipelineConfig:
     # MainWindow before calling run(); segment subdirectories go inside it.
     output_directory: Path
 
-    # Serial number of the job being run.  Stored in SegmentRecord so the
-    # history can group segments by job.
-    job_id: int = 0
-
     # strptime-style format string the user typed into the "Filename format"
     # field (e.g. "%Y_%m_%dT%H_%M_%S").  Passed directly to VideoService so
     # it can try the user's format before falling back to COMMON_PATTERNS.
     # An empty string means "use auto-detection only".
     video_filename_time_format: str
+
+    # Serial number of the job being run.  Stored in SegmentRecord so the
+    # history can group segments by job.
+    job_id: int = 0
 
     # -----------------------------------------------------------------------
     # Pre-loaded data
@@ -212,11 +212,19 @@ class PipelineConfig:
     # List of processing step names that are enabled for this run.
     # Possible values: "extract_frames", "generate_sensor_rasters",
     #   "annotate_frames", "apply_clahe", "generate_geo_txt",
-    #   "update_master", "interpolate_only".
+    #   "update_master", "interpolate_only", "build_full_interp".
     # The pipeline checks membership in this list to gate each step, which
     # allows re-running only specific steps on existing output directories
     # without re-extracting frames.
     selected_steps: list[str] = field(default_factory=lambda: ["extract_frames", "generate_sensor_rasters", "annotate_frames"])
+
+    # Sample rate (Hz) used when building the full-dataset interp_full.csv.
+    # Only used when "build_full_interp" is in selected_steps.
+    full_interp_sample_hz: float = 1.0
+
+    # Workspace directory path — interp_full.csv is written here so it lives
+    # alongside workspace.json rather than inside a per-job subfolder.
+    workspace_directory: str = ""
 
     # -----------------------------------------------------------------------
     # CLAHE parameters
@@ -266,8 +274,9 @@ class PipelineConfig:
     # block is placed, and how it looks.  None falls back to legacy defaults.
     annotation_config: AnnotationConfig | None = None
 
-    # JPEG quality setting passed to cv2.imwrite() — future use.  Currently
-    # hardcoded to 90 inside the extraction methods.
+    # JPEG quality used for all cv2.imwrite() calls.
+    # "Original" copies frames without re-encoding (saves at 95 JPEG quality).
+    # Other options compress to the specified quality level.
     frame_quality: str = "Original"
 
 
@@ -362,9 +371,13 @@ class PipelineService:
         # If MainWindow pre-loaded VideoRecords, use those directly.  If not
         # (e.g. running from a saved workspace), scan the directory now.
         # -----------------------------------------------------------------
-        videos = config.videos or VideoService(config.video_filename_time_format).scan_directory(config.video_directory)[0]
-        if not videos:
-            raise ValueError("No videos available to process.")
+        # build_full_interp operates entirely on nav/sensor data — no videos needed.
+        if config.selected_steps == ["build_full_interp"]:
+            videos = []
+        else:
+            videos = config.videos or VideoService(config.video_filename_time_format).scan_directory(config.video_directory)[0]
+            if not videos:
+                raise ValueError("No videos available to process.")
 
         # -----------------------------------------------------------------
         # Step 2: Resolve the interval list
@@ -372,12 +385,17 @@ class PipelineService:
         # synthesise a single interval spanning all videos so the pipeline
         # processes everything.
         # -----------------------------------------------------------------
-        intervals = config.selected_intervals or [
-            SelectedTimeRange(
-                start_time=min(video.start_time for video in videos),
-                end_time=max(video.end_time for video in videos),
-            )
-        ]
+        if config.selected_intervals:
+            intervals = config.selected_intervals
+        elif videos:
+            intervals = [
+                SelectedTimeRange(
+                    start_time=min(video.start_time for video in videos),
+                    end_time=max(video.end_time for video in videos),
+                )
+            ]
+        else:
+            intervals = []
 
         # -----------------------------------------------------------------
         # Step 3: Determine which pipeline steps are enabled
@@ -387,21 +405,25 @@ class PipelineService:
         # -----------------------------------------------------------------
         selected_steps = config.selected_steps or ["extract_frames", "generate_sensor_rasters", "annotate_frames"]
 
-        # sensor_only is True when the user wants a interp.csv without images,
-        # either by unchecking "Sample Images" or by explicitly choosing the
-        # "interpolate_only" step.
-        sensor_only = not config.sample_images or "interpolate_only" in selected_steps
+        # sensor_only: build a dense interp.csv at sample_rate with no image
+        # extraction or image post-processing.  Triggered explicitly via the
+        # "interpolate_only" step (set by _build_pipeline_config when
+        # sample_images is unchecked on the main Execute path).
+        # Post-processing runs (CLAHE, annotate, etc.) must NOT set sensor_only
+        # even when sample_images is False — those steps operate on existing frames.
+        sensor_only = "interpolate_only" in selected_steps
 
         # Individual step flags; sensor_only overrides image-related steps.
-        run_extract      = "extract_frames"          in selected_steps and not sensor_only
-        run_update_master= "update_master"           in selected_steps or sensor_only
-        run_rasters      = "generate_sensor_rasters" in selected_steps and not sensor_only
-        run_annotate     = "annotate_frames"         in selected_steps and not sensor_only
-        run_clahe        = "apply_clahe"             in selected_steps and not sensor_only
-        run_geo_txt      = "generate_geo_txt"        in selected_steps and not sensor_only
+        run_extract       = "extract_frames"          in selected_steps and not sensor_only
+        run_update_master = "update_master"           in selected_steps or sensor_only
+        run_rasters       = "generate_sensor_rasters" in selected_steps and not sensor_only
+        run_annotate      = "annotate_frames"         in selected_steps and not sensor_only
+        run_clahe         = "apply_clahe"             in selected_steps and not sensor_only
+        run_geo_txt       = "generate_geo_txt"        in selected_steps and not sensor_only
+        run_full_interp   = "build_full_interp"       in selected_steps
 
         # Guard: at least one step must be active, otherwise there's nothing to do.
-        if not any((run_extract, run_update_master, run_rasters, run_annotate, run_clahe, run_geo_txt, sensor_only)):
+        if not any((run_extract, run_update_master, run_rasters, run_annotate, run_clahe, run_geo_txt, sensor_only, run_full_interp)):
             raise ValueError("At least one processing step must be selected.")
 
         # -----------------------------------------------------------------
@@ -410,9 +432,9 @@ class PipelineService:
         # sensor-only interp.csv already exists.
         # -----------------------------------------------------------------
         has_thresholds = (
-            bool(config.altitude_threshold) or
-            bool(config.depth_threshold) or
-            bool(config.speed_threshold) or
+            config.altitude_threshold is not None or
+            config.depth_threshold    is not None or
+            config.speed_threshold    is not None or
             bool(config.sensor_thresholds)
         )
 
@@ -436,6 +458,25 @@ class PipelineService:
             if config.navigation_file.altitude_source:
                 self._emit_log(config, f"Loading altitude source: {config.navigation_file.altitude_source.csv_path}")
                 nav_sources["alt"] = SensorService.load_time_value_dataframe(config.navigation_file.altitude_source)
+
+            if config.navigation_file.depth_source:
+                self._emit_log(config, f"Loading depth source: {config.navigation_file.depth_source.csv_path}")
+                nav_sources["water_depth"] = SensorService.load_time_value_dataframe(
+                    config.navigation_file.depth_source,
+                    negate=getattr(config.navigation_file, "negate_depth", False),
+                )
+
+            if config.navigation_file.heading_source:
+                self._emit_log(config, f"Loading heading source: {config.navigation_file.heading_source.csv_path}")
+                nav_sources["heading"] = SensorService.load_time_value_dataframe(config.navigation_file.heading_source)
+
+            if config.navigation_file.pitch_source:
+                self._emit_log(config, f"Loading pitch source: {config.navigation_file.pitch_source.csv_path}")
+                nav_sources["pitch"] = SensorService.load_time_value_dataframe(config.navigation_file.pitch_source)
+
+            if config.navigation_file.roll_source:
+                self._emit_log(config, f"Loading roll source: {config.navigation_file.roll_source.csv_path}")
+                nav_sources["roll"] = SensorService.load_time_value_dataframe(config.navigation_file.roll_source)
 
         self._emit_progress(config, 15)
         self._emit_status(config, "Navigation sources loaded.")
@@ -503,34 +544,37 @@ class PipelineService:
                 segment_dir.mkdir(parents=True, exist_ok=True)
                 sensors_dir.mkdir(parents=True, exist_ok=True)
 
-                # Log a notice if a interp.csv already exists; we overwrite it.
-                master_exists = interp_csv.exists()
-                if master_exists and not run_update_master:
-                    self._emit_log(config, f"Sensor-only master already exists for interval {idx + 1}; updating.")
-
-                # Build a synthetic frame_df — a table of unix_times at which
-                # to evaluate all sensor timeseries.  No actual frames are read.
-                if config.sampling_mode == "dynamic" and nav_sources:
-                    # Dynamic mode: use GPS distance to pick sample times.
-                    self._emit_substatus(config, "Computing dynamic sample schedule...")
-                    dynamic_times = self._get_dynamic_sample_times(nav_sources, interval, config)
-                    self._emit_log(config, f"Dynamic sampling: {len(dynamic_times)} target frames for interval {idx + 1}")
-                    frame_df = self._create_dynamic_sample_df(videos, dynamic_times)
+                # If real frames already exist in this segment, re-interpolate
+                # on the existing interp.csv rows so frame_filename is preserved.
+                # Only build from synthetic timestamps when no frames exist yet.
+                frames_exist = frames_dir.exists() and any(frames_dir.glob("*.jpg"))
+                if frames_exist and interp_csv.exists():
+                    master_df = pd.read_csv(interp_csv)
+                    master_df = self._update_master_dataframe(master_df, nav_sources, sensor_frames)
+                    master_df.to_csv(interp_csv, index=False)
+                    self._emit_log(config, f"  interp.csv → {interp_csv} (updated, frame_filename preserved)")
+                    self._emit_status(config, f"interp.csv updated ({len(master_df)} rows).")
                 else:
-                    # Fixed mode: evenly space sample times across the interval.
-                    frame_df = self._create_sampled_frame_df(videos, interval, config.frame_rate)
+                    # Build a synthetic frame_df — a table of unix_times at which
+                    # to evaluate all sensor timeseries.  No actual frames are read.
+                    if config.sampling_mode == "dynamic" and nav_sources:
+                        self._emit_substatus(config, "Computing dynamic sample schedule...")
+                        dynamic_times = self._get_dynamic_sample_times(nav_sources, interval, config)
+                        self._emit_log(config, f"Dynamic sampling: {len(dynamic_times)} target frames for interval {idx + 1}")
+                        frame_df = self._create_dynamic_sample_df(videos, dynamic_times)
+                    else:
+                        frame_df = self._create_sampled_frame_df(videos, interval, config.frame_rate)
 
-                if frame_df.empty:
-                    self._emit_log(config, f"No sample times for interval {idx + 1}; skipping.")
-                    continue
+                    if frame_df.empty:
+                        self._emit_log(config, f"No sample times for interval {idx + 1}; skipping.")
+                        continue
 
-                # Interpolate nav + sensor columns at each sample time and
-                # write the resulting table to interp.csv.
-                master_df = self._build_master_dataframe(frame_df, nav_sources, sensor_frames)
-                master_df.to_csv(interp_csv, index=False)
-                self._emit_log(config, f"  interp.csv → {interp_csv}")
+                    master_df = self._build_master_dataframe(frame_df, nav_sources, sensor_frames)
+                    master_df.to_csv(interp_csv, index=False)
+                    self._emit_log(config, f"  interp.csv → {interp_csv}")
+                    self._emit_status(config, f"Sensor-only interp.csv written ({len(master_df)} rows, no images).")
+
                 self._emit_progress(config, 60)
-                self._emit_status(config, f"Sensor-only interp.csv written ({len(master_df)} rows, no images).")
                 produced_dirs.append(segment_dir)
                 self._emit_segment_completed(config, interval, segment_dir, "completed")
                 continue  # Jump to the next interval; no more steps in this path.
@@ -764,7 +808,7 @@ class PipelineService:
             # Sub-step: Frame annotation (burn text overlays onto frames)
             # ------------------------------------------------------------------
             if run_annotate and not annotations_exist:
-                self._annotate_frames(frames_dir, annotated_dir, master_df, config.annotation_config)
+                self._annotate_frames(frames_dir, annotated_dir, master_df, config.annotation_config, config.frame_quality)
                 self._emit_log(config, f"  annotated   → {annotated_dir}")
                 self._emit_progress(config, 93)
                 self._emit_status(config, "Annotation complete.")
@@ -815,12 +859,167 @@ class PipelineService:
             produced_dirs.append(segment_dir)
             self._emit_segment_completed(config, interval, segment_dir, "completed")
 
+        # Build the full-dataset interp_full.csv spanning the entire nav range.
+        if run_full_interp:
+            ws_dir = Path(config.workspace_directory) if config.workspace_directory else config.output_directory
+            self._build_full_interp_csv(config, nav_sources, sensor_frames, ws_dir)
+
         # Pipeline complete — reset progress indicators.
         self._emit_progress(config, 100)
         self._emit_status(config, "Pipeline complete.")
         self._emit_subprogress(config, 0)
         self._emit_substatus(config, "Idle.")
         return produced_dirs
+
+    # -----------------------------------------------------------------------
+    # Threshold interval analysis (no pipeline run required)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def find_threshold_intervals(
+        navigation_file: "NavigationConfig | None",
+        sensor_files: "list[SensorFileConfig]",
+        constraints: list[dict],
+        min_duration_s: float = 2.0,
+    ) -> list[SelectedTimeRange]:
+        """Scan raw sensor/nav data and return intervals where ALL constraints are met.
+
+        Each constraint is a dict with keys:
+            channel   — display_name of a sensor channel OR a nav key
+                        ("alt", "water_depth", "heading", "pitch", "roll")
+            min_val   — float or None (no lower bound)
+            max_val   — float or None (no upper bound)
+
+        Constraints are combined with logical AND: every constraint must be
+        satisfied simultaneously for a data point to be included.  Contiguous
+        runs of passing points that span ≥ min_duration_s become one interval.
+
+        Args:
+            navigation_file: Configured nav sources (may be None).
+            sensor_files:    List of sensor CSV configs.
+            constraints:     List of {channel, min_val, max_val} dicts.
+            min_duration_s:  Minimum interval length in seconds.
+
+        Returns:
+            List of SelectedTimeRange objects with source="threshold".
+        """
+        if not constraints:
+            return []
+
+        # ------------------------------------------------------------------
+        # Step 1: load all relevant timeseries
+        # ------------------------------------------------------------------
+        series: dict[str, pd.DataFrame] = {}   # channel_name → (unix_time, value) df
+
+        # Navigation channels
+        _NAV_KEYS = {"alt", "water_depth", "heading", "pitch", "roll"}
+        if navigation_file is not None:
+            _nav_srcs = {
+                "alt":         navigation_file.altitude_source,
+                "water_depth": navigation_file.depth_source,
+                "heading":     navigation_file.heading_source,
+                "pitch":       navigation_file.pitch_source,
+                "roll":        navigation_file.roll_source,
+            }
+            for key, src in _nav_srcs.items():
+                if src is not None:
+                    try:
+                        df = SensorService.load_time_value_dataframe(
+                            src,
+                            negate=(key == "water_depth" and getattr(navigation_file, "negate_depth", False)),
+                        )
+                        series[key] = df
+                    except Exception:
+                        pass
+
+        # Sensor channels
+        for sf in sensor_files:
+            try:
+                raw = SensorService.load_sensor_dataframe(sf)
+                for ch in sf.channels:
+                    name = ch.display_name or ch.source_column
+                    if ch.source_column in raw.columns:
+                        ch_df = raw[["unix_time", ch.source_column]].copy()
+                        ch_df = ch_df.rename(columns={ch.source_column: "value"})
+                        series[name] = ch_df
+            except Exception:
+                pass
+
+        if not series:
+            return []
+
+        # ------------------------------------------------------------------
+        # Step 2: build a common time axis via union of all timestamps
+        # ------------------------------------------------------------------
+        relevant_channels = {c["channel"] for c in constraints}
+        missing = relevant_channels - set(series.keys())
+        if missing:
+            return []   # required channel not available
+
+        # Merge on unix_time using outer join, interpolate linearly
+        merged: pd.DataFrame | None = None
+        for ch in relevant_channels:
+            df = series[ch].rename(columns={"value": ch})
+            merged = df if merged is None else pd.merge_asof(
+                merged.sort_values("unix_time"),
+                df.sort_values("unix_time"),
+                on="unix_time",
+                direction="nearest",
+                tolerance=5.0,   # 5-second tolerance for matching timestamps
+            )
+        if merged is None or merged.empty:
+            return []
+
+        merged = merged.sort_values("unix_time").reset_index(drop=True)
+
+        # ------------------------------------------------------------------
+        # Step 3: build a boolean mask — True where ALL constraints pass
+        # ------------------------------------------------------------------
+        mask = pd.Series(True, index=merged.index)
+        for c in constraints:
+            col = c["channel"]
+            if col not in merged.columns:
+                return []
+            vals = pd.to_numeric(merged[col], errors="coerce")
+            if c.get("min_val") is not None:
+                mask &= vals >= float(c["min_val"])
+            if c.get("max_val") is not None:
+                mask &= vals <= float(c["max_val"])
+
+        # ------------------------------------------------------------------
+        # Step 4: find contiguous True runs of sufficient duration
+        # ------------------------------------------------------------------
+        times = merged["unix_time"].to_numpy(dtype=float)
+        m     = mask.to_numpy(dtype=bool)
+
+        intervals: list[SelectedTimeRange] = []
+        i = 0
+        while i < len(m):
+            if m[i]:
+                # Find end of this True run
+                j = i
+                while j < len(m) and m[j]:
+                    j += 1
+                duration = times[j - 1] - times[i] if j > i else 0.0
+                if duration >= min_duration_s:
+                    start_dt = datetime.utcfromtimestamp(float(times[i]))
+                    end_dt   = datetime.utcfromtimestamp(float(times[j - 1]))
+                    desc_parts = []
+                    for c in constraints:
+                        lo = f"≥{c['min_val']:.3g}" if c.get("min_val") is not None else ""
+                        hi = f"≤{c['max_val']:.3g}" if c.get("max_val") is not None else ""
+                        desc_parts.append(f"{c['channel']} {lo}{hi}".strip())
+                    intervals.append(SelectedTimeRange(
+                        start_time=start_dt,
+                        end_time=end_dt,
+                        source="threshold",
+                        threshold_desc="  &  ".join(desc_parts),
+                    ))
+                i = j
+            else:
+                i += 1
+
+        return intervals
 
     # -----------------------------------------------------------------------
     # Static utilities
@@ -996,18 +1195,20 @@ class PipelineService:
                 # seeks landing on a slightly different frame due to keyframes).
                 frame_offset_s = frame_idx / video_fps
                 frame_dt       = datetime.utcfromtimestamp(video_start_raw + frame_offset_s)
-                if not (interval_start <= frame_dt <= interval_end):
+                if not (interval_start <= frame_dt < interval_end):
                     continue
                 unix_time = video_start_raw + frame_offset_s
 
-                # Build the output filename and write the JPEG.
-                fname = f"{video.path.stem}_fig_{saved_idx:05d}.jpg"
+                # Build the output filename: [video_stem]_[YYYYMMDDTHHMMSS_mmm].jpg
+                ts_dt = datetime.utcfromtimestamp(unix_time)
+                ts_str = ts_dt.strftime("%Y%m%dT%H%M%S") + f"_{ts_dt.microsecond // 1000:03d}"
+                fname = f"{video.path.stem}_{ts_str}.jpg"
                 fpath = output_dir / fname
 
                 ok_write = cv2.imwrite(
                     str(fpath),
                     frame,
-                    [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+                    self._jpeg_params(config.frame_quality),
                 )
                 if not ok_write:
                     raise RuntimeError(f"Failed to write extracted frame to {fpath}")
@@ -1187,15 +1388,24 @@ class PipelineService:
 
         alt_col = "alt" if "alt" in nav_sources else None
 
-        schedule = create_dynamic_sample_schedule(
-            nav_df,
-            time_col="unix_time",
-            lat_col="lat",
-            lon_col="lon",
-            alt_col=alt_col,
-            target_spacing_m=config.dynamic_target_spacing_m,
-            min_frequency_hz=config.dynamic_min_frequency_hz,
-        )
+        try:
+            schedule = create_dynamic_sample_schedule(
+                nav_df,
+                time_col="unix_time",
+                lat_col="lat",
+                lon_col="lon",
+                alt_col=alt_col,
+                target_spacing_m=config.dynamic_target_spacing_m,
+                min_frequency_hz=config.dynamic_min_frequency_hz,
+            )
+        except ValueError as exc:
+            # Non-monotone or duplicate timestamps in the nav CSV raise ValueError.
+            # Log and fall back to an empty schedule for this interval rather than
+            # crashing the entire pipeline run.
+            self._emit_log(config,
+                f"  WARNING: Dynamic sampling skipped for this interval: {exc}. "
+                "Check that navigation timestamps are strictly increasing.")
+            return []
 
         if schedule.empty:
             return []
@@ -1256,15 +1466,25 @@ class PipelineService:
         mask = pd.Series(True, index=df.index)
 
         # Altitude: rows must be at or below the altitude ceiling.
-        if config.altitude_threshold and "alt" in df.columns:
+        if config.altitude_threshold is not None and "alt" in df.columns:
             mask &= df["alt"] <= config.altitude_threshold
 
-        # Depth: rows must be at or below the minimum depth (i.e. deeper than threshold).
-        if config.depth_threshold and "Depth" in df.columns:
-            mask &= df["Depth"] >= config.depth_threshold
+        # Depth: rows must be at or deeper than the threshold.
+        # The column may be named "depth" (lower) depending on how navigation was imported.
+        # When negate_depth is True, stored values are negative; the comparison must flip
+        # so that "deeper than X metres" means a more-negative value in the column.
+        depth_col = next((c for c in ("water_depth", "depth", "Depth") if c in df.columns), None)
+        if config.depth_threshold is not None and depth_col:
+            negate = getattr(config.navigation_file, "negate_depth", False) if config.navigation_file else False
+            if negate:
+                # e.g. threshold=-2000 → keep rows where depth ≤ -2000 (deeper)
+                mask &= df[depth_col] <= config.depth_threshold
+            else:
+                # positive depth convention → keep rows where depth ≥ threshold
+                mask &= df[depth_col] >= config.depth_threshold
 
         # Speed: rows must meet or exceed the minimum speed.
-        if config.speed_threshold and "Speed" in df.columns:
+        if config.speed_threshold is not None and "Speed" in df.columns:
             mask &= df["Speed"] >= config.speed_threshold
 
         # Per-channel range filters: apply min and max independently.
@@ -1396,11 +1616,14 @@ class PipelineService:
                 if not ok or frame is None:
                     continue
 
-                fname = f"{video.path.stem}_fig_{saved_idx:05d}.jpg"
+                ts_dt = datetime.utcfromtimestamp(unix_time)
+                ts_str = ts_dt.strftime("%Y%m%dT%H%M%S") + f"_{ts_dt.microsecond // 1000:03d}"
+                fname = f"{video.path.stem}_{ts_str}.jpg"
                 fpath = output_dir / fname
 
-                # Write the frame as JPEG at quality 90.
-                cv2.imwrite(str(fpath), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                ok_write = cv2.imwrite(str(fpath), frame, self._jpeg_params(config.frame_quality))
+                if not ok_write:
+                    raise RuntimeError(f"Failed to write extracted frame to {fpath}")
 
                 rows.append({
                     "frame_filename": fname,
@@ -1426,6 +1649,69 @@ class PipelineService:
     # -----------------------------------------------------------------------
     # interp.csv construction
     # -----------------------------------------------------------------------
+
+    def _build_full_interp_csv(
+        self,
+        config: "PipelineConfig",
+        nav_sources: dict[str, pd.DataFrame],
+        sensor_frames: list[tuple["SensorFileConfig", pd.DataFrame]],
+        output_dir: Path,
+    ) -> None:
+        """Build interp_full.csv spanning the entire navigation time range.
+
+        Unlike the per-segment interp.csv files, this output covers every
+        timestamp in the navigation data at a uniform sample rate, regardless
+        of job intervals.  It contains no frame-extraction columns (no
+        frame_filename, video_filename, or frame_index).
+
+        The file is written to output_dir/interp_full.csv, overwriting any
+        existing file.
+
+        Args:
+            config:        Pipeline config (used for full_interp_sample_hz and logging).
+            nav_sources:   Loaded nav timeseries (lat, lon, alt, water_depth, …).
+            sensor_frames: Loaded sensor (config, dataframe) pairs.
+            output_dir:    Job-level output directory.
+        """
+        # Collect the time extent of every nav and sensor source, then take the
+        # union so interp_full.csv covers the full data coverage window without
+        # being bounded by any single source or by video file timestamps.
+        all_mins: list[float] = []
+        all_maxs: list[float] = []
+        for df in nav_sources.values():
+            all_mins.append(float(df["unix_time"].min()))
+            all_maxs.append(float(df["unix_time"].max()))
+        for _, df in sensor_frames:
+            if "unix_time" in df.columns:
+                all_mins.append(float(df["unix_time"].min()))
+                all_maxs.append(float(df["unix_time"].max()))
+
+        if not all_mins:
+            self._emit_log(config, "interp_full.csv skipped: no navigation or sensor sources configured.")
+            return
+
+        t_min = min(all_mins)
+        t_max = max(all_maxs)
+        hz      = max(config.full_interp_sample_hz, 0.001)
+        step    = 1.0 / hz
+        times   = np.arange(t_min, t_max + step * 0.5, step)
+
+        frame_df = pd.DataFrame({"unix_time": times})
+        full_df  = self._build_master_dataframe(frame_df, nav_sources, sensor_frames)
+
+        # Drop frame-specific columns — they carry no meaning here.
+        for col in ("frame_filename", "video_filename", "frame_index"):
+            if col in full_df.columns:
+                full_df = full_df.drop(columns=[col])
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = output_dir / "interp_full.csv"
+        full_df.to_csv(out_path, index=False)
+        self._emit_log(
+            config,
+            f"  interp_full.csv → {out_path}  ({len(full_df)} rows @ {hz:.3g} Hz)"
+        )
+        self._emit_status(config, f"interp_full.csv written ({len(full_df)} rows).")
 
     def _build_master_dataframe(
         self,
@@ -1511,6 +1797,13 @@ class PipelineService:
             # Default to 0.0 so alt is always a valid column even without data.
             master["alt"] = 0.0
 
+        # Interpolate optional nav channels when configured.
+        for key in ("water_depth", "heading", "pitch", "roll"):
+            if key in nav_sources:
+                master[key] = SensorService.interpolate_series(
+                    master["unix_time"], nav_sources[key]["unix_time"], nav_sources[key]["value"]
+                )
+
         # Interpolate each sensor channel at every frame timestamp.
         # The display_name from the channel config becomes the column header.
         for sensor_cfg, sensor_df in sensor_frames:
@@ -1520,10 +1813,16 @@ class PipelineService:
                     master["unix_time"], sensor_df["unix_time"], sensor_df[channel.source_column]
                 )
 
+        master = self._add_utm_columns(master)
+
         # Reorder columns so the most important ones come first, making the
         # CSV easy to read and predictable for downstream tooling.
-        ordered   = ["frame_filename", "timestamp_iso", "unix_time", "lat", "lon", "alt", "video_filename", "frame_index"]
-        remaining = [col for col in master.columns if col not in ordered]
+        preferred = ["frame_filename", "timestamp_iso", "unix_time", "lat", "lon", "alt",
+                     "water_depth", "heading", "pitch", "roll",
+                     "easting", "northing", "depth", "utm_zone",
+                     "video_filename", "frame_index"]
+        ordered   = [c for c in preferred if c in master.columns]
+        remaining = [col for col in master.columns if col not in set(ordered)]
         return master[ordered + remaining]
 
     def _update_master_dataframe(
@@ -1574,6 +1873,13 @@ class PipelineService:
         elif "alt" not in master.columns:
             master["alt"] = 0.0
 
+        # Re-interpolate optional nav channels when sources are available.
+        for key in ("water_depth", "heading", "pitch", "roll"):
+            if key in nav_sources:
+                master[key] = SensorService.interpolate_series(
+                    master["unix_time"], nav_sources[key]["unix_time"], nav_sources[key]["value"]
+                )
+
         # Re-interpolate all sensor channels.
         for sensor_cfg, sensor_df in sensor_frames:
             for channel in sensor_cfg.channels:
@@ -1582,10 +1888,73 @@ class PipelineService:
                     master["unix_time"], sensor_df["unix_time"], sensor_df[channel.source_column]
                 )
 
+        master = self._add_utm_columns(master)
+
         # Restore canonical column order.
-        ordered   = ["frame_filename", "timestamp_iso", "unix_time", "lat", "lon", "alt", "video_filename", "frame_index"]
-        remaining = [col for col in master.columns if col not in ordered]
+        preferred = ["frame_filename", "timestamp_iso", "unix_time", "lat", "lon", "alt",
+                     "water_depth", "heading", "pitch", "roll",
+                     "easting", "northing", "depth", "utm_zone",
+                     "video_filename", "frame_index"]
+        ordered   = [c for c in preferred if c in master.columns]
+        remaining = [col for col in master.columns if col not in set(ordered)]
         return master[ordered + remaining]
+
+    # -----------------------------------------------------------------------
+    # UTM coordinate computation
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _add_utm_columns(master: pd.DataFrame) -> pd.DataFrame:
+        """Append utm_x, utm_y, utm_z, and utm_zone columns to *master*.
+
+        utm_x / utm_y are UTM easting / northing in metres (WGS84), projected
+        from lat/lon using the `utm` library.  All rows are forced to the zone
+        determined from the track centroid to prevent discontinuities at zone
+        boundaries.
+
+        utm_z = -depth (depth is positive-down from surface → negative Z).
+        utm_zone is the full designation string, e.g. "18T" or "34S".
+
+        All four columns are NaN / empty when required source columns are absent.
+        """
+        import utm as _utm
+
+        if "lat" not in master.columns or "lon" not in master.columns:
+            return master
+
+        lat_arr = master["lat"].to_numpy(dtype=float)
+        lon_arr = master["lon"].to_numpy(dtype=float)
+
+        valid = ~(np.isnan(lat_arr) | np.isnan(lon_arr))
+        if not valid.any():
+            master = master.copy()
+            master["easting"]  = np.nan
+            master["northing"] = np.nan
+            master["depth"]    = np.nan
+            master["utm_zone"] = ""
+            return master
+
+        # Pin zone to centroid so the whole track shares one coordinate space.
+        median_lat = float(np.median(lat_arr[valid]))
+        median_lon = float(np.median(lon_arr[valid]))
+        _, _, zone_number, zone_letter = _utm.from_latlon(median_lat, median_lon)
+
+        easting  = np.full(len(lat_arr), np.nan)
+        northing = np.full(len(lat_arr), np.nan)
+        e, n, _, _ = _utm.from_latlon(
+            lat_arr[valid], lon_arr[valid],
+            force_zone_number=zone_number,
+            force_zone_letter=zone_letter,
+        )
+        easting[valid]  = e
+        northing[valid] = n
+
+        master = master.copy()
+        master["easting"]  = easting
+        master["northing"] = northing
+        master["depth"]    = -master["water_depth"] if "water_depth" in master.columns else np.nan
+        master["utm_zone"] = f"{zone_number}{zone_letter}"
+        return master
 
     # -----------------------------------------------------------------------
     # Sensor raster generation
@@ -1605,7 +1974,10 @@ class PipelineService:
         Returns:
             List of column name strings that are not in the fixed exclusion set.
         """
-        excluded = {"frame_filename", "timestamp_iso", "unix_time", "lat", "lon", "alt", "video_filename", "frame_index"}
+        excluded = {"frame_filename", "timestamp_iso", "unix_time",
+                    "lat", "lon", "alt", "water_depth", "heading", "pitch", "roll",
+                    "easting", "northing", "depth", "utm_zone",
+                    "video_filename", "frame_index"}
         return [col for col in master_df.columns if col not in excluded]
 
     def _create_sensor_raster(self, df: pd.DataFrame, value_column: str, output_path: Path) -> None:
@@ -1702,6 +2074,7 @@ class PipelineService:
         annotated_dir: Path,
         master_df: pd.DataFrame,
         ann: AnnotationConfig | None = None,
+        frame_quality: str = "Original",
     ) -> None:
         """Burn configurable telemetry overlays onto each extracted frame.
 
@@ -1781,7 +2154,8 @@ class PipelineService:
                             lines.append(f"{ident}: {v}")
 
             if not lines:
-                cv2.imwrite(str(annotated_dir / src.name), img)
+                if not cv2.imwrite(str(annotated_dir / src.name), img, self._jpeg_params(frame_quality)):
+                    self.log_fn(f"Warning: failed to write annotated frame {src.name}")
                 continue
 
             # --- Measure text block ---
@@ -1825,7 +2199,8 @@ class PipelineService:
                 # Fill pass
                 cv2.putText(img, line, (tx, ty), font, scale, fill_bgr, fill_th, cv2.LINE_AA)
 
-            cv2.imwrite(str(annotated_dir / src.name), img)
+            if not cv2.imwrite(str(annotated_dir / src.name), img, self._jpeg_params(frame_quality)):
+                self.log_fn(f"Warning: failed to write annotated frame {src.name}")
 
     def _apply_clahe_to_frames(self, frames_dir: Path, clahe_dir: Path, config: PipelineConfig) -> None:
         """Apply CLAHE contrast enhancement to all frames and write results.
@@ -1876,7 +2251,8 @@ class PipelineService:
             lab_result    = cv2.merge([clahe.apply(l), a, b])
             result        = cv2.cvtColor(lab_result, cv2.COLOR_LAB2BGR)
 
-            cv2.imwrite(str(clahe_dir / src.name), result, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not cv2.imwrite(str(clahe_dir / src.name), result, self._jpeg_params(config.frame_quality)):
+                self._emit_log(config, f"Warning: failed to write CLAHE frame {src.name}")
 
             self._emit_subprogress(config, int(round(((i + 1) / total) * 100)))
             self._emit_substatus(config, f"Applying CLAHE: {src.name} ({i + 1}/{total})")
@@ -1975,6 +2351,22 @@ class PipelineService:
     # All five helpers follow the same pattern: check whether the callback was
     # supplied and call it if so.  This avoids repeating the None-guard at
     # every call site, keeping the business logic clean.
+
+    @staticmethod
+    def _jpeg_params(frame_quality: str) -> list[int]:
+        """Return cv2.imwrite() JPEG parameter list for the given quality string.
+
+        "Original" maps to quality 95 (high fidelity, reasonable file size).
+        Named presets map to standard JPEG quality values.
+        """
+        _MAP = {
+            "Original":     95,
+            "High (90%)":   90,
+            "Medium (75%)": 75,
+            "Low (50%)":    50,
+        }
+        q = _MAP.get(frame_quality, 95)
+        return [int(cv2.IMWRITE_JPEG_QUALITY), q]
 
     def _emit_progress(self, config: PipelineConfig, value: int) -> None:
         """Update the top-level progress bar (0–100)."""

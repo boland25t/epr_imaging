@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path  # Path objects for the csv_path in SensorFileConfig
 
 from PySide6.QtCore import Qt  # Qt.ItemIsEditable flag for read-only table cells
@@ -47,6 +48,14 @@ import pandas as pd  # pd.to_datetime() used in the live timestamp parse preview
 
 from models import SensorChannel, SensorFileConfig  # Return types
 from sensor_service import SensorService             # CSV read helpers and config builder
+
+# Detects column "names" that look like data values rather than header strings.
+# Same pattern as navigation_import_dialog._LOOKS_LIKE_VALUE.
+_LOOKS_LIKE_VALUE = re.compile(
+    r"^-?\d+(\.\d+)?$"
+    r"|^\d{1,2}/\d{1,2}/\d{2,4}$"
+    r"|^\d{1,2}:\d{2}(\.\d+)?$"
+)
 
 
 class SensorImportDialog(QDialog):
@@ -79,6 +88,9 @@ class SensorImportDialog(QDialog):
         # A wider preview DataFrame (up to 20 rows) used for the live timestamp
         # parse preview so the displayed range covers more of the data.
         self._full_preview_df = None
+
+        # Set to True when the user clicks "Load without headers".
+        self._no_header: bool = False
 
         self._build_ui()
 
@@ -138,6 +150,31 @@ class SensorImportDialog(QDialog):
 
         layout.addWidget(source_group)
 
+        # --- Headerless notice (hidden until a suspicious file is loaded) ---
+        self.headerless_warning = QLabel(
+            "First row looks like data — this file may have no header row."
+        )
+        self.headerless_warning.setWordWrap(True)
+        self.headerless_warning.setStyleSheet(
+            "color: #8B4513; background: #fff3cd; border: 1px solid #ffc107; "
+            "border-radius: 3px; padding: 4px; font-size: 11px;"
+        )
+        self.headerless_warning.hide()
+
+        self.load_no_header_button = QPushButton("Load without headers")
+        self.load_no_header_button.setToolTip(
+            "Reload the file treating all rows as data.\n"
+            "Columns will be numbered 0, 1, 2, …"
+        )
+        self.load_no_header_button.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+        self.load_no_header_button.hide()
+        self.load_no_header_button.clicked.connect(self._reload_without_headers)
+
+        headerless_row = QHBoxLayout()
+        headerless_row.addWidget(self.headerless_warning, stretch=1)
+        headerless_row.addWidget(self.load_no_header_button)
+        layout.addLayout(headerless_row)
+
         # --- Preview table group box ---
         preview_group  = QGroupBox("Preview (first 5 rows)")
         preview_layout = QVBoxLayout(preview_group)
@@ -187,6 +224,7 @@ class SensorImportDialog(QDialog):
         if not path:
             return
 
+        self._no_header = False
         self.path_edit.setText(path)
         try:
             preview_df            = SensorService.read_preview(path, nrows=5)
@@ -198,6 +236,38 @@ class SensorImportDialog(QDialog):
 
         self._populate_preview_table(preview_df)
         self._populate_column_combos(columns)
+
+        suspicious = sum(1 for c in columns if _LOOKS_LIKE_VALUE.match(str(c)))
+        headerless = suspicious >= max(2, len(columns) // 2)
+        self.headerless_warning.setVisible(headerless)
+        self.load_no_header_button.setVisible(headerless)
+        if headerless:
+            self.headerless_warning.setText(
+                "First row looks like data — this file may have no header row."
+            )
+            self.load_no_header_button.setText("Load without headers")
+            self.load_no_header_button.setEnabled(True)
+
+    def _reload_without_headers(self) -> None:
+        """Reload the file treating all rows as data, auto-numbering columns 0, 1, 2, …"""
+        path = self.path_edit.text().strip()
+        if not path:
+            return
+        try:
+            preview_df            = SensorService.read_preview(path, nrows=5,  no_header=True)
+            columns               = SensorService.read_columns(path, no_header=True)
+            self._full_preview_df = SensorService.read_preview(path, nrows=20, no_header=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to reload file", str(exc))
+            return
+
+        self._no_header = True
+        self._populate_preview_table(preview_df)
+        self._populate_column_combos(columns)
+        self._update_timestamp_preview(self.timestamp_combo.currentText())
+        self.headerless_warning.setText("Loaded without headers — columns numbered 0, 1, 2, …")
+        self.load_no_header_button.setText("✓ Loaded without headers")
+        self.load_no_header_button.setEnabled(False)
 
     def _on_separate_toggled(self, checked: bool) -> None:
         """Show or hide the date_combo row and refresh the timestamp parse preview."""
@@ -399,6 +469,7 @@ class SensorImportDialog(QDialog):
                 timestamp_column=timestamp_column,
                 channels=[channel],
                 date_column=date_column,
+                no_header=self._no_header,
             )
         except Exception as exc:
             QMessageBox.critical(self, "Failed to configure sensor", str(exc))

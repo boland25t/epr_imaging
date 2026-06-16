@@ -113,6 +113,7 @@ class _SourceSection(QWidget):
         super().__init__(parent)
         self.required     = required
         self._value_hints = value_hints
+        self._no_header   = False  # set True when user loads without headers
 
         layout = QVBoxLayout(self)
         group  = QGroupBox(title)
@@ -144,18 +145,31 @@ class _SourceSection(QWidget):
         self.preview_table.verticalHeader().setVisible(False)
         self.preview_table.setMinimumHeight(140)
 
-        # --- Warning label shown when the file appears headerless ---
+        # --- Headerless notice: warning text + "Load without headers" button ---
         self.headerless_warning = QLabel(
-            "Warning: this file appears to have no column headers (first row looks like data). "
-            "Column names shown are first-row values. For best results, convert .ppi files using "
-            "'Convert PPI → CSV' first, or use a CSV file that has a proper header row."
+            "First row looks like data — this file may have no header row."
         )
         self.headerless_warning.setWordWrap(True)
         self.headerless_warning.setStyleSheet(
             "color: #8B4513; background: #fff3cd; border: 1px solid #ffc107; "
             "border-radius: 3px; padding: 4px; font-size: 11px;"
         )
-        self.headerless_warning.hide()  # Hidden until a suspicious file is loaded
+        self.headerless_warning.hide()
+
+        self.load_no_header_button = QPushButton("Load without headers")
+        self.load_no_header_button.setToolTip(
+            "Reload the file treating all rows as data.\n"
+            "Columns will be numbered 0, 1, 2, …"
+        )
+        self.load_no_header_button.setStyleSheet(
+            "font-size: 11px; padding: 2px 8px;"
+        )
+        self.load_no_header_button.hide()
+        self.load_no_header_button.clicked.connect(self._reload_without_headers)
+
+        headerless_row = QHBoxLayout()
+        headerless_row.addWidget(self.headerless_warning, stretch=1)
+        headerless_row.addWidget(self.load_no_header_button)
 
         # Lay out the form rows; the date_combo row is hidden by default.
         form.addRow("Source file:",      path_row)
@@ -164,7 +178,7 @@ class _SourceSection(QWidget):
         form.addRow("Date column:",      self.date_combo)
         form.setRowVisible(self.date_combo, False)
         form.addRow("Value column:",     self.value_combo)
-        layout.addWidget(self.headerless_warning)
+        layout.addLayout(headerless_row)
         layout.addWidget(self.preview_table)
 
         # Wire up interaction signals.
@@ -191,6 +205,7 @@ class _SourceSection(QWidget):
         if not path:
             return
 
+        self._no_header = False
         self.path_edit.setText(path)
         try:
             preview_df = SensorService.read_preview(path, nrows=5)
@@ -202,10 +217,35 @@ class _SourceSection(QWidget):
         self._populate_preview_table(preview_df)
         self._populate_column_combos(columns)
 
-        # Count how many column names look like numeric/date/time data values.
-        # If the majority do, the file probably has no header row.
         suspicious = sum(1 for c in columns if _LOOKS_LIKE_VALUE.match(str(c)))
-        self.headerless_warning.setVisible(suspicious >= max(2, len(columns) // 2))
+        headerless = suspicious >= max(2, len(columns) // 2)
+        self.headerless_warning.setVisible(headerless)
+        self.load_no_header_button.setVisible(headerless)
+
+    def _reload_without_headers(self) -> None:
+        """Reload the current file treating all rows as data (no header row).
+
+        Columns are numbered "0", "1", "2", … so the user can still select
+        which column is the timestamp and which is the value.  The no-header
+        flag is stored and propagated to build_result() so the service layer
+        loads the file the same way at pipeline run time.
+        """
+        path = self.path_edit.text().strip()
+        if not path:
+            return
+        try:
+            preview_df = SensorService.read_preview(path, nrows=5,  no_header=True)
+            columns    = SensorService.read_columns(path, no_header=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Failed to reload file", str(exc))
+            return
+
+        self._no_header = True
+        self._populate_preview_table(preview_df)
+        self._populate_column_combos(columns)
+        self.headerless_warning.setText("Loaded without headers — columns numbered 0, 1, 2, …")
+        self.load_no_header_button.setText("✓ Loaded without headers")
+        self.load_no_header_button.setEnabled(False)
 
     def _populate_preview_table(self, df) -> None:
         """Fill the preview table with the first N rows of the loaded file.
@@ -311,7 +351,8 @@ class _SourceSection(QWidget):
             raise ValueError("Navigation source is missing timestamp/value column selections.")
 
         return SensorService.build_time_value_source_config(
-            Path(path), timestamp_column, value_column, date_column
+            Path(path), timestamp_column, value_column, date_column,
+            no_header=self._no_header,
         )
 
 
@@ -404,6 +445,13 @@ class NavigationImportDialog(QDialog):
             value_hints=["depth", "depth_m", "depth_msw", "depth_meters", "pressure", "dep"],
             parent=self,
         )
+        self.heading_section = _SourceSection(
+            "Heading Source (degrees true, 0 = North, clockwise)",
+            required=False,
+            value_hints=["heading", "heading_deg", "heading_degrees", "yaw", "yaw_deg",
+                         "compass", "course", "cog"],
+            parent=self,
+        )
         self.pitch_section = _SourceSection(
             "Pitch Source (degrees, positive = nose up)",
             required=False,
@@ -418,6 +466,19 @@ class NavigationImportDialog(QDialog):
         )
         scroll_layout.addWidget(self.alt_section)
         scroll_layout.addWidget(self.depth_section)
+
+        self.negate_depth_check = QCheckBox(
+            "Negate depth values  (instrument records depth as positive → store as negative)"
+        )
+        self.negate_depth_check.setToolTip(
+            "Check this when your depth sensor reports depth below the surface as a\n"
+            "positive number (e.g. 45 m) and you want it stored as −45 m so that\n"
+            "below-surface positions have a negative Z coordinate."
+        )
+        self.negate_depth_check.setStyleSheet("font-size: 11px; margin-left: 4px;")
+        scroll_layout.addWidget(self.negate_depth_check)
+
+        scroll_layout.addWidget(self.heading_section)
         scroll_layout.addWidget(self.pitch_section)
         scroll_layout.addWidget(self.roll_section)
         scroll_layout.addStretch()
@@ -436,12 +497,13 @@ class NavigationImportDialog(QDialog):
         stores the result in _result_config and accepts the dialog.
         """
         try:
-            lat_source   = self.lat_section.build_result()
-            lon_source   = self.lon_section.build_result()
-            alt_source   = self.alt_section.build_result()
-            depth_source = self.depth_section.build_result()
-            pitch_source = self.pitch_section.build_result()
-            roll_source  = self.roll_section.build_result()
+            lat_source     = self.lat_section.build_result()
+            lon_source     = self.lon_section.build_result()
+            alt_source     = self.alt_section.build_result()
+            depth_source   = self.depth_section.build_result()
+            heading_source = self.heading_section.build_result()
+            pitch_source   = self.pitch_section.build_result()
+            roll_source    = self.roll_section.build_result()
 
             if lat_source is None or lon_source is None:
                 raise ValueError("Latitude and longitude sources are required.")
@@ -450,9 +512,11 @@ class NavigationImportDialog(QDialog):
                 lat_source, lon_source,
                 altitude_source=alt_source,
                 depth_source=depth_source,
+                heading_source=heading_source,
                 pitch_source=pitch_source,
                 roll_source=roll_source,
             )
+            self._result_config.negate_depth = self.negate_depth_check.isChecked()
         except Exception as exc:
             QMessageBox.critical(self, "Failed to configure navigation", str(exc))
             return  # Stay open so the user can correct the problem

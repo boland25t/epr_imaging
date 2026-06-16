@@ -1,0 +1,130 @@
+{
+  "video_directory": "/home/troyboland/epr_imaging/EPR_2026_DATA/VIDEO/J1756/DOWN",
+  "filename_datetime_format": "%Y%m%d_%H%M%S",
+  "navigation_file": {
+    "latitude_source": {
+      "csv_path": "/home/troyboland/epr_imaging/EPR_2026_DATA/Renav/J1756_renav_shift_30m_053deg_1h-new.csv",
+      "timestamp_column": "1",
+      "value_column": "2",
+      "date_column": "0",
+      "start_time": "2026-01-18T04:12:19",
+      "end_time": "2026-01-18T16:48:58",
+      "no_header": true
+    },
+    "longitude_source": {
+      "csv_path": "/home/troyboland/epr_imaging/EPR_2026_DATA/Renav/J1756_renav_shift_30m_053deg_1h-new.csv",
+      "timestamp_column": "1",
+      "value_column": "3",
+      "date_column": "0",
+      "start_time": "2026-01-18T04:12:19",
+      "end_time": "2026-01-18T16:48:58",
+      "no_header": true
+    },
+    "altitude_source": {
+      "csv_path": "/home/troyboland/epr_imaging/EPR_2026_DATA/DPA/J2-1756_DPA.csv",
+      "timestamp_column": "TIME",
+      "value_column": "ALTITUDE(m)",
+      "date_column": "DATE",
+      "start_time": "2026-01-18T01:50:00.576999",
+      "end_time": "2026-01-18T18:25:59.423000",
+      "no_header": false
+    },
+    "depth_source": {
+      "csv_path": "/home/troyboland/epr_imaging/EPR_2026_DATA/Renav/J1756_renav_shift_30m_053deg_1h-new.csv",
+      "timestamp_column": "1",
+      "value_column": "4",
+      "date_column": "0",
+      "start_time": "2026-01-18T04:12:19",
+      "end_time": "2026-01-18T16:48:58",
+      "no_header": true
+    },
+    "negate_depth": true,
+    "heading_source": {
+      "csv_path": "/home/troyboland/epr_imaging/EPR_2026_DATA/Renav/J1756_renav_shift_30m_053deg_1h-new.csv",
+      "timestamp_column": "1",
+      "value_column": "5",
+      "date_column": "0",
+      "start_time": "2026-01-18T04:12:19",
+      "end_time": "2026-01-18T16:48:58",
+      "no_header": true
+    },
+    "pitch_source": {
+      "csv_path": "/home/troyboland/epr_imaging/EPR_2026_DATA/Renav/J1756_renav_shift_30m_053deg_1h-new.csv",
+      "timestamp_column": "1",
+      "value_column": "6",
+      "date_column": "0",
+      "start_time": "2026-01-18T04:12:19",
+      "end_time": "2026-01-18T16:48:58",
+      "no_header": true
+    },
+    "roll_source": {
+      "csv_path": "/home/troyboland/epr_imaging/EPR_2026_DATA/Renav/J1756_renav_shift_30m_053deg_1h-new.csv",
+      "timestamp_column": "1",
+      "value_column": "7",
+      "date_column": "0",
+      "start_time": "2026-01-18T04:12:19",
+      "end_time": "2026-01-18T16:48:58",
+      "no_header": true
+    },
+    "start_time": "2026-01-18T01:50:00.576999",
+    "end_time": "2026-01-18T18:25:59.423000"
+  },
+  "sensor_files": [
+    {
+      "csv_path": "/home/troyboland/epr_imaging/EPR_2026_DATA/Sensors/Dive1756.csv",
+      "timestamp_column": "datetime",
+      "date_column": null,
+      "start_time": "2026-01-18T04:12:19",
+      "end_time": "2026-01-18T16:48:58",
+      "channels": [
+        {
+          "source_column": "concentration_uatm_co2",
+          "display_name": "CO2 Concentration",
+          "units": "uatm",
+          "use_header_name": false
+        }
+      ],
+      "no_header": false
+    }
+  ],
+  "next_job_id": 1,
+  "pending_job": {
+    "job_id": 1,
+    "name": "",
+    "intervals": [],
+    "status": "pending",
+    "settings_snapshot": {}
+  },
+  "segment_history": [],
+  "job_history": [],
+  "threshold_history": [],
+  "annotation_config": {
+    "enabled_items": [
+      "filename",
+      "timestamp",
+      "lat",
+      "lon",
+      "alt"
+    ],
+    "position": "top_left",
+    "font_scale": 0.65,
+    "color_rgb": [255, 255, 255],
+    "use_background": true,
+    "bg_opacity": 0.55
+  },
+  "frame_rate": 1.0,
+  "generate_sensor_tiffs": true,
+  "annotate_frames": false,
+  "frame_quality": "Original",
+  "altitude_threshold": 0.0,
+  "depth_threshold": 0.0,
+  "speed_threshold": 0.0,
+  "min_segment_frames": 1,
+  "depth_source": null,
+  "speed_source": null,
+  "sampling_mode": "fixed",
+  "dynamic_target_spacing_m": 2.0,
+  "dynamic_min_frequency_hz": 0.1,
+  "clahe_clip_limit": 2.0,
+  "clahe_tile_grid_size": 8
+}

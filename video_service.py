@@ -283,7 +283,7 @@ class VideoService:
 
         Example:
             "%Y_%m_%dT%H_%M_%S"
-            → re.compile(r"\d{4}\_\d{2}\_\d{2}T\d{2}\_\d{2}\_\d{2}")
+            → re.compile(r"[0-9]{4}_[0-9]{2}_[0-9]{2}T[0-9]{2}_[0-9]{2}_[0-9]{2}")
 
         Args:
             datetime_format: The user-supplied strptime format string.

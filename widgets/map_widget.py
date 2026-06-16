@@ -51,7 +51,13 @@ _UNSELECTED_FILL = "#1565c0"   # Dark blue — default dot fill
 _UNSELECTED_PEN  = "#000000"   # Black outline for unselected dots
 _SELECTED_FILL   = "#ffcc00"   # Yellow fill for selected/highlighted dots
 _SELECTED_PEN    = "#995500"   # Dark gold outline for selected dots
-_TRACKLINE       = "#e63946"   # Red — GPS navigation trackline colour
+_TRACKLINE       = "#e63946"   # Red — GPS navigation trackline (video-covered)
+_NO_VIDEO_TRACKLINE = "#1565c0"  # Blue — trackline where no video covers the time
+
+# Number of discrete colour buckets used when drawing a sensor-coloured trackline.
+# Fewer buckets = fewer PlotCurveItem objects per redraw = faster rendering.
+# Paired with _MAX_DISPLAY_PTS in MainWindow; reduce here if 5 000 pts still lags.
+_COLOR_LEVELS: int = 64
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +273,11 @@ class MapWidget(QWidget):
         # Used by _on_mouse_moved() to determine which video (if any) covers the
         # hovered GPS timestamp and compute the corresponding video-relative offset.
         self._videos: list[tuple[float, float, str]] = []
+
+        # When True (and _videos is set), the plain trackline is drawn split by
+        # video coverage: red where a video covers the timestamp, blue where not.
+        # Only applies when sensor colouring is OFF.
+        self._color_by_video_coverage: bool = False
 
         # -----------------------------------------------------------------------
         # State: two-click pick mode
@@ -503,6 +514,15 @@ class MapWidget(QWidget):
             self._segment_colors.append(color)
             for idx in seg["indices"]:
                 self._segment_assignments[idx] = seg_idx
+        self._redraw()
+
+    def set_video_coverage_coloring(self, enabled: bool) -> None:
+        """Colour the plain trackline by video coverage (red=covered, blue=not).
+
+        Requires set_videos() to have been called.  Has no effect while sensor
+        colouring is active (that takes priority).
+        """
+        self._color_by_video_coverage = bool(enabled)
         self._redraw()
 
     def set_display_mode(self, mode: str) -> None:
@@ -746,7 +766,7 @@ class MapWidget(QWidget):
             sensor_v:  Sensor value for every nav point (same length as tx/ty).
             log_scale: If True, apply logarithmic normalisation instead of linear.
         """
-        N_LEVELS = 64
+        N_LEVELS = _COLOR_LEVELS
 
         if self._sensor_min_clamp is not None and self._sensor_max_clamp is not None:
             v_min, v_max = self._sensor_min_clamp, self._sensor_max_clamp
@@ -799,6 +819,48 @@ class MapWidget(QWidget):
                     self._trackline_item = item
                     first_item = False
 
+                if i < N:
+                    run_start = i
+
+    def _draw_coverage_trackline(self, tx: np.ndarray, ty: np.ndarray) -> None:
+        """Draw the trackline split by video coverage.
+
+        Each nav point is classified as covered (its unix time falls inside any
+        video window) or not.  Consecutive points sharing a class are grouped
+        into runs and drawn as one PlotCurveItem — red where covered, blue where
+        not — extended by one point on each side for seamless joins.
+
+        Args:
+            tx: Projected X coordinates for every nav point.
+            ty: Projected Y coordinates for every nav point.
+        """
+        times = self._nav_unix_times
+        N = len(tx)
+        if N < 2:
+            return
+
+        # Boolean coverage mask via the video windows.
+        covered = np.zeros(N, dtype=bool)
+        for v_start, v_end, _name in self._videos:
+            covered |= (times >= v_start) & (times <= v_end)
+
+        first_item = True
+        run_start = 0
+        for i in range(1, N + 1):
+            if i == N or covered[i] != covered[run_start]:
+                s = max(0, run_start - 1)
+                e = min(N, i + 1)
+                color = _TRACKLINE if covered[run_start] else _NO_VIDEO_TRACKLINE
+                item = pg.PlotCurveItem(
+                    x=tx[s:e], y=ty[s:e],
+                    pen=pg.mkPen(color=color, width=self._nav_trackline_width),
+                    connect="all",
+                    antialias=False,
+                )
+                self._plot.addItem(item)
+                if first_item:
+                    self._trackline_item = item
+                    first_item = False
                 if i < N:
                     run_start = i
 
@@ -871,11 +933,20 @@ class MapWidget(QWidget):
             and self._sensor_coloring_values is not None
             and len(self._sensor_coloring_values) == len(tx)
         )
+        use_coverage_color = (
+            has_nav
+            and not use_sensor_color
+            and self._color_by_video_coverage
+            and bool(self._videos)
+            and len(self._nav_unix_times) == len(tx) > 0
+        )
         if use_sensor_color:
             self._draw_colored_trackline(
                 tx, ty, self._sensor_coloring_values,
                 log_scale=self._sensor_log_scale,
             )
+        elif use_coverage_color:
+            self._draw_coverage_trackline(tx, ty)
         else:
             self._trackline_item = pg.PlotCurveItem(
                 x=tx, y=ty,
@@ -907,24 +978,54 @@ class MapWidget(QWidget):
                     item.setZValue(1)
                     self._plot.addItem(item)
 
-        # --- Layer 1c: History mode overlay (blue bands = previously sampled) ---
+        # --- Layer 1c: History / pending-job overlay ---
+        # Colors: yellow (#ffd600) = pending job, blue (#2196f3) = manual history,
+        # green (#4caf50) = threshold history.  When a blue and green range overlap,
+        # a dashed blue line is drawn on top of the green to suggest the mix.
         if (has_nav
                 and self._history_ranges
                 and len(self._nav_unix_times) == len(self._nav_px) > 0):
+            # Collect blue and green time ranges for overlap detection
+            blue_ranges  = [(s, e) for s, e, c, _ in self._history_ranges if c == "#2196f3"]
+            green_ranges = [(s, e) for s, e, c, _ in self._history_ranges if c == "#4caf50"]
+
             for start_u, end_u, color, _tooltip in self._history_ranges:
                 i0 = max(0, int(np.searchsorted(self._nav_unix_times, start_u, side="left")) - 1)
                 i1 = min(len(self._nav_unix_times),
                          int(np.searchsorted(self._nav_unix_times, end_u, side="right")) + 1)
-                if i1 - i0 >= 2:
-                    item = pg.PlotCurveItem(
-                        x=self._nav_px[i0:i1],
-                        y=self._nav_py[i0:i1],
-                        pen=pg.mkPen(color=color, width=self._nav_trackline_width + 6),
-                        connect="all",
-                        antialias=False,
+                if i1 - i0 < 2:
+                    continue
+                w = self._nav_trackline_width + 6
+                item = pg.PlotCurveItem(
+                    x=self._nav_px[i0:i1],
+                    y=self._nav_py[i0:i1],
+                    pen=pg.mkPen(color=color, width=w),
+                    connect="all",
+                    antialias=False,
+                )
+                item.setZValue(2)
+                self._plot.addItem(item)
+
+                # If this is a green range that overlaps a blue range, draw a
+                # dashed blue line on top to produce a visual blue-green mix.
+                if color == "#4caf50":
+                    overlaps = any(
+                        bs < end_u and be > start_u
+                        for bs, be in blue_ranges
                     )
-                    item.setZValue(2)
-                    self._plot.addItem(item)
+                    if overlaps:
+                        dash_item = pg.PlotCurveItem(
+                            x=self._nav_px[i0:i1],
+                            y=self._nav_py[i0:i1],
+                            pen=pg.mkPen(
+                                color="#2196f3", width=w,
+                                style=Qt.DashLine,
+                            ),
+                            connect="all",
+                            antialias=False,
+                        )
+                        dash_item.setZValue(3)
+                        self._plot.addItem(dash_item)
 
         # --- Layer 2: T1 pick marker (orange star at first-click position) ---
         if (self._pick_mode

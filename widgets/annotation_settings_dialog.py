@@ -44,6 +44,7 @@ _BUILTIN_LABELS: dict[str, str] = {
     "lon":       "Longitude",
     "alt":       "Altitude (above substrate)",
     "depth":     "Depth (below surface)",
+    "heading":   "Heading (degrees true)",
     "pitch":     "Pitch",
     "roll":      "Roll",
 }

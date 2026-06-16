@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from models import (
     AnnotationConfig,
@@ -34,6 +35,7 @@ from models import (
     SelectedTimeRange,
     SensorChannel,
     SensorFileConfig,
+    ThresholdConfig,
     TimeValueSourceConfig,
     VideoRecord,
 )
@@ -173,6 +175,8 @@ class ConfigService:
         pending_job: "Job | None",
         next_job_id: int,
         segment_history: "list[SegmentRecord]",
+        job_history: "list[Job] | None" = None,
+        threshold_history: "list[ThresholdConfig] | None" = None,
         annotation_config: "AnnotationConfig | None" = None,
         frame_rate: float,
         generate_sensor_tiffs: bool,
@@ -189,6 +193,25 @@ class ConfigService:
         dynamic_min_frequency_hz: float = 0.1,
         clahe_clip_limit: float = 2.0,
         clahe_tile_grid_size: int = 8,
+        workspace_path: str = "",
+        # Outputs tab
+        out_nav_2d_cell_size: float = 5.0,
+        out_nav_2d_crs: str = "utm",
+        out_nav_3d_cell_size: float = 1.0,
+        out_nav_slices_step: float = 5.0,
+        out_nav_slices_ppc: int = 4,
+        out_sensor_2d_cell_size: float = 5.0,
+        out_sensor_2d_crs: str = "utm",
+        out_sensor_2d_fill: str = "IDW fill",
+        out_sensor_3d_cell_size: float = 1.0,
+        out_sensor_3d_agg: str = "mean",
+        out_sensor_3d_fill: str = "IDW fill",
+        out_sensor_slices_step: float = 5.0,
+        out_sensor_slices_ppc: int = 4,
+        out_sensor_slices_color: str = "rgb (viridis)",
+        out_sensor_slices_log: bool = False,
+        out_sensor_slices_pct: float = 100.0,
+        **extra_settings: Any,
     ) -> None:
         """Serialise the complete GUI state to a portable workspace JSON file.
 
@@ -200,6 +223,14 @@ class ConfigService:
         Args:
             path: Destination path for the workspace .json file.
             All keyword-only arguments: current GUI settings to save.
+            **extra_settings: Any additional flat (JSON-serialisable) GUI
+                settings.  These are merged into the payload verbatim, which
+                lets the GUI add new persisted settings (e.g. task_stack,
+                photogrammetry options) without this signature having to track
+                every one.  load_workspace() passes them back through
+                unchanged.  Only use this for plain scalars / dicts / lists —
+                anything needing path-relativisation or object reconstruction
+                must be an explicit parameter handled above.
         """
         base = Path(path).resolve().parent
 
@@ -220,6 +251,7 @@ class ConfigService:
             for key, src in (
                 ("altitude_source", nav.altitude_source),
                 ("depth_source",    nav.depth_source),
+                ("heading_source",  nav.heading_source),
                 ("pitch_source",    nav.pitch_source),
                 ("roll_source",     nav.roll_source),
             ):
@@ -233,10 +265,12 @@ class ConfigService:
             "sensor_files":             [rel_sensor_file(sf) for sf in sensor_files],
 
             # Job structure
-            "next_job_id":      next_job_id,
-            "pending_job":      pending_job.to_dict() if pending_job else None,
-            "segment_history":  [r.to_dict() for r in segment_history],
-            "annotation_config": annotation_config.to_dict() if annotation_config else None,
+            "next_job_id":        next_job_id,
+            "pending_job":        pending_job.to_dict() if pending_job else None,
+            "segment_history":    [r.to_dict() for r in segment_history],
+            "job_history":        [j.to_dict() for j in (job_history or [])],
+            "threshold_history":  [t.to_dict() for t in (threshold_history or [])],
+            "annotation_config":  annotation_config.to_dict() if annotation_config else None,
 
             # Pipeline settings
             "frame_rate":            frame_rate,
@@ -262,7 +296,36 @@ class ConfigService:
             # CLAHE contrast-enhancement parameters
             "clahe_clip_limit":     clahe_clip_limit,
             "clahe_tile_grid_size": clahe_tile_grid_size,
+
+            # Original workspace file path (used to restore output dir root after
+            # auto-restore from last_session.json on next startup)
+            "workspace_path": workspace_path,
+
+            # Outputs tab settings — persisted so the user doesn't re-enter
+            # preferred cell sizes, fill methods, etc. every session.
+            "out_nav_2d_cell_size":    out_nav_2d_cell_size,
+            "out_nav_2d_crs":          out_nav_2d_crs,
+            "out_nav_3d_cell_size":    out_nav_3d_cell_size,
+            "out_nav_slices_step":     out_nav_slices_step,
+            "out_nav_slices_ppc":      out_nav_slices_ppc,
+            "out_sensor_2d_cell_size": out_sensor_2d_cell_size,
+            "out_sensor_2d_crs":       out_sensor_2d_crs,
+            "out_sensor_2d_fill":      out_sensor_2d_fill,
+            "out_sensor_3d_cell_size": out_sensor_3d_cell_size,
+            "out_sensor_3d_agg":       out_sensor_3d_agg,
+            "out_sensor_3d_fill":      out_sensor_3d_fill,
+            "out_sensor_slices_step":  out_sensor_slices_step,
+            "out_sensor_slices_ppc":   out_sensor_slices_ppc,
+            "out_sensor_slices_color": out_sensor_slices_color,
+            "out_sensor_slices_log":   out_sensor_slices_log,
+            "out_sensor_slices_pct":   out_sensor_slices_pct,
         }
+
+        # Merge forward-compatible flat settings (task_stack, photogrammetry
+        # options, geo-slice settings, etc.).  Explicit payload keys win so a
+        # stray duplicate in extra_settings can't clobber a relativised path.
+        for key, value in extra_settings.items():
+            payload.setdefault(key, value)
 
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -289,7 +352,13 @@ class ConfigService:
         """
         path = Path(path).resolve()
         base = path.parent  # Resolution root for relative paths inside the file.
-        data = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Could not load workspace file '{path.name}': {exc}\n"
+                "The file may be corrupted or from an incompatible version."
+            ) from exc
 
         # --- Reconstruct NavigationConfig ---
         navigation_file = None
@@ -303,6 +372,8 @@ class ConfigService:
                 longitude_source=ConfigService._load_time_value_source(nav["longitude_source"], base),
                 altitude_source=_opt_src("altitude_source"),
                 depth_source=_opt_src("depth_source"),
+                negate_depth=bool(nav.get("negate_depth", False)),
+                heading_source=_opt_src("heading_source"),
                 pitch_source=_opt_src("pitch_source"),
                 roll_source=_opt_src("roll_source"),
             )
@@ -321,19 +392,37 @@ class ConfigService:
             pj = data["pending_job"]
             pending_job = Job(
                 job_id=int(pj["job_id"]),
+                name=pj.get("name", ""),
                 intervals=[ConfigService._load_interval(i) for i in pj.get("intervals", [])],
                 status=pj.get("status", "pending"),
+                settings_snapshot=pj.get("settings_snapshot", {}),
             )
 
         segment_history: list[SegmentRecord] = []
         for rec in data.get("segment_history", []):
             segment_history.append(SegmentRecord(
                 job_id=int(rec["job_id"]),
+                job_name=rec.get("job_name", ""),
                 interval=ConfigService._load_interval(rec["interval"]),
                 output_path=rec.get("output_path", ""),
                 status=rec.get("status", "completed"),
                 processed_at=ConfigService._parse_dt(rec.get("processed_at")) or datetime.utcnow(),
+                settings_snapshot=rec.get("settings_snapshot", {}),
             ))
+
+        job_history: list[Job] = []
+        for jh in data.get("job_history", []):
+            job_history.append(Job(
+                job_id=int(jh["job_id"]),
+                name=jh.get("name", ""),
+                intervals=[ConfigService._load_interval(i) for i in jh.get("intervals", [])],
+                status=jh.get("status", "pending"),
+                settings_snapshot=jh.get("settings_snapshot", {}),
+            ))
+
+        threshold_history: list[ThresholdConfig] = [
+            ThresholdConfig.from_dict(t) for t in data.get("threshold_history", [])
+        ]
 
         # --- Resolve video directory path ---
         video_dir = _resolve(data.get("video_directory"), base)
@@ -343,7 +432,7 @@ class ConfigService:
         speed_source = ConfigService._load_sensor_file(data["speed_source"], base) if data.get("speed_source") else None
 
         # --- Build and return the complete settings dict ---
-        return {
+        result = {
             "video_directory":          str(video_dir) if video_dir else "",
             "filename_datetime_format": data.get("filename_datetime_format", ""),
             "navigation_file":          navigation_file,
@@ -351,6 +440,8 @@ class ConfigService:
             "next_job_id":              next_job_id,
             "pending_job":              pending_job,
             "segment_history":          segment_history,
+            "job_history":              job_history,
+            "threshold_history":        threshold_history,
             "annotation_config":        AnnotationConfig.from_dict(data["annotation_config"])
                                         if data.get("annotation_config") else None,
             "frame_rate":               float(data.get("frame_rate", 1.0)),
@@ -368,7 +459,34 @@ class ConfigService:
             "dynamic_min_frequency_hz": float(data.get("dynamic_min_frequency_hz", 0.1)),
             "clahe_clip_limit":         float(data.get("clahe_clip_limit", 2.0)),
             "clahe_tile_grid_size":     int(data.get("clahe_tile_grid_size", 8)),
+            "workspace_path":           data.get("workspace_path", ""),
+            # Outputs tab
+            "out_nav_2d_cell_size":     float(data.get("out_nav_2d_cell_size", 5.0)),
+            "out_nav_2d_crs":           data.get("out_nav_2d_crs", "utm"),
+            "out_nav_3d_cell_size":     float(data.get("out_nav_3d_cell_size", 1.0)),
+            "out_nav_slices_step":      float(data.get("out_nav_slices_step", 5.0)),
+            "out_nav_slices_ppc":       int(data.get("out_nav_slices_ppc", 4)),
+            "out_sensor_2d_cell_size":  float(data.get("out_sensor_2d_cell_size", 5.0)),
+            "out_sensor_2d_crs":        data.get("out_sensor_2d_crs", "utm"),
+            "out_sensor_2d_fill":       data.get("out_sensor_2d_fill", "IDW fill"),
+            "out_sensor_3d_cell_size":  float(data.get("out_sensor_3d_cell_size", 1.0)),
+            "out_sensor_3d_agg":        data.get("out_sensor_3d_agg", "mean"),
+            "out_sensor_3d_fill":       data.get("out_sensor_3d_fill", "IDW fill"),
+            "out_sensor_slices_step":   float(data.get("out_sensor_slices_step", 5.0)),
+            "out_sensor_slices_ppc":    int(data.get("out_sensor_slices_ppc", 4)),
+            "out_sensor_slices_color":  data.get("out_sensor_slices_color", "rgb (viridis)"),
+            "out_sensor_slices_log":    bool(data.get("out_sensor_slices_log", False)),
+            "out_sensor_slices_pct":    float(data.get("out_sensor_slices_pct", 100.0)),
         }
+
+        # Pass through any remaining flat settings saved via save_workspace's
+        # **extra_settings catch-all (task_stack, photo_* options, geo-slice
+        # settings, qgis_project_name, …).  setdefault keeps the reconstructed
+        # objects above authoritative; only genuinely unhandled keys are added.
+        for key, value in data.items():
+            result.setdefault(key, value)
+
+        return result
 
     # ---------------------------------------------------------------------------
     # Private deserialization helpers
@@ -389,6 +507,7 @@ class ConfigService:
             date_column=data.get("date_column"),
             start_time=ConfigService._parse_dt(data.get("start_time")),
             end_time=ConfigService._parse_dt(data.get("end_time")),
+            no_header=bool(data.get("no_header", False)),
         )
 
     @staticmethod
@@ -416,6 +535,7 @@ class ConfigService:
             channels=channels,
             start_time=ConfigService._parse_dt(data.get("start_time")),
             end_time=ConfigService._parse_dt(data.get("end_time")),
+            no_header=bool(data.get("no_header", False)),
         )
 
     @staticmethod
@@ -438,6 +558,8 @@ class ConfigService:
         return SelectedTimeRange(
             start_time=datetime.fromisoformat(data["start_time"]),
             end_time=datetime.fromisoformat(data["end_time"]),
+            source=data.get("source", "manual"),
+            threshold_desc=data.get("threshold_desc", ""),
         )
 
     # ---------------------------------------------------------------------------

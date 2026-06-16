@@ -95,30 +95,51 @@ class SensorService:
         return df[SensorService._PPI_COLS]
 
     @staticmethod
-    def _read_file(path: str | Path, nrows: int | None = None) -> pd.DataFrame:
+    def _read_file(
+        path: str | Path,
+        nrows: int | None = None,
+        no_header: bool = False,
+    ) -> pd.DataFrame:
         """Dispatch to the appropriate file reader based on file extension.
 
         Args:
-            path:  Path to a CSV or .ppi file.
-            nrows: Limit rows read (useful for preview/column-sniffing).
+            path:      Path to a CSV or .ppi file.
+            nrows:     Limit rows read (useful for preview/column-sniffing).
+            no_header: When True, load with header=None and rename integer
+                       columns to their string equivalents ("0", "1", …).
         """
         if SensorService._is_ppi(path):
             return SensorService._read_ppi(path, nrows=nrows)
         kwargs: dict = {}
         if nrows is not None:
             kwargs["nrows"] = nrows
-        # Standard CSV; pandas will infer delimiter, quoting, etc.
-        return pd.read_csv(path, **kwargs)
+        if no_header:
+            kwargs["header"] = None
+        df = pd.read_csv(path, **kwargs)
+        if no_header:
+            df.columns = [str(c) for c in df.columns]
+        return df
 
     @staticmethod
-    def read_preview(csv_path: str | Path, nrows: int = 20) -> pd.DataFrame:
+    def read_preview(
+        csv_path: str | Path,
+        nrows: int = 20,
+        no_header: bool = False,
+    ) -> pd.DataFrame:
         """Read the first nrows rows of a file for display in the import dialog."""
-        return SensorService._read_file(csv_path, nrows=nrows)
+        return SensorService._read_file(csv_path, nrows=nrows, no_header=no_header)
 
     @staticmethod
-    def read_columns(csv_path: str | Path) -> list[str]:
+    def read_columns(
+        csv_path: str | Path,
+        no_header: bool = False,
+    ) -> list[str]:
         """Return the list of column names from a file without reading any data rows."""
-        df = SensorService._read_file(csv_path, nrows=0)
+        if no_header:
+            # header=None with nrows=0 returns an empty frame; read 1 row instead.
+            df = SensorService._read_file(csv_path, nrows=1, no_header=True)
+        else:
+            df = SensorService._read_file(csv_path, nrows=0)
         return [str(column) for column in df.columns]
 
     # ---------------------------------------------------------------------------
@@ -283,7 +304,8 @@ class SensorService:
             """Convert a time string (HH:MM:SS or HH:MM.frac) to seconds-of-day.
 
             Supports hours >= 24 for instruments that don't reset at midnight.
-            Returns NaN for values that can't be parsed.
+            Returns NaN for values that can't be parsed or have out-of-range
+            minutes/seconds (which indicate malformed data, not intentional overflow).
             """
             if pd.isna(val):
                 return np.nan
@@ -291,11 +313,12 @@ class SensorService:
             s = SensorService._fix_decimal_minutes(str(val).strip())
             parts = s.split(":")
             try:
-                return (
-                    int(parts[0]) * 3600.0
-                    + int(parts[1]) * 60.0
-                    + (float(parts[2]) if len(parts) > 2 else 0.0)
-                )
+                h   = int(parts[0])
+                m   = int(parts[1])
+                sec = float(parts[2]) if len(parts) > 2 else 0.0
+                if not (0 <= m < 60 and 0.0 <= sec < 60.0):
+                    return np.nan  # malformed — minutes/seconds out of range
+                return h * 3600.0 + m * 60.0 + sec
             except (ValueError, IndexError):
                 return np.nan
 
@@ -336,6 +359,7 @@ class SensorService:
         timestamp_column: str,
         channels: list[SensorChannel],
         date_column: str | None = None,
+        no_header: bool = False,
     ) -> SensorFileConfig:
         """Read a sensor CSV and return a fully-populated SensorFileConfig.
 
@@ -345,7 +369,7 @@ class SensorService:
         Raises:
             ValueError: If no valid timestamps are found in the specified column.
         """
-        df = SensorService._read_file(csv_path)
+        df = SensorService._read_file(csv_path, no_header=no_header)
 
         # Parse timestamps and drop NaN rows before computing the range.
         timestamps = SensorService._get_timestamp_series(df, timestamp_column, date_column).dropna()
@@ -364,6 +388,7 @@ class SensorService:
             channels=channels,
             start_time=start_dt,
             end_time=end_dt,
+            no_header=no_header,
         )
 
     @staticmethod
@@ -372,6 +397,7 @@ class SensorService:
         timestamp_column: str,
         value_column: str,
         date_column: str | None = None,
+        no_header: bool = False,
     ) -> TimeValueSourceConfig:
         """Read a navigation CSV column and return a TimeValueSourceConfig.
 
@@ -381,7 +407,7 @@ class SensorService:
         Raises:
             ValueError: If timestamps or values are entirely non-numeric/missing.
         """
-        df = SensorService._read_file(csv_path)
+        df = SensorService._read_file(csv_path, no_header=no_header)
 
         timestamps = SensorService._get_timestamp_series(df, timestamp_column, date_column).dropna()
         if timestamps.empty:
@@ -402,6 +428,7 @@ class SensorService:
             date_column=date_column,
             start_time=start_dt,
             end_time=end_dt,
+            no_header=no_header,
         )
 
     @staticmethod
@@ -410,6 +437,7 @@ class SensorService:
         longitude_source: TimeValueSourceConfig,
         altitude_source: TimeValueSourceConfig | None = None,
         depth_source: TimeValueSourceConfig | None = None,
+        heading_source: TimeValueSourceConfig | None = None,
         pitch_source: TimeValueSourceConfig | None = None,
         roll_source: TimeValueSourceConfig | None = None,
     ) -> NavigationConfig:
@@ -422,6 +450,7 @@ class SensorService:
             longitude_source=longitude_source,
             altitude_source=altitude_source,
             depth_source=depth_source,
+            heading_source=heading_source,
             pitch_source=pitch_source,
             roll_source=roll_source,
         )
@@ -447,7 +476,7 @@ class SensorService:
         Raises:
             ValueError: If any configured column is missing from the file.
         """
-        df = SensorService._read_file(config.csv_path)
+        df = SensorService._read_file(config.csv_path, no_header=getattr(config, "no_header", False))
 
         # Build the list of columns we need from the file.
         cols = [config.timestamp_column] + [channel.source_column for channel in config.channels]
@@ -476,17 +505,25 @@ class SensorService:
         return result
 
     @staticmethod
-    def load_time_value_dataframe(config: TimeValueSourceConfig) -> pd.DataFrame:
+    def load_time_value_dataframe(
+        config: TimeValueSourceConfig,
+        negate: bool = False,
+    ) -> pd.DataFrame:
         """Load a navigation CSV column and return a two-column (unix_time, value) DataFrame.
 
         Used to load latitude, longitude, and altitude series for the pipeline
         and for the map/timeline widgets.  Returns only the two columns needed
         for interpolation; all other columns are discarded.
 
+        Args:
+            config: The source configuration describing file, timestamp, and value columns.
+            negate: When True, multiply all values by -1 after loading.  Used to
+                    convert positive depth readings to negative Z coordinates.
+
         Raises:
             ValueError: If the required columns are missing from the file.
         """
-        df = SensorService._read_file(config.csv_path)
+        df = SensorService._read_file(config.csv_path, no_header=getattr(config, "no_header", False))
 
         cols = [config.timestamp_column, config.value_column]
         if config.date_column is not None and config.date_column not in cols:
@@ -508,6 +545,11 @@ class SensorService:
         # sort and deduplicate on the time axis.
         result = result.dropna(subset=["unix_time", "value"]).sort_values("unix_time")
         result = result.drop_duplicates(subset=["unix_time"])
+
+        # Apply optional sign inversion (e.g. depth positive → negative).
+        if negate:
+            result = result.copy()
+            result["value"] = -result["value"]
 
         # Return only the two columns the pipeline needs; drop the original
         # raw timestamp and value columns to keep the result clean.
