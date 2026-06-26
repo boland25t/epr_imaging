@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(QT_QPA_PLATFORM=offscreen conda run -n epr_imaging_venv python -c ' *)",
+      "Bash(xargs -I{} sh -c 'echo {}; head -1 \"{}\"')",
+      "Bash(QT_QPA_PLATFORM=offscreen timeout 30 conda run -n epr_imaging_venv python app.py)",
+      "Bash(python3 -c \"import json,os; p=os.path.expanduser\\('~/.config/epr_imaging/last_session.json'\\); print\\('exists:', os.path.exists\\(p\\)\\); json.load\\(open\\(p\\)\\) if os.path.exists\\(p\\) else None; print\\('valid JSON' \\)\")",
+      "Bash(QT_QPA_PLATFORM=offscreen timeout 90 conda run -n epr_imaging_venv python -c ' *)",
+      "Bash(grep -n \"self.log.emit$\\\\|= self.log.emit\\\\|self.log.emit\\\\b\" stack_runner.py)",
+      "Bash(awk '/def _resolve_task_target/,/^    def [a-z]/' main_window.py)",
+      "Bash(grep -vE \"^QML|qt.qpa|libpng|Warning|^$\")",
+      "Bash(git checkout *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(gh auth *)",
+      "Bash(git reset *)",
+      "Bash(git switch *)",
+      "Bash(git branch *)"
+    ]
+  }
+}

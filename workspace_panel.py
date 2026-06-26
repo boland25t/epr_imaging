@@ -391,13 +391,29 @@ class WorkspacePanel(QWidget):
                             ])
                             child.setData(0, _ROLE_PATH, str(f))
 
-        # --- Outputs section ---
+        # --- Outputs section (full-dataset scope: <workspace>/outputs) ---
         outputs = root / "outputs"
-        if not outputs.is_dir():
-            return
+        if outputs.is_dir():
+            out_node = self._group_node(
+                self._tree.invisibleRootItem(), "outputs/", str(outputs), expanded
+            )
+            self._add_outputs_subtree(out_node, outputs, expanded)
 
-        out_node = self._group_node(self._tree.invisibleRootItem(), "outputs/", str(outputs), expanded)
-        self._add_outputs_subtree(out_node, outputs, expanded)
+        # --- Per-job outputs (job-scoped tasks: <workspace>/<job_dir>/outputs) ---
+        # Job/sampling tasks write under a sibling directory, so scan every
+        # immediate subdirectory that has its own 'outputs/' folder and surface
+        # it as its own section.  Without this, job-scoped products (photogram-
+        # metry, sensor 3-D, …) are invisible in the tree.
+        for sub in sorted(p for p in root.iterdir() if p.is_dir()):
+            if sub.name in ("outputs", "inputs", "logs"):
+                continue
+            job_outputs = sub / "outputs"
+            if job_outputs.is_dir():
+                node = self._group_node(
+                    self._tree.invisibleRootItem(),
+                    f"{sub.name}/outputs/", str(job_outputs), expanded,
+                )
+                self._add_outputs_subtree(node, job_outputs, expanded)
 
     def _add_source_subtree(self, expanded: set) -> None:
         """Add a collapsible 'Source Files' section for configured inputs."""
@@ -567,10 +583,16 @@ class WorkspacePanel(QWidget):
             bits.append("dense cloud")
         elif (run_dir / "sparse_cloud.ply").exists():
             bits.append("sparse cloud")
+        if (run_dir / "mesh_poisson.ply").exists():
+            bits.append("Poisson mesh")
+        if (run_dir / "mesh_delaunay.ply").exists():
+            bits.append("Delaunay mesh")
         if (run_dir / "mesh_textured.obj").exists():
             bits.append("textured mesh")
         elif (run_dir / "mesh.obj").exists():
             bits.append("mesh")
+        if (run_dir / "camera_trajectory.ply").exists():
+            bits.append("trajectory")
         return ", ".join(bits)
 
     def _add_versioned_runs(
@@ -848,27 +870,33 @@ class WorkspacePanel(QWidget):
         self._photo_run_context_menu(Path(path), pos)
 
     def _photo_run_context_menu(self, run_dir: Path, pos) -> None:
-        """Context menu for a photogrammetry run: pick the best product to open."""
+        """Context menu for a photogrammetry run: open any produced product.
+
+        Builds one "Open …" action per product file that actually exists
+        (Metashape and COLMAP, dense/sparse/mesh/trajectory), routing 3-D files
+        to the viewer, .psx to Metashape, and .pdf to the OS.
+        """
         from PySide6.QtWidgets import QMenu
 
-        # Prefer the dense cloud for the 3D viewer; fall back to sparse.
-        cloud = None
-        for name in ("dense_cloud.ply", "sparse_cloud.ply"):
-            if (run_dir / name).exists():
-                cloud = run_dir / name
-                break
-        # Mesh: textured preferred over plain.
-        mesh = None
-        for name in ("mesh_textured.obj", "mesh.obj"):
-            if (run_dir / name).exists():
-                mesh = run_dir / name
-                break
+        # (filename, menu label) — listed best-first; only existing files appear.
+        viewer_products = [
+            ("dense_cloud.ply",      "Open dense cloud in 3D Viewer"),
+            ("sparse_cloud.ply",     "Open sparse cloud in 3D Viewer"),
+            ("mesh_poisson.ply",     "Open Poisson mesh in 3D Viewer"),
+            ("mesh_delaunay.ply",    "Open Delaunay mesh in 3D Viewer"),
+            ("mesh_textured.obj",    "Open textured mesh in 3D Viewer"),
+            ("mesh.obj",             "Open mesh in 3D Viewer"),
+            ("camera_trajectory.ply", "Open camera trajectory in 3D Viewer"),
+        ]
+        menu = QMenu(self)
+        viewer_actions: dict = {}
+        for fname, label in viewer_products:
+            p = run_dir / fname
+            if p.exists():
+                viewer_actions[menu.addAction(label)] = p
+
         psx    = run_dir / "project.psx"
         report = run_dir / "report.pdf"
-
-        menu = QMenu(self)
-        cloud_action  = menu.addAction("Open point cloud in 3D Viewer") if cloud else None
-        mesh_action   = menu.addAction("Open mesh in 3D Viewer") if mesh else None
         psx_action    = menu.addAction("Open in Metashape GUI") if psx.exists() else None
         report_action = menu.addAction("Open report (PDF)") if report.exists() else None
         if menu.isEmpty():
@@ -877,10 +905,8 @@ class WorkspacePanel(QWidget):
         chosen = menu.exec(self._tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
-        if chosen is cloud_action and cloud:
-            self.open_in_viewer_requested.emit(str(cloud))
-        elif chosen is mesh_action and mesh:
-            self.open_in_viewer_requested.emit(str(mesh))
+        if chosen in viewer_actions:
+            self.open_in_viewer_requested.emit(str(viewer_actions[chosen]))
         elif chosen is psx_action:
             self.open_in_metashape_requested.emit(str(psx))
         elif chosen is report_action:

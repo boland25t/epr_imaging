@@ -610,20 +610,37 @@ def launch_in_metashape(psx_path: str, exe: Optional[str] = None) -> None:
 def run_colmap(
     run_dir: Path,
     frame_dir: str,
-    build_dense: bool = True,
-    max_features: int = 8192,
+    *,
+    nav_csv: Optional[str] = None,
+    single_camera: bool = True,
     matcher: str = "Exhaustive",
+    max_features: int = 8192,
+    georeference: bool = True,
+    build_dense: bool = True,
+    export_camera_trajectory: bool = True,
+    export_undistorted: bool = False,
+    export_depth_maps: bool = False,
+    build_poisson_mesh: bool = False,
+    build_delaunay_mesh: bool = False,
     colmap_bin: str = "colmap",
     log_fn: Optional[Callable[[str], None]] = None,
+    file_log_fn: Optional[Callable[[str], None]] = None,
 ) -> dict[str, str]:
-    """Run the COLMAP SfM + (optional) MVS pipeline via CLI subprocess.
+    """Run the COLMAP SfM (+ optional MVS, meshing, georeferencing) pipeline.
 
-    Stages:
-      1. feature_extractor
-      2. matcher  (exhaustive / sequential / vocab_tree per `matcher`)
-      3. mapper
-      4. model_converter (bin → PLY)
-      5. [dense] image_undistorter → patch_match_stereo → stereo_fusion
+    Pipeline (stages gated by the toggles):
+      1. feature_extractor          (single_camera optional)
+      2. <matcher>                  (exhaustive / sequential / vocab_tree / spatial)
+      3. mapper                     → sparse model
+      4. model_aligner              → georeference to nav (UTM E/N/alt) if requested
+      5. export sparse cloud PLY
+      6. export camera trajectory   (PLY of camera centres + JSON)
+      7. image_undistorter → patch_match_stereo → stereo_fusion → dense cloud PLY
+      8. poisson_mesher             → watertight mesh PLY
+      9. delaunay_mesher            → detail-preserving mesh PLY
+
+    All georeferenced products (sparse, trajectory, dense, meshes) come out in
+    the navigation UTM frame when `georeference` is on and nav_csv is provided.
 
     Returns dict mapping product keys to absolute file paths.
     """
@@ -635,7 +652,9 @@ def run_colmap(
     if not photos:
         raise FileNotFoundError(f"No images found in {frame_dir}")
     log(f"COLMAP: {len(photos)} frames from {frame_dir}")
-    log(f"COLMAP: matcher={matcher}, max_features={max_features}, dense={build_dense}")
+    log(f"COLMAP: matcher={matcher}, max_features={max_features}, single_camera={single_camera}")
+    log(f"COLMAP: georeference={georeference}, dense={build_dense}, "
+        f"poisson={build_poisson_mesh}, delaunay={build_delaunay_mesh}")
 
     colmap_dir = run_dir / "colmap"
     colmap_dir.mkdir(exist_ok=True)
@@ -644,20 +663,38 @@ def run_colmap(
     dense_dir  = colmap_dir / "dense"
     sparse_dir.mkdir(exist_ok=True)
 
+    products: dict[str, str] = {}
+
     # ── 1. Feature extraction ──────────────────────────────────────────────
     log(f"COLMAP: extracting features (max={max_features})…")
-    _colmap_run(colmap_bin, [
+    feat_args = [
         "feature_extractor",
         "--database_path", str(db_path),
         "--image_path",    frame_dir,
         "--SiftExtraction.max_num_features", str(max_features),
         "--ImageReader.camera_model", "RADIAL",
-    ], log)
+    ]
+    if single_camera:
+        feat_args += ["--ImageReader.single_camera", "1"]
+    _colmap_run(colmap_bin, feat_args, log, file_log_fn)
+
+    # ── 1b. Build geo.txt + inject position priors (for georef / spatial) ───
+    geo_txt: Optional[Path] = None
+    if (georeference or matcher.lower() == "spatial") and nav_csv:
+        geo_txt = colmap_dir / "geo.txt"
+        n = _build_colmap_geo_txt(nav_csv, photos, geo_txt, log)
+        if n == 0:
+            log("  ⚠ No frame→position matches found in nav CSV; georeferencing disabled.")
+            geo_txt = None
+        else:
+            products["georef_txt"] = str(geo_txt)
+            if matcher.lower() == "spatial":
+                _inject_db_positions(db_path, geo_txt, log)
 
     # ── 2. Matching ────────────────────────────────────────────────────────
     matcher_cmd = _COLMAP_MATCHER_CMD.get(matcher.lower(), "exhaustive_matcher")
     log(f"COLMAP: {matcher.lower()} feature matching…")
-    _colmap_run(colmap_bin, [matcher_cmd, "--database_path", str(db_path)], log)
+    _colmap_run(colmap_bin, [matcher_cmd, "--database_path", str(db_path)], log, file_log_fn)
 
     # ── 3. Sparse reconstruction ───────────────────────────────────────────
     log("COLMAP: sparse reconstruction (mapper)…")
@@ -666,7 +703,7 @@ def run_colmap(
         "--database_path", str(db_path),
         "--image_path",    frame_dir,
         "--output_path",   str(sparse_dir),
-    ], log)
+    ], log, file_log_fn)
 
     sparse_model = sparse_dir / "0"
     if not sparse_model.exists():
@@ -675,63 +712,356 @@ def run_colmap(
             "Check image overlap — underwater images may need higher quality preset."
         )
 
-    # ── 4. Export sparse PLY ───────────────────────────────────────────────
+    # ── 4. Georeference to navigation (model_aligner) ───────────────────────
+    #     Aligns the sparse model into the nav UTM frame; everything downstream
+    #     (dense, meshes, trajectory) inherits the georeferenced coordinates.
+    model = sparse_model
+    if georeference and geo_txt is not None:
+        geo_model = colmap_dir / "sparse_geo"
+        geo_model.mkdir(exist_ok=True)
+        log("COLMAP: georeferencing to navigation (model_aligner)…")
+        try:
+            _colmap_run(colmap_bin, [
+                "model_aligner",
+                "--input_path",          str(sparse_model),
+                "--output_path",         str(geo_model),
+                "--ref_images_path",     str(geo_txt),
+                "--ref_is_gps",          "0",
+                "--alignment_type",      "custom",
+                "--alignment_max_error", "3.0",
+            ], log, file_log_fn)
+            if (geo_model / "images.bin").exists() or (geo_model / "images.txt").exists():
+                model = geo_model
+                log("  ✓ model georeferenced into navigation UTM frame")
+            else:
+                log("  ⚠ model_aligner produced no output; using un-georeferenced model")
+        except Exception as exc:  # noqa: BLE001 — georef is best-effort
+            log(f"  ⚠ Georeferencing failed (continuing un-georeferenced): {exc}")
+
+    # ── 5. Export sparse cloud PLY ──────────────────────────────────────────
     sparse_ply = run_dir / "sparse_cloud.ply"
     _colmap_run(colmap_bin, [
         "model_converter",
-        "--input_path",  str(sparse_model),
+        "--input_path",  str(model),
         "--output_path", str(sparse_ply),
         "--output_type", "PLY",
-    ], log)
+    ], log, file_log_fn)
+    products["sparse_ply"] = str(sparse_ply)
     log(f"Sparse cloud: {sparse_ply}")
 
-    products: dict[str, str] = {"sparse_ply": str(sparse_ply)}
+    # ── 6. Camera trajectory (camera centres + poses) ───────────────────────
+    if export_camera_trajectory:
+        try:
+            traj_ply  = run_dir / "camera_trajectory.ply"
+            traj_json = run_dir / "cameras.json"
+            n = _export_colmap_trajectory(model, traj_ply, traj_json, colmap_bin, log)
+            if n > 0:
+                products["camera_trajectory_ply"] = str(traj_ply)
+                products["cameras_json"]          = str(traj_json)
+                log(f"Camera trajectory: {traj_ply} ({n} cameras)")
+        except Exception as exc:  # noqa: BLE001 — non-fatal QA product
+            log(f"  ⚠ Camera trajectory export skipped: {exc}")
 
-    # ── 5. Dense reconstruction ────────────────────────────────────────────
+    # ── 7. Dense reconstruction (best-effort: never discards the sparse cloud) ─
     if build_dense:
-        dense_dir.mkdir(exist_ok=True)
-        log("COLMAP: undistorting images…")
-        _colmap_run(colmap_bin, [
-            "image_undistorter",
-            "--image_path",  frame_dir,
-            "--input_path",  str(sparse_model),
-            "--output_path", str(dense_dir),
-            "--output_type", "COLMAP",
-        ], log)
+        try:
+            dense_dir.mkdir(exist_ok=True)
+            log("COLMAP: undistorting images…")
+            _colmap_run(colmap_bin, [
+                "image_undistorter",
+                "--image_path",  frame_dir,
+                "--input_path",  str(model),
+                "--output_path", str(dense_dir),
+                "--output_type", "COLMAP",
+            ], log, file_log_fn)
+            if export_undistorted and (dense_dir / "images").is_dir():
+                products["undistorted_dir"] = str(dense_dir / "images")
+                log(f"Undistorted frames: {dense_dir / 'images'}")
 
-        log("COLMAP: PatchMatch stereo (GPU required)…")
-        _colmap_run(colmap_bin, [
-            "patch_match_stereo",
-            "--workspace_path", str(dense_dir),
-        ], log)
+            log("COLMAP: PatchMatch stereo (CUDA GPU required)…")
+            _colmap_run(colmap_bin, [
+                "patch_match_stereo",
+                "--workspace_path", str(dense_dir),
+            ], log, file_log_fn)
+            if export_depth_maps and (dense_dir / "stereo" / "depth_maps").is_dir():
+                products["depth_maps_dir"] = str(dense_dir / "stereo" / "depth_maps")
+                products["normal_maps_dir"] = str(dense_dir / "stereo" / "normal_maps")
+                log(f"Depth/normal maps: {dense_dir / 'stereo'}")
 
-        log("COLMAP: stereo fusion…")
-        dense_ply = run_dir / "dense_cloud.ply"
-        _colmap_run(colmap_bin, [
-            "stereo_fusion",
-            "--workspace_path", str(dense_dir),
-            "--output_path",    str(dense_ply),
-        ], log)
-        products["dense_ply"] = str(dense_ply)
-        log(f"Dense cloud: {dense_ply}")
+            log("COLMAP: stereo fusion…")
+            dense_ply = run_dir / "dense_cloud.ply"
+            _colmap_run(colmap_bin, [
+                "stereo_fusion",
+                "--workspace_path", str(dense_dir),
+                "--output_path",    str(dense_ply),
+            ], log, file_log_fn)
+            products["dense_ply"] = str(dense_ply)
+            log(f"Dense cloud: {dense_ply}")
 
-    log("COLMAP run complete.")
+            fused = dense_dir / "fused.ply"
+            if not fused.exists():
+                fused = dense_ply  # some COLMAP builds write directly to output_path
+
+            # ── 8. Poisson mesh ────────────────────────────────────────────
+            if build_poisson_mesh:
+                try:
+                    mesh_p = run_dir / "mesh_poisson.ply"
+                    log("COLMAP: Poisson meshing…")
+                    _colmap_run(colmap_bin, [
+                        "poisson_mesher",
+                        "--input_path",  str(fused),
+                        "--output_path", str(mesh_p),
+                    ], log, file_log_fn)
+                    products["mesh_poisson_ply"] = str(mesh_p)
+                    log(f"Poisson mesh: {mesh_p}")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"  ⚠ Poisson meshing failed: {exc}")
+
+            # ── 9. Delaunay mesh ───────────────────────────────────────────
+            if build_delaunay_mesh:
+                try:
+                    mesh_d = run_dir / "mesh_delaunay.ply"
+                    log("COLMAP: Delaunay meshing…")
+                    _colmap_run(colmap_bin, [
+                        "delaunay_mesher",
+                        "--input_path",  str(dense_dir),
+                        "--output_path", str(mesh_d),
+                    ], log, file_log_fn)
+                    products["mesh_delaunay_ply"] = str(mesh_d)
+                    log(f"Delaunay mesh: {mesh_d}")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"  ⚠ Delaunay meshing failed: {exc}")
+
+        except Exception as exc:  # noqa: BLE001 — keep sparse cloud on dense failure
+            log(f"  ⚠ Dense reconstruction failed — sparse cloud is preserved. Reason: {exc}")
+            log("    (PatchMatch stereo requires a CUDA GPU; check GPU availability in WSL.)")
+
+    # Final product summary with explicit paths.
+    log(f"COLMAP run complete. Products written under: {run_dir}")
+    for key, path in products.items():
+        log(f"  [colmap] {key}: {path}")
     return products
 
 
-def _colmap_run(colmap_bin: str, args: list[str], log_fn: Callable) -> None:
-    """Run one COLMAP CLI stage, streaming stdout/stderr to log_fn."""
+def _build_colmap_geo_txt(nav_csv: str, photos: list[str], out_path: Path,
+                          log_fn: Callable) -> int:
+    """Write a COLMAP geo.txt (`image_name X Y Z` per line) from an interp CSV.
+
+    Uses UTM easting/northing and Z = -depth — the SAME convention as the app's
+    sensor/nav 3-D PLYs (see _neg_depth_csv) — so a georeferenced COLMAP cloud
+    overlays the sensor products in one viewer scene.  Falls back to converting
+    lat/lon when easting/northing are absent.  Returns the number of lines.
+    """
+    import math
+    import pandas as pd
+
+    df = pd.read_csv(nav_csv)
+    cols = {c.lower(): c for c in df.columns}
+    name_col = cols.get("frame_filename") or cols.get("filename")
+    if name_col is None:
+        log_fn("  ⚠ geo.txt: nav CSV has no frame_filename column.")
+        return 0
+
+    e_col, n_col = cols.get("easting"), cols.get("northing")
+    lat_col = cols.get("lat") or cols.get("latitude")
+    lon_col = cols.get("lon") or cols.get("longitude")
+    d_col   = cols.get("depth") or cols.get("water_depth")
+
+    photo_names = {Path(p).name for p in photos}
+    out_lines: list[str] = []
+    for _, row in df.iterrows():
+        name = str(row[name_col]).strip()
+        if not name or name not in photo_names:
+            continue
+        try:
+            if e_col and n_col:
+                x, y = float(row[e_col]), float(row[n_col])
+            elif lat_col and lon_col:
+                import utm
+                x, y, *_ = utm.from_latlon(float(row[lat_col]), float(row[lon_col]))
+            else:
+                continue
+            z = -float(row[d_col]) if (d_col and pd.notna(row[d_col])) else 0.0
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            continue
+        out_lines.append(f"{name} {x:.4f} {y:.4f} {z:.4f}")
+
+    out_path.write_text("\n".join(out_lines) + ("\n" if out_lines else ""))
+    log_fn(f"  geo.txt: {len(out_lines)} frame positions written → {out_path}")
+    return len(out_lines)
+
+
+def _inject_db_positions(db_path: Path, geo_txt: Path, log_fn: Callable) -> None:
+    """Write position priors into the COLMAP database for spatial matching.
+
+    Best-effort: updates images.prior_tx/ty/tz keyed by image name.  Silently
+    no-ops (with a log line) if the schema differs across COLMAP versions.
+    """
+    import sqlite3
+
+    pos: dict[str, tuple] = {}
+    for line in geo_txt.read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            try:
+                pos[parts[0]] = (float(parts[1]), float(parts[2]), float(parts[3]))
+            except ValueError:
+                continue
+    if not pos:
+        return
+    try:
+        con = sqlite3.connect(str(db_path))
+        cur = con.cursor()
+        have = {r[1] for r in cur.execute("PRAGMA table_info(images)").fetchall()}
+        if not {"prior_tx", "prior_ty", "prior_tz"}.issubset(have):
+            log_fn("  ⚠ spatial matching: DB lacks prior position columns; skipping injection.")
+            con.close()
+            return
+        updated = 0
+        for name, (x, y, z) in pos.items():
+            cur.execute(
+                "UPDATE images SET prior_tx=?, prior_ty=?, prior_tz=? WHERE name=?",
+                (x, y, z, name),
+            )
+            updated += cur.rowcount
+        con.commit()
+        con.close()
+        log_fn(f"  spatial matching: injected positions for {updated} image(s)")
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        log_fn(f"  ⚠ spatial matching: DB position injection failed: {exc}")
+
+
+def _export_colmap_trajectory(model_dir: Path, out_ply: Path, out_json: Path,
+                              colmap_bin: str, log_fn: Callable) -> int:
+    """Export camera centres + poses from a COLMAP model.
+
+    Converts the model to TXT, parses images.txt (camera centre C = -Rᵀ·t),
+    and writes:
+      • out_ply  — one coloured point per camera (the camera path)
+      • out_json — per-camera name, centre, and quaternion
+    Returns the number of cameras exported.
+    """
+    import tempfile
+
+    txt_dir = Path(tempfile.mkdtemp(prefix="colmap_txt_"))
+    _colmap_run(colmap_bin, [
+        "model_converter",
+        "--input_path",  str(model_dir),
+        "--output_path", str(txt_dir),
+        "--output_type", "TXT",
+    ], log_fn)
+
+    images_txt = txt_dir / "images.txt"
+    if not images_txt.exists():
+        return 0
+
+    data_lines = [l for l in images_txt.read_text().splitlines()
+                  if l.strip() and not l.startswith("#")]
+    cams: list[dict] = []
+    # COLMAP images.txt: 2 lines per image (header, then 2-D points). Take headers.
+    for k in range(0, len(data_lines), 2):
+        parts = data_lines[k].split()
+        if len(parts) < 10:
+            continue
+        try:
+            qw, qx, qy, qz, tx, ty, tz = map(float, parts[1:8])
+        except ValueError:
+            continue
+        name = parts[9]
+        cx, cy, cz = _camera_center(qw, qx, qy, qz, tx, ty, tz)
+        cams.append({"name": name, "center": [cx, cy, cz], "quat": [qw, qx, qy, qz]})
+
+    if not cams:
+        return 0
+    cams.sort(key=lambda c: c["name"])  # frame order → connectable path
+
+    # ASCII PLY of camera centres (amber so the path stands out over clouds).
+    hdr = [
+        "ply", "format ascii 1.0", f"element vertex {len(cams)}",
+        "property float x", "property float y", "property float z",
+        "property uchar red", "property uchar green", "property uchar blue",
+        "end_header",
+    ]
+    body = [f"{c['center'][0]:.4f} {c['center'][1]:.4f} {c['center'][2]:.4f} 255 200 0"
+            for c in cams]
+    out_ply.write_text("\n".join(hdr + body) + "\n")
+    out_json.write_text(json.dumps({"cameras": cams}, indent=2))
+    return len(cams)
+
+
+def _camera_center(qw: float, qx: float, qy: float, qz: float,
+                   tx: float, ty: float, tz: float) -> tuple:
+    """COLMAP camera centre in world coords: C = -Rᵀ·t (R = world→cam rotation)."""
+    # Rotation matrix from a Hamilton quaternion (COLMAP convention).
+    r00 = 1 - 2 * (qy * qy + qz * qz)
+    r01 = 2 * (qx * qy - qz * qw)
+    r02 = 2 * (qx * qz + qy * qw)
+    r10 = 2 * (qx * qy + qz * qw)
+    r11 = 1 - 2 * (qx * qx + qz * qz)
+    r12 = 2 * (qy * qz - qx * qw)
+    r20 = 2 * (qx * qz - qy * qw)
+    r21 = 2 * (qy * qz + qx * qw)
+    r22 = 1 - 2 * (qx * qx + qy * qy)
+    # C = -Rᵀ t
+    cx = -(r00 * tx + r10 * ty + r20 * tz)
+    cy = -(r01 * tx + r11 * ty + r21 * tz)
+    cz = -(r02 * tx + r12 * ty + r22 * tz)
+    return cx, cy, cz
+
+
+# Hard cap on log lines forwarded per COLMAP stage.  COLMAP (esp.
+# patch_match_stereo / feature_extractor) can emit tens of thousands of
+# progress lines; forwarding every one floods the GUI's cross-thread signal
+# queue and unbounded QTextEdit → freeze/crash.  We cap and summarise instead.
+_COLMAP_MAX_LOG_LINES = 1500
+
+
+def _colmap_run(colmap_bin: str, args: list[str], log_fn: Callable,
+                file_fn: Optional[Callable] = None) -> None:
+    """Run one COLMAP CLI stage with a BOUNDED GUI view and a COMPLETE file log.
+
+    COLMAP's console output comes from glog on stderr.  We:
+      • wrap in `stdbuf -oL -eL` (when available) to line-buffer;
+      • read by NEWLINE only — COLMAP's carriage-return progress bars overwrite
+        in place and are intentionally NOT each turned into a log line (that was
+        a flood/crash hazard);
+      • send the first _COLMAP_MAX_LOG_LINES lines to log_fn (GUI + file, since
+        log_fn tees), then send the remainder to file_fn only (the complete,
+        uncapped task log file) — so the GUI never floods but the file is whole.
+    The exact command (with full paths) is logged first.
+    """
     cmd = [colmap_bin] + args
+    if shutil.which("stdbuf"):
+        cmd = ["stdbuf", "-oL", "-eL"] + cmd
+    log_fn(f"  $ {' '.join(cmd)}")
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
     )
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line:
-            log_fn(f"  {line}")
+    emitted = 0
+    capped = False
+    for raw in proc.stdout:
+        # Keep only the final segment of a CR-progress line (drop the in-place
+        # progress ticks), then forward the resulting text line.
+        line = raw.replace("\r", "\n").rstrip("\n").split("\n")[-1].strip()
+        if not line:
+            continue
+        if emitted < _COLMAP_MAX_LOG_LINES:
+            log_fn(f"  {line}")            # GUI + file (log_fn tees to both)
+            emitted += 1
+        else:
+            if file_fn:
+                file_fn(f"  {line}")        # file only — keeps the file complete
+            if not capped:
+                log_fn(f"  … (GUI output capped at {_COLMAP_MAX_LOG_LINES} lines; "
+                       "full output continues in the task log file)")
+                capped = True
     proc.wait()
     if proc.returncode != 0:
         raise RuntimeError(

@@ -695,8 +695,17 @@ class Task:
         return list(TASK_INFO.get(self.task_type, {}).get("requires", []))
 
     def target_label(self) -> str:
-        if self.target.get("kind") == "job":
+        kind = self.target.get("kind", "full")
+        if kind == "job":
             return self.target.get("name") or f"Job #{self.target.get('job_id')}"
+        if kind == "jobs":
+            jobs = self.target.get("jobs", [])
+            if len(jobs) == 1:
+                j = jobs[0]
+                return j.get("name") or f"Job #{j.get('job_id')}"
+            return f"{len(jobs)} jobs"
+        if kind == "all_jobs":
+            return "All jobs"
         return "Full dataset"
 
     def display_label(self) -> str:

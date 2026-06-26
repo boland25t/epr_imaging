@@ -72,15 +72,37 @@ class TaskConfigDialog(QDialog):
         layout.setSpacing(8)
 
         # ── Target ────────────────────────────────────────────────────────────
+        # Axis-1 batching: a task can run over the full dataset, a chosen set of
+        # jobs (multi-select), or every job at once.
         tgt_group = QGroupBox("Target — which data this task runs on")
-        tgt_form  = QFormLayout(tgt_group)
-        self._target_combo = QComboBox()
-        self._target_combo.addItem("Full dataset", userData={"kind": "full"})
+        tgt_layout = QVBoxLayout(tgt_group)
+        self._tgt_full = QRadioButton("Full dataset")
+        self._tgt_jobs = QRadioButton("Selected jobs")
+        self._tgt_all  = QRadioButton("All jobs")
+        tgt_layout.addWidget(self._tgt_full)
+        tgt_layout.addWidget(self._tgt_jobs)
+
+        self._job_list = QListWidget()
+        self._job_list.setMaximumHeight(120)
         for job_id, name in available_jobs:
-            label = f"Job: {name or f'#{job_id}'}"
-            self._target_combo.addItem(label, userData={"kind": "job", "job_id": job_id, "name": name})
-        self._select_current_target()
-        tgt_form.addRow("Run over:", self._target_combo)
+            item = QListWidgetItem(name or f"Job #{job_id}")
+            item.setData(Qt.UserRole, job_id)
+            item.setData(Qt.UserRole + 1, name)
+            item.setCheckState(Qt.Unchecked)
+            self._job_list.addItem(item)
+        tgt_layout.addWidget(self._job_list)
+        tgt_layout.addWidget(self._tgt_all)
+        if not available_jobs:
+            self._tgt_jobs.setEnabled(False)
+            self._tgt_all.setEnabled(False)
+            note = QLabel("No jobs with intervals — create one on the Jobs tab to batch.")
+            note.setStyleSheet("color: #888; font-size: 10px;")
+            tgt_layout.addWidget(note)
+        self._restore_target_selection()
+        self._tgt_jobs.toggled.connect(
+            lambda on: self._job_list.setEnabled(on)
+        )
+        self._job_list.setEnabled(self._tgt_jobs.isChecked())
         layout.addWidget(tgt_group)
 
         # ── Channels (per-channel types only) ─────────────────────────────────
@@ -122,16 +144,46 @@ class TaskConfigDialog(QDialog):
     # Helpers
     # -----------------------------------------------------------------------
 
-    def _select_current_target(self) -> None:
-        cur = self._task.target
-        for i in range(self._target_combo.count()):
-            data = self._target_combo.itemData(i)
-            if data == cur or (
-                data.get("kind") == cur.get("kind")
-                and data.get("job_id") == cur.get("job_id")
-            ):
-                self._target_combo.setCurrentIndex(i)
-                return
+    def _restore_target_selection(self) -> None:
+        """Set the radio + job checklist from the task's current target."""
+        tgt  = self._task.target or {"kind": "full"}
+        kind = tgt.get("kind", "full")
+        # Collect the job ids the target currently references.
+        sel_ids: set[int] = set()
+        if kind == "job":
+            sel_ids = {int(tgt.get("job_id", -1))}
+        elif kind == "jobs":
+            sel_ids = {int(j.get("job_id", -1)) for j in tgt.get("jobs", [])}
+
+        if kind == "all_jobs" and self._tgt_all.isEnabled():
+            self._tgt_all.setChecked(True)
+        elif kind in ("job", "jobs") and self._tgt_jobs.isEnabled():
+            self._tgt_jobs.setChecked(True)
+            for i in range(self._job_list.count()):
+                item = self._job_list.item(i)
+                if item.data(Qt.UserRole) in sel_ids:
+                    item.setCheckState(Qt.Checked)
+        else:
+            self._tgt_full.setChecked(True)
+
+    def _collect_target(self) -> dict:
+        """Build the target dict from the radio + job checklist."""
+        if self._tgt_all.isChecked():
+            return {"kind": "all_jobs"}
+        if self._tgt_jobs.isChecked():
+            jobs = []
+            for i in range(self._job_list.count()):
+                item = self._job_list.item(i)
+                if item.checkState() == Qt.Checked:
+                    jobs.append({
+                        "job_id": item.data(Qt.UserRole),
+                        "name":   item.data(Qt.UserRole + 1),
+                    })
+            if jobs:
+                return {"kind": "jobs", "jobs": jobs}
+            # No jobs checked → fall back to full so the task still runs.
+            return {"kind": "full"}
+        return {"kind": "full"}
 
     def _dspin(self, lo, hi, val, suffix="", step=None, dec=None) -> QDoubleSpinBox:
         w = QDoubleSpinBox()
@@ -513,7 +565,8 @@ class TaskConfigDialog(QDialog):
         colmap_vbox.setContentsMargins(0, 0, 0, 0)
         colmap_vbox.setSpacing(6)
 
-        colmap_group = QGroupBox("COLMAP Settings")
+        # -- COLMAP: SfM / matching --------------------------------------------
+        colmap_group = QGroupBox("COLMAP — Matching & SfM")
         colmap_form  = QFormLayout(colmap_group)
         w["max_features"] = QSpinBox()
         w["max_features"].setRange(512, 65536)
@@ -521,18 +574,77 @@ class TaskConfigDialog(QDialog):
         w["max_features"].setValue(int(s.get("max_features", 8192)))
         colmap_form.addRow("Max features:", w["max_features"])
         w["matcher"] = self._combo(
-            ["Exhaustive", "Sequential", "Vocab Tree"],
+            ["Exhaustive", "Sequential", "Vocab Tree", "Spatial"],
             s.get("matcher", "Exhaustive"),
         )
         w["matcher"].setToolTip(
             "Exhaustive: checks all image pairs (best quality, slowest).\n"
             "Sequential: assumes images are taken in order (fast for video).\n"
-            "Vocab Tree: approximate nearest-neighbour matching (large datasets)."
+            "Vocab Tree: approximate nearest-neighbour matching (large datasets).\n"
+            "Spatial: uses navigation positions to limit pairs (needs nav)."
         )
         colmap_form.addRow("Matcher:", w["matcher"])
-        w["run_mvs"] = self._check("Run dense reconstruction (MVS)", bool(s.get("run_mvs", True)))
-        colmap_form.addRow("", w["run_mvs"])
+        w["single_camera"] = self._check(
+            "Single shared camera (video frames)", bool(s.get("single_camera", True)))
+        w["single_camera"].setToolTip(
+            "Solve one shared intrinsic set for all frames — correct for video "
+            "from one camera; more stable and faster.")
+        colmap_form.addRow("", w["single_camera"])
         colmap_vbox.addWidget(colmap_group)
+
+        # -- COLMAP: products --------------------------------------------------
+        prod_group = QGroupBox("COLMAP — Products to generate")
+        prod_form  = QVBoxLayout(prod_group)
+        w["c_sparse"] = self._check("Sparse cloud (PLY)", True)
+        w["c_sparse"].setChecked(True)
+        w["c_sparse"].setEnabled(False)  # always produced
+        w["c_sparse"].setToolTip("Always produced — the SfM result.")
+        prod_form.addWidget(w["c_sparse"])
+        w["c_traj"] = self._check(
+            "Camera trajectory (poses + path)", bool(s.get("export_camera_trajectory", True)))
+        prod_form.addWidget(w["c_traj"])
+        w["run_mvs"] = self._check(
+            "Dense cloud (MVS — needs CUDA GPU)", bool(s.get("run_mvs", True)))
+        prod_form.addWidget(w["run_mvs"])
+        w["c_undist"] = self._check(
+            "Export undistorted frames", bool(s.get("export_undistorted", False)))
+        prod_form.addWidget(w["c_undist"])
+        w["c_depth"] = self._check(
+            "Export depth + normal maps", bool(s.get("export_depth_maps", False)))
+        prod_form.addWidget(w["c_depth"])
+        w["c_poisson"] = self._check(
+            "Poisson mesh (watertight, PLY)", bool(s.get("build_poisson_mesh", False)))
+        prod_form.addWidget(w["c_poisson"])
+        w["c_delaunay"] = self._check(
+            "Delaunay mesh (detail-preserving, PLY)", bool(s.get("build_delaunay_mesh", False)))
+        prod_form.addWidget(w["c_delaunay"])
+
+        def _sync_colmap_dense():
+            on = w["run_mvs"].isChecked()
+            for key in ("c_undist", "c_depth", "c_poisson", "c_delaunay"):
+                w[key].setEnabled(on)  # all dense-derived
+        w["run_mvs"].toggled.connect(lambda _: _sync_colmap_dense())
+        _sync_colmap_dense()
+        colmap_vbox.addWidget(prod_group)
+
+        # -- COLMAP: georeference ----------------------------------------------
+        cgeo_group = QGroupBox("COLMAP — Georeference")
+        cgeo_form  = QVBoxLayout(cgeo_group)
+        w["c_georef"] = self._check(
+            "Georeference to navigation (UTM E/N/-depth)",
+            bool(s.get("georeference", True)))
+        w["c_georef"].setToolTip(
+            "Aligns the whole reconstruction to your nav track via model_aligner, "
+            "so clouds/meshes come out in UTM and overlay the sensor 3-D products. "
+            "Requires interp_full.csv / per-segment interp.csv.")
+        cgeo_form.addWidget(w["c_georef"])
+        note = QLabel("Orientation (heading/pitch/roll) cannot be used as a COLMAP "
+                      "prior — only positions are used for alignment.")
+        note.setStyleSheet("color: #888; font-size: 9px; font-style: italic;")
+        note.setWordWrap(True)
+        cgeo_form.addWidget(note)
+        colmap_vbox.addWidget(cgeo_group)
+
         vbox.addWidget(self._colmap_widget)
 
         vbox.addStretch()
@@ -559,7 +671,7 @@ class TaskConfigDialog(QDialog):
     def accept(self) -> None:
         """Write widget values back into the Task, then close."""
         task = self._task
-        task.target = dict(self._target_combo.currentData())
+        task.target = self._collect_target()
 
         if self._channel_list is not None:
             task.channels = [
@@ -658,10 +770,19 @@ class TaskConfigDialog(QDialog):
             s["nav_accuracy_h"]    = w["nav_accuracy_h"].value()
             s["nav_accuracy_v"]    = w["nav_accuracy_v"].value()
 
-            # COLMAP
-            s["max_features"] = w["max_features"].value()
-            s["matcher"]      = w["matcher"].currentText()
-            s["run_mvs"]      = w["run_mvs"].isChecked()
+            # COLMAP — matching / SfM
+            s["max_features"]  = w["max_features"].value()
+            s["matcher"]       = w["matcher"].currentText()
+            s["single_camera"] = w["single_camera"].isChecked()
+            # COLMAP — products
+            s["run_mvs"]                  = w["run_mvs"].isChecked()
+            s["export_camera_trajectory"] = w["c_traj"].isChecked()
+            s["export_undistorted"]       = w["c_undist"].isChecked()
+            s["export_depth_maps"]        = w["c_depth"].isChecked()
+            s["build_poisson_mesh"]       = w["c_poisson"].isChecked()
+            s["build_delaunay_mesh"]      = w["c_delaunay"].isChecked()
+            # COLMAP — georeference
+            s["georeference"]             = w["c_georef"].isChecked()
 
         elif t == "qgis_project":
             s["project_name"] = w["project_name"].text().strip() or "EPR Survey"

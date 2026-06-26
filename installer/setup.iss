@@ -7,11 +7,22 @@
 ;   3. Output:  installer\EPRSamplingToolSetup.exe
 
 ; ---------------------------------------------------------------------------
+; Version — single source of truth is installer\version.txt (read at compile
+; time via the Inno preprocessor).  Bump the number there, nowhere else.
+; ---------------------------------------------------------------------------
+#define VerHandle FileOpen(AddBackslash(SourcePath) + "..\version.txt")
+#define AppVersion Trim(FileRead(VerHandle))
+#expr FileClose(VerHandle)
+#if AppVersion == ""
+  #define AppVersion "0.0.0"
+#endif
+
+; ---------------------------------------------------------------------------
 ; Application metadata
 ; ---------------------------------------------------------------------------
 [Setup]
 AppName=EPR Sampling Tool
-AppVersion=1.0
+AppVersion={#AppVersion}
 AppPublisher=Woods Hole Oceanographic Institution
 AppPublisherURL=https://www.whoi.edu
 AppSupportURL=https://www.whoi.edu
@@ -63,25 +74,17 @@ FinishedLabel=The EPR Sampling Tool has been installed on your computer.%n%nA sh
 [Files]
 
 ; --- Python source files ---
-Source: "..\app.py";                 DestDir: "{app}"; Flags: ignoreversion
-Source: "..\chat_panel.py";          DestDir: "{app}"; Flags: ignoreversion
-Source: "..\claude_service.py";      DestDir: "{app}"; Flags: ignoreversion
-Source: "..\config_service.py";      DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dynamicsampling.py";     DestDir: "{app}"; Flags: ignoreversion
-Source: "..\main_window.py";         DestDir: "{app}"; Flags: ignoreversion
-Source: "..\models.py";              DestDir: "{app}"; Flags: ignoreversion
-Source: "..\output_service.py";      DestDir: "{app}"; Flags: ignoreversion
-Source: "..\pipeline_service.py";    DestDir: "{app}"; Flags: ignoreversion
-Source: "..\point_cloud_pipeline.py"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\sensor_service.py";      DestDir: "{app}"; Flags: ignoreversion
-Source: "..\video_service.py";       DestDir: "{app}"; Flags: ignoreversion
-Source: "..\workspace_panel.py";     DestDir: "{app}"; Flags: ignoreversion
+; Glob ALL top-level modules so newly-added files ship automatically.  (The
+; previous hand-maintained list silently dropped 6 modules added later and
+; shipped a crash-on-launch app; never enumerate by hand again.)
+Source: "..\*.py";                   DestDir: "{app}"; Flags: ignoreversion
 
 ; --- Widgets sub-package ---
 Source: "..\widgets\*.py";           DestDir: "{app}\widgets"; Flags: ignoreversion
 
 ; --- Assets ---
 Source: "..\requirements.txt";       DestDir: "{app}"; Flags: ignoreversion
+Source: "..\version.txt";            DestDir: "{app}"; Flags: ignoreversion
 Source: "..\whoilogo.png";           DestDir: "{app}"; Flags: ignoreversion
 Source: "..\whoilogolong.png";       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\sampling_tool.png";      DestDir: "{app}"; Flags: ignoreversion

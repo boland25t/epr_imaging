@@ -151,6 +151,8 @@ class Layer:
         self.shown_points = 0       # point count currently rendered
         self.downsampled  = False   # True when shown < full
         self.force_full   = False   # user asked to render every point
+        self.point_size   = 2.0     # render size for point-cloud layers (px)
+        self.log_scale    = False   # log colour mapping for scalar fields (e.g. CO2)
 
     def display_name(self) -> str:
         return self.name or Path(self.path).name
@@ -171,6 +173,7 @@ class LayerRowWidget(QFrame):
     visibility_changed = Signal(bool)
     opacity_changed    = Signal(float)
     color_mode_changed = Signal(bool)  # True = RGB, False = scalar
+    log_scale_changed  = Signal(bool)  # True = logarithmic scalar colour mapping
     remove_requested   = Signal()
     full_res_requested = Signal()      # user clicked "Full" on a downsampled layer
 
@@ -234,6 +237,19 @@ class LayerRowWidget(QFrame):
         )
         layout.addWidget(self.mode_combo)
 
+        # Log colour scale — useful for scalar fields spanning orders of
+        # magnitude (e.g. CO2 concentration).  Only relevant in Viridis mode.
+        self.log_check = QCheckBox("Log")
+        self.log_check.setChecked(layer.log_scale)
+        self.log_check.setToolTip("Logarithmic colour mapping for the scalar field")
+        self.log_check.setEnabled(not layer.color_rgb)
+        self.log_check.toggled.connect(self.log_scale_changed)
+        layout.addWidget(self.log_check)
+        # Keep the Log toggle enabled only while in scalar (Viridis) mode.
+        self.mode_combo.currentIndexChanged.connect(
+            lambda i: self.log_check.setEnabled(i != 0)
+        )
+
         self.opacity_spin = QDoubleSpinBox()
         self.opacity_spin.setRange(0.0, 1.0)
         self.opacity_spin.setSingleStep(0.1)
@@ -273,6 +289,11 @@ class PointCloudViewer(QMainWindow):
         self._potree_thread = None
         self._potree_worker = None
 
+        # Per-load point budget for downsampling (None = no cap / full res).
+        # Adjustable from the toolbar to trade detail for smoothness when
+        # overlaying dense sensor clouds on photogrammetry models.
+        self._max_points: Optional[int] = DEFAULT_MAX_POINTS
+
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -301,6 +322,27 @@ class PointCloudViewer(QMainWindow):
         screenshot_btn = QPushButton("Screenshot…")
         screenshot_btn.clicked.connect(self._take_screenshot)
         tb.addWidget(screenshot_btn)
+
+        tb.addSeparator()
+
+        # Point budget: downsample layers to keep overlays smooth.  Applies live
+        # to all loaded layers so the user can dial detail vs. responsiveness.
+        tb.addWidget(QLabel(" Max points: "))
+        self._budget_combo = QComboBox()
+        self._budget_presets = {
+            "100k": 100_000, "250k": 250_000, "500k": 500_000,
+            "1M": 1_000_000, "2M": 2_000_000, "5M": 5_000_000,
+            "Full (slow)": None,
+        }
+        self._budget_combo.addItems(list(self._budget_presets.keys()))
+        self._budget_combo.setCurrentText("2M")
+        self._budget_combo.setToolTip(
+            "Downsample displayed point clouds to this many points (per layer) "
+            "to reduce lag when overlaying dense sensor data.\n"
+            "Changing it re-applies to all loaded layers; files on disk are untouched."
+        )
+        self._budget_combo.currentTextChanged.connect(self._on_budget_changed)
+        tb.addWidget(self._budget_combo)
 
         tb.addSeparator()
 
@@ -341,6 +383,14 @@ class PointCloudViewer(QMainWindow):
         if PYVISTA_OK:
             self._plotter = QtInteractor(self)
             self._plotter.set_background("#1a1a2e")  # dark blue-black
+            # Depth peeling makes per-layer opacity render as TRUE translucency
+            # instead of an opaque "brick" — essential for seeing a model through
+            # an overlaid sensor cloud (e.g. CO2).  Returns False if the GL
+            # backend can't do it; harmless either way.
+            try:
+                self._plotter.enable_depth_peeling(number_of_peels=8, occlusion_ratio=0.0)
+            except Exception:
+                pass
             splitter.addWidget(self._plotter)
         else:
             placeholder = QLabel(
@@ -392,6 +442,14 @@ class PointCloudViewer(QMainWindow):
         layer.force_full = force_full
         layer.full_points = self._point_count(mesh)
 
+        # Scalar-coloured point clouds (sensor fields like CO2) load translucent
+        # so an overlaid photogrammetry model/mesh stays visible through them;
+        # RGB clouds and meshes (the "model") stay fully opaque.
+        n_faces  = getattr(mesh, "n_faces", 0) or 0
+        is_cloud = not (isinstance(mesh, pv.PolyData) and n_faces > 0)
+        if is_cloud and not layer.color_rgb:
+            layer.opacity = 0.45
+
         render_mesh, downsampled = self._maybe_downsample(mesh, force_full)
         layer.mesh         = render_mesh
         layer.downsampled  = downsampled
@@ -435,6 +493,37 @@ class PointCloudViewer(QMainWindow):
             f"{layer.display_name()}: full resolution ({layer.shown_points:,} points)"
         )
 
+    def _on_budget_changed(self, text: str) -> None:
+        """Apply a new point budget to every loaded layer (re-downsample live).
+
+        Re-reads each layer from disk and re-renders at the new budget so the
+        change takes effect immediately on already-loaded sensor/model clouds.
+        Layers the user pinned to full resolution (force_full) are left alone.
+        """
+        if not PYVISTA_OK:
+            return
+        self._max_points = self._budget_presets.get(text, DEFAULT_MAX_POINTS)
+        if not self._layers:
+            return
+        budget_label = text
+        for layer in self._layers:
+            if layer.force_full:
+                continue
+            try:
+                mesh = pv.read(layer.path)
+            except Exception:
+                continue
+            render_mesh, downsampled = self._maybe_downsample(mesh, force_full=False)
+            layer.mesh         = render_mesh
+            layer.downsampled  = downsampled
+            layer.shown_points = self._point_count(render_mesh)
+            self._render_layer(layer)
+            self._refresh_row_for(layer)
+            QApplication.processEvents()
+        if self._plotter:
+            self._plotter.update()
+        self.statusBar().showMessage(f"Point budget set to {budget_label} — layers re-sampled.")
+
     def remove_layer(self, layer: Layer) -> None:
         if layer.actor is not None and self._plotter:
             self._plotter.remove_actor(layer.actor)
@@ -466,9 +555,10 @@ class PointCloudViewer(QMainWindow):
         clouds are randomly subsampled (preserving per-point RGB/scalars).
         """
         n = self._point_count(mesh)
-        if force_full or n <= DEFAULT_MAX_POINTS:
+        budget = self._max_points
+        if force_full or budget is None or n <= budget:
             return mesh, False
-        target = DEFAULT_MAX_POINTS
+        target = budget
         try:
             import numpy as np
             # n_faces returns polygonal faces on current pyvista; guard for older versions.
@@ -513,6 +603,16 @@ class PointCloudViewer(QMainWindow):
         else:
             kwargs["cmap"] = "viridis"
             kwargs["show_scalar_bar"] = False
+            if layer.log_scale:
+                kwargs["log_scale"] = True
+
+        # Point clouds: small, flat points (not spheres) so a dense overlaid
+        # cloud reads as a translucent haze you can see through, not a wall.
+        n_faces = getattr(mesh, "n_faces", 0) or 0
+        if not (isinstance(mesh, pv.PolyData) and n_faces > 0):
+            kwargs["point_size"] = layer.point_size
+            kwargs["render_points_as_spheres"] = False
+            kwargs["style"] = "points"
 
         actor = self._plotter.add_mesh(mesh, **kwargs)
         layer.actor = self._promote_to_lod(actor, layer)
@@ -576,6 +676,9 @@ class PointCloudViewer(QMainWindow):
         row_widget.color_mode_changed.connect(
             lambda rgb, l=layer: self._on_color_mode(l, rgb)
         )
+        row_widget.log_scale_changed.connect(
+            lambda on, l=layer: self._on_log_scale(l, on)
+        )
         row_widget.remove_requested.connect(
             lambda l=layer: self.remove_layer(l)
         )
@@ -605,6 +708,13 @@ class PointCloudViewer(QMainWindow):
     def _on_color_mode(self, layer: Layer, use_rgb: bool) -> None:
         """Re-render the (already-loaded) mesh with a different colour mode."""
         layer.color_rgb = use_rgb
+        if not self._plotter or layer.mesh is None:
+            return
+        self._render_layer(layer)
+
+    def _on_log_scale(self, layer: Layer, on: bool) -> None:
+        """Toggle logarithmic colour mapping for a scalar-coloured layer."""
+        layer.log_scale = on
         if not self._plotter or layer.mesh is None:
             return
         self._render_layer(layer)

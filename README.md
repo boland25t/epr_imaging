@@ -1,51 +1,94 @@
-# Video + Sensor Processing Tool
+# EPR Sampling Tool
 
-Desktop GUI app for building a processing package from video, navigation, and sensor data.
+Desktop GUI (PySide6) for turning underwater survey data — video, navigation,
+and sensor channels — into geo-referenced 2D/3D products and photogrammetric
+reconstructions. Built for Woods Hole Oceanographic Institution.
 
-## Current capabilities
+Version is tracked in [`version.txt`](version.txt) and shown in the window title.
 
-- scans a directory of video clips and parses start times from filenames with robust fallback logic
-- reads actual video durations from file metadata
-- imports a navigation CSV with timestamp / lat / lon / optional altitude mapping
-- imports one or more sensor CSV files with multiple channels per file
-- lets the user choose timestamp and value columns per CSV, plus display names and units
-- shows a shared timeline of video, navigation, and sensor coverage
-- exports a configuration `.json`
-- runs an end-to-end processing pipeline from the GUI:
-  - extracts frames for each selected interval
-  - builds a `master.csv` with aligned frame, nav, and sensor data
-  - generates GeoTIFF rasters for each sensor channel
-  - optionally annotates extracted frames
+---
 
-## Expected deliverables per segment
+## What it does
 
-Each processed interval is written as:
+**Ingest**
+- Scans a directory of video clips, parsing start times from filenames (with
+  common-pattern and file-mtime fallbacks) and reading durations from metadata.
+- Imports navigation (lat / lon / altitude / depth / heading / pitch / roll
+  from any CSV columns) and any number of sensor channels, including `.ppi`
+  files and decimal-minute coordinate repair.
+
+**Select intervals**
+- Threshold-based (auto-detect windows meeting sensor/nav criteria) or manual
+  trackline picking on an interactive map.
+- Group intervals into named **Jobs**.
+
+**Task Stack** — the orchestration surface
+- Build an ordered, instance-based pipeline of tasks (sampling, sensor/nav 2D &
+  3D, depth slices, QGIS export, photogrammetry) and run them top-to-bottom.
+- Each task targets the **Full dataset**, **selected jobs**, or **all jobs**
+  (batching), and runs sequentially with per-step failure isolation and a
+  complete on-disk task log.
+
+**Products**
+- Frame extraction (fixed-rate or distance-adaptive) with per-frame nav/sensor
+  interpolation, optional CLAHE and annotation overlays.
+- 3D PLYs (nav trackline, sensor fields with IDW/Kriging/RBF fill).
+- 2D GeoTIFFs, depth-banded slices, PNG slices.
+- **Photogrammetry** via COLMAP or Metashape — sparse/dense clouds, meshes,
+  camera trajectory, georeferenced to navigation (UTM E/N/−depth) so outputs
+  overlay the sensor products.
+- One-click QGIS project generation.
+
+**Visualize**
+- Embedded 3D viewer (PyVista) for overlaying clouds/meshes in one scene, with
+  downsampling budget, translucency (depth peeling), and log color scaling.
+
+---
+
+## Workspace layout
+
+A workspace is one survey/dive. Products are written under it:
 
 ```text
-output/segment_001/
-├── frames/
-├── master.csv
-├── sensors/
-│   ├── temperature.tif
-│   └── ...
-├── frames_annotated/         # optional
+<workspace>/
+├── interp_full.csv                 # per-frame nav+sensor record
+├── inputs/  nav/  sensor/          # copied source CSVs
+├── outputs/                        # full-dataset products
+│   ├── nav_trackline/  sensor_3d/  sensor_2d/  photogrammetry/  …
+├── job_<NNN>_<name>/outputs/       # per-job (batched) products
+└── logs/  task_log_<timestamp>.txt # complete run logs
 ```
 
-## Robust filename parsing
+---
 
-The scanner first tries the user-specified `strftime` format. If that fails, it automatically tries common datetime patterns such as:
+## Install (end users)
 
-- `20260315_120000`
-- `20260315-120000`
-- `2026-03-15_12-00-00`
-- `2026-03-15T12:00:00`
-- `20260315120000`
+Download and run `EPRSamplingToolSetup.exe`. It installs Python, a virtual
+environment, and all dependencies to `%LOCALAPPDATA%\EPRSamplingTool` (no admin
+required) and creates a desktop shortcut. See
+[`installer/BUILD.md`](installer/BUILD.md) for building the installer.
 
-If none match, it falls back to the file modified time and records that source in the project summary.
-
-## Run locally
+## Run from source (developers)
 
 ```bash
 pip install -r requirements.txt
 python app.py
 ```
+
+Full two-instance setup (production install + editable dev clone, native
+Windows vs. WSL) is in [`DEV_SETUP.md`](DEV_SETUP.md).
+
+### Optional photogrammetry engines
+
+- **COLMAP** — install a CUDA build, put `colmap` on `PATH`; auto-detected.
+- **Metashape Professional** — install it and `pip install` Agisoft's Metashape
+  Python 3 module into the venv; then it's detected and driven headlessly.
+  (Not importable from WSL unless a Linux Metashape is installed there — see
+  [`DEV_SETUP.md`](DEV_SETUP.md).)
+
+---
+
+## Docs
+
+- [`DEV_SETUP.md`](DEV_SETUP.md) — dev environments, two-instance model, shipping checklist
+- [`installer/BUILD.md`](installer/BUILD.md) — building the Windows installer

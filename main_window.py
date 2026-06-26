@@ -94,6 +94,18 @@ from widgets.sensor_import_dialog import SensorImportDialog
 from widgets.timeline_widget import TimelineWidget
 
 
+def _app_version() -> str:
+    """Read the app version from version.txt next to the source (single source
+    of truth, shared with the installer).  Returns 'dev' if not found."""
+    try:
+        vp = Path(__file__).resolve().parent / "version.txt"
+        if vp.exists():
+            return vp.read_text(encoding="utf-8").strip() or "dev"
+    except Exception:
+        pass
+    return "dev"
+
+
 # ===========================================================================
 # WorkspaceStartupDialog — shown on every launch; user must pick an action
 # ===========================================================================
@@ -302,27 +314,34 @@ class PhotogrammetryWorker(QObject):
     def run(self) -> None:
         try:
             import photogrammetry_service as ps
-            run_dir  = Path(self.kwargs["run_dir"])
+            run_dir   = Path(self.kwargs["run_dir"])
             frame_dir = self.kwargs["frame_dir"]
-            quality   = self.kwargs.get("quality", "normal")
-            kw = {
-                "run_dir":       run_dir,
-                "frame_dir":     frame_dir,
-                "quality":       quality,
-                "build_dense":   self.kwargs.get("build_dense", True),
-                "build_mesh":    self.kwargs.get("build_mesh", True),
-                "build_texture": self.kwargs.get("build_texture", False),
-                "log_fn":        self.log.emit,
-            }
+            # Legacy quality preset → the engines' newer fine-grained params.
+            quality   = self.kwargs.get("quality", "normal").lower()
+            _ACC = {"draft": "Low", "normal": "Medium", "high": "High", "highest": "Highest"}
+            _FEAT = {"draft": 4096, "normal": 8192, "high": 16384, "highest": 32768}
+
             if self.engine == "metashape":
-                kw["nav_csv"] = self.kwargs.get("nav_csv")
-                products = ps.run_metashape(**kw)
+                products = ps.run_metashape(
+                    run_dir=run_dir,
+                    frame_dir=frame_dir,
+                    align_accuracy=_ACC.get(quality, "High"),
+                    dense_quality=_ACC.get(quality, "Medium"),
+                    build_dense=self.kwargs.get("build_dense", True),
+                    build_mesh=self.kwargs.get("build_mesh", True),
+                    build_texture=self.kwargs.get("build_texture", False),
+                    nav_csv=self.kwargs.get("nav_csv"),
+                    log_fn=self.log.emit,
+                )
             else:
-                kw["colmap_bin"] = self.kwargs.get("colmap_bin", "colmap")
-                kw.pop("build_mesh", None)
-                kw.pop("build_texture", None)
-                kw.pop("nav_csv", None)
-                products = ps.run_colmap(**kw)
+                products = ps.run_colmap(
+                    run_dir=run_dir,
+                    frame_dir=frame_dir,
+                    build_dense=self.kwargs.get("build_dense", True),
+                    max_features=_FEAT.get(quality, 8192),
+                    colmap_bin=self.kwargs.get("colmap_bin", "colmap"),
+                    log_fn=self.log.emit,
+                )
             self.finished.emit(products)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -384,7 +403,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         """Initialise all session state, build the UI, wire signals, and do an initial refresh."""
         super().__init__()
-        self.setWindowTitle("Sampling Tool")
+        self.setWindowTitle(f"Sampling Tool  v{_app_version()}")
         self.setMinimumSize(1000, 650)
 
         # -----------------------------------------------------------------------
@@ -1276,16 +1295,60 @@ class MainWindow(QMainWindow):
             None,
         )
 
-    def _resolve_task_target(self, task: "Task") -> tuple:
-        """Resolve a task's target to (scope_id, interp_path, output_dir, label)."""
-        tgt = task.target
-        if tgt.get("kind") == "job":
-            job = self._find_job(int(tgt.get("job_id", -1)))
+    def _scope_for_job(self, job: "Job") -> tuple:
+        """Return the (scope_id, interp, out_dir, label, job) tuple for one job."""
+        interp  = self._get_filtered_interp_for_job(job)
+        out_dir = str(Path(self.workspace_path) / self._job_output_dirname(job) / "outputs")
+        return (f"job_{job.job_id}", interp, out_dir, job.name or f"Job #{job.job_id}", job)
+
+    def _scope_full(self) -> tuple:
+        """Return the (scope_id, interp, out_dir, label, job) tuple for full dataset."""
+        return ("full", self._interp_full_path(), self._outputs_root(), "Full dataset", None)
+
+    def _resolve_task_scopes(self, task: "Task") -> list[tuple]:
+        """Expand a task's target into concrete scope tuples (Axis-1 batching).
+
+        Each tuple is (scope_id, interp_path, output_dir, label, job|None).  A
+        target of kind 'full' yields one full-dataset scope; 'job'/'jobs' yield
+        one scope per named job; 'all_jobs' fans out over every job that has
+        intervals.  Jobs without intervals are dropped (and reported as skips).
+        """
+        tgt  = task.target or {"kind": "full"}
+        kind = tgt.get("kind", "full")
+        scopes: list[tuple] = []
+
+        if kind == "full":
+            return [self._scope_full()]
+
+        # Collect the requested job ids.
+        job_ids: list[int] = []
+        if kind == "job":
+            job_ids = [int(tgt.get("job_id", -1))]
+        elif kind == "jobs":
+            job_ids = [int(j.get("job_id", -1)) for j in tgt.get("jobs", [])]
+        elif kind == "all_jobs":
+            job_ids = [jid for jid, _name in self._stack_available_jobs()]
+
+        for jid in job_ids:
+            job = self._find_job(jid)
             if job is not None and job.intervals:
-                interp  = self._get_filtered_interp_for_job(job)
-                out_dir = str(Path(self.workspace_path) / self._job_output_dirname(job) / "outputs")
-                return (f"job_{job.job_id}", interp, out_dir, job.name or f"Job #{job.job_id}")
-        return ("full", self._interp_full_path(), self._outputs_root(), "Full dataset")
+                scopes.append(self._scope_for_job(job))
+            elif hasattr(self, "_plan_skips"):
+                self._plan_skips.append(
+                    f"{task.display_label()} — job #{jid} has no intervals (skipped)"
+                )
+        return scopes
+
+    def _iter_task_scopes(self):
+        """Yield (task, scope_tuple) for every task × its resolved target scopes."""
+        for task in self._task_stack.tasks:
+            scopes = self._resolve_task_scopes(task)
+            if not scopes and hasattr(self, "_plan_skips"):
+                self._plan_skips.append(
+                    f"{task.display_label()} — target resolved to no runnable scope"
+                )
+            for scope in scopes:
+                yield task, scope
 
     # ------------------------------------------------------------------
 
@@ -1296,15 +1359,14 @@ class MainWindow(QMainWindow):
     def _build_task_plan(self) -> list[dict]:
         """Turn the ordered Task list into runner step dicts (preserving user order)."""
         plan: list[dict] = []
-        for task in self._task_stack.tasks:
-            scope_id, interp_path, output_dir, tlabel = self._resolve_task_target(task)
+        for task, (scope_id, interp_path, output_dir, tlabel, job) in self._iter_task_scopes():
             tag = f"  [{tlabel}]"
             t = task.task_type
             s = task.settings
             channels = task.channels or self._stack_available_channels()
 
             if t == "sampling":
-                config = self._build_sampling_config(task)
+                config = self._build_sampling_config(task, job, scope_id)
                 if config is None:
                     continue
                 plan.append({
@@ -1418,10 +1480,20 @@ class MainWindow(QMainWindow):
                         "use_nav_reference": bool(s.get("use_nav_reference", True)),
                         "nav_accuracy_h":    float(s.get("nav_accuracy_h", 0.1)),
                         "nav_accuracy_v":    float(s.get("nav_accuracy_v", 0.5)),
-                        # COLMAP
-                        "max_features": int(s.get("max_features", 8192)),
-                        "matcher":      s.get("matcher", "Exhaustive"),
-                        "run_mvs":      bool(s.get("run_mvs", True)),
+                        # COLMAP — matching / SfM
+                        "max_features":  int(s.get("max_features", 8192)),
+                        "matcher":       s.get("matcher", "Exhaustive"),
+                        "single_camera": bool(s.get("single_camera", True)),
+                        # COLMAP — products
+                        "run_mvs":                  bool(s.get("run_mvs", True)),
+                        "export_camera_trajectory": bool(s.get("export_camera_trajectory", True)),
+                        "export_undistorted":       bool(s.get("export_undistorted", False)),
+                        "export_depth_maps":        bool(s.get("export_depth_maps", False)),
+                        "build_poisson_mesh":       bool(s.get("build_poisson_mesh", False)),
+                        "build_delaunay_mesh":      bool(s.get("build_delaunay_mesh", False)),
+                        # COLMAP — georeference (always pass interp so it CAN georef)
+                        "georeference": bool(s.get("georeference", True)),
+                        "colmap_nav_csv": interp_path,
                     },
                 })
 
@@ -1433,20 +1505,38 @@ class MainWindow(QMainWindow):
 
         return plan
 
-    def _build_sampling_config(self, task: "Task"):
-        """Build a PipelineConfig for a sampling task (frame extraction)."""
+    def _build_sampling_config(self, task: "Task", job: "Job | None" = None,
+                               scope_id: str = "full"):
+        """Build a PipelineConfig for one sampling scope (frame extraction).
+
+        `job` is the concrete target scope resolved by the plan builder (None =
+        full dataset).  Returns None (and records a reason in self._plan_skips)
+        when the scope cannot run, so _run_stack can tell the user exactly why.
+        """
         from pipeline_service import PipelineConfig
-        video_dir = self.video_dir_edit.text().strip()
-        if not video_dir or not self.videos:
-            self.log_text.append("Stack: sampling task skipped — no videos loaded.")
+
+        def _skip(reason: str):
+            full = f"{task.display_label()} [{scope_id}] — {reason}"
+            self.log_text.append(f"Stack: sampling task skipped — {reason}")
+            if hasattr(self, "_plan_skips"):
+                self._plan_skips.append(full)
             return None
 
-        # Intervals come from the target job, or span all video coverage for 'full'.
-        tgt = task.target
-        if tgt.get("kind") == "job":
-            job = self._find_job(int(tgt.get("job_id", -1)))
-            intervals = list(job.intervals) if job else []
-            out_name  = f"sampling_{task.task_id}_{self._job_output_dirname(job)}" if job else f"sampling_{task.task_id}"
+        video_dir = self.video_dir_edit.text().strip()
+        if not video_dir:
+            return _skip("no video directory set (Inputs tab → Video directory).")
+        if not self.videos:
+            return _skip(
+                f"no videos loaded from '{video_dir}'. Re-scan on the Inputs tab "
+                "(check the directory and filename time format)."
+            )
+
+        # Intervals come from the resolved job scope, or span all video coverage
+        # for the full-dataset scope.  out_name is scope-unique so concurrent
+        # batch scopes don't collide.
+        if job is not None:
+            intervals = list(job.intervals)
+            out_name  = f"sampling_{task.task_id}_{self._job_output_dirname(job)}"
         else:
             starts = [v.start_time for v in self.videos]
             ends   = [v.end_time for v in self.videos]
@@ -1454,8 +1544,12 @@ class MainWindow(QMainWindow):
             out_name  = f"sampling_{task.task_id}_full"
 
         if not intervals:
-            self.log_text.append(f"Stack: sampling task {task.task_id} has no intervals — skipping.")
-            return None
+            if job is not None:
+                return _skip(
+                    f"target job '{job.name or job.job_id}' has no intervals. "
+                    "Add intervals on the Jobs tab, or retarget to Full dataset."
+                )
+            return _skip("no time intervals could be derived (no video coverage).")
 
         s = task.settings
         steps = ["extract_frames"]
@@ -1511,14 +1605,43 @@ class MainWindow(QMainWindow):
                                     "Create at least one task before running.")
             return
 
+        # Clear the log FIRST so diagnostics emitted while building the plan
+        # (e.g. "sampling task skipped — no videos loaded") survive and are seen.
+        self.log_text.clear()
+        self._plan_skips: list[str] = []
         plan = self._build_task_plan()
+
+        # Surface any tasks that were dropped during plan-building so a skipped
+        # sampling task is never silently ignored while other tasks run.
+        if self._plan_skips:
+            self.log_text.append("⚠ Some tasks were skipped and will NOT run:")
+            for reason in self._plan_skips:
+                self.log_text.append(f"    • {reason}")
+            QTimer.singleShot(0, lambda: QMessageBox.warning(
+                self, "Some tasks skipped",
+                "These tasks were skipped and will not run:\n\n• "
+                + "\n• ".join(self._plan_skips)
+                + "\n\nSee the log for details."
+            ))
+
         if not plan:
             QMessageBox.information(self, "Nothing to run",
-                                    "No runnable steps — check task targets and data.")
+                                    "No runnable steps — check task targets and data. "
+                                    "See the log for skipped-task reasons.")
             return
 
-        self.log_text.clear()
+        # Complete, uncapped task log written beside the workspace, timestamped.
+        log_dir = Path(self.workspace_path) / "logs"
+        try:
+            log_dir.mkdir(exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file = str(log_dir / f"task_log_{stamp}.txt")
+        except Exception:
+            log_file = None
+
         self.log_text.append(f"Stack: {len(plan)} step(s) queued.")
+        if log_file:
+            self.log_text.append(f"Full task log → {log_file}")
         self._status_label.setText("Running stack…")
         self._progress_bar.setValue(0)
         self._stack_result_paths: list[str] = []
@@ -1527,7 +1650,7 @@ class MainWindow(QMainWindow):
 
         from stack_runner import StackWorker
         thread = QThread(self)
-        worker = StackWorker(plan)
+        worker = StackWorker(plan, log_file=log_file)
         self.stack_worker_thread = thread
         self.stack_worker        = worker
         worker.moveToThread(thread)
@@ -1536,6 +1659,8 @@ class MainWindow(QMainWindow):
         worker.step_started.connect(self._on_stack_step_started)
         worker.step_finished.connect(self._on_stack_step_finished)
         worker.step_failed.connect(self._on_stack_step_failed)
+        worker.sub_progress.connect(self._subprogress_bar.setValue)
+        worker.sub_status.connect(self._substatus_label.setText)
         worker.finished.connect(self._on_stack_finished)
         worker.error.connect(self._on_stack_error)
         worker.finished.connect(thread.quit)
@@ -1560,30 +1685,57 @@ class MainWindow(QMainWindow):
             self._stack_panel.set_running(False)
 
     def _on_stack_step_started(self, index: int, total: int, label: str) -> None:
+        # The worker logs the detailed "▶ [i/total] …" header + resolved paths;
+        # here we only drive the status bar so we don't double-log.
         self._status_label.setText(f"Stack {index}/{total}: {label}")
+        self._substatus_label.setText("")
+        self._subprogress_bar.setValue(0)
         pct = int((index - 1) / total * 100) if total else 0
         self._progress_bar.setValue(pct)
-        self.log_text.append(f"▶ [{index}/{total}] {label}")
 
     def _on_stack_step_finished(self, label: str, paths: list) -> None:
-        self.log_text.append(f"  ✓ {label} — {len(paths)} file(s)")
+        # Output paths are already logged per-step by the worker (_log_outputs);
+        # just track them and refresh the workspace tree so new files appear.
         self._stack_result_paths.extend(paths)
         self._workspace_panel.refresh()
 
     def _on_stack_step_failed(self, label: str, message: str) -> None:
-        self.log_text.append(f"  ✗ {label}: {message}")
+        # Worker already logged the failure line; nothing extra to do here.
+        pass
 
     def _on_stack_finished(self, summary: dict) -> None:
         self._progress_bar.setValue(100)
+        self._subprogress_bar.setValue(100)
         c, f, sk = summary.get("completed", 0), summary.get("failed", 0), summary.get("skipped", 0)
         msg = f"Stack finished: {c} completed, {f} failed, {sk} skipped."
         self._status_label.setText(msg)
-        self.log_text.append(msg)
+        self._substatus_label.setText("")
+
+        # Structured end-of-run report: every step with its status and the full
+        # path of each file it produced.
+        report = summary.get("report", [])
+        self.log_text.append("")
+        self.log_text.append("──────────── STACK REPORT ────────────")
+        for entry in report:
+            status = entry.get("status", "?")
+            mark = {"completed": "✓", "failed": "✗", "skipped": "⊘"}.get(status, "•")
+            self.log_text.append(f"{mark} {entry.get('label', '?')}  [{status}]")
+            if status == "failed" and entry.get("error"):
+                self.log_text.append(f"      error: {entry['error']}")
+            for p in entry.get("paths", []):
+                self.log_text.append(f"      → {p}")
+        total_files = sum(len(e.get("paths", [])) for e in report)
+        self.log_text.append(
+            f"───────── {c} completed · {f} failed · {sk} skipped · "
+            f"{total_files} file(s) written ─────────"
+        )
+
         self._workspace_panel.refresh()
         QTimer.singleShot(0, lambda: QMessageBox.information(self, "Stack complete", msg))
 
     def _on_stack_error(self, message: str) -> None:
         self._status_label.setText("Stack failed.")
+        self._substatus_label.setText("")
         self.log_text.append(f"Stack failed: {message}")
         QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Stack failed", message))
 
@@ -2682,6 +2834,10 @@ class MainWindow(QMainWindow):
         log_layout = QVBoxLayout(log_group)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        # Bound the log so a very chatty run (COLMAP, large stacks) can never
+        # grow the document without limit and exhaust memory / freeze the UI.
+        # Oldest lines are dropped as new ones arrive.
+        self.log_text.document().setMaximumBlockCount(10000)
         log_layout.addWidget(self.log_text)
 
         layout.addWidget(summary_group, stretch=2)
