@@ -1,4 +1,4 @@
-# EPR Sampling Tool
+# Sampling Tool
 
 Desktop GUI (PySide6) for turning underwater survey data — video, navigation,
 and sensor channels — into geo-referenced 2D/3D products and photogrammetric
