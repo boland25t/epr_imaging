@@ -403,6 +403,74 @@ class OutputService:
         return str(run_dir)
 
     # ------------------------------------------------------------------
+    # CF-compliant gridded NetCDF output
+    # ------------------------------------------------------------------
+
+    def generate_sensor_netcdf(
+        self,
+        interp_path: str,
+        output_dir: str,
+        channel: str,
+        cell_size: float = 1.0,
+        aggregation: str = "mean",
+        fill_method: str = "idw",
+        units: str = "",
+    ) -> str:
+        """Write a CF-1.8 gridded NetCDF (.nc) for one sensor channel.
+
+        Builds the same regular 3-D grid used for the sensor 3D PLY, then
+        writes it as a dense depth × northing × easting array with CF metadata
+        and a UTM grid_mapping so it loads in xarray / QGIS / Panoply.  Reuses
+        the run's cached grid.csv.gz when present.
+
+        Each call creates sensor_netcdf/{channel}/run_NNN/{channel}.nc.
+
+        Returns the path to the written .nc file.
+        """
+        from netcdf_export import write_gridded_netcdf, grid_to_arrays
+
+        df_head = pd.read_csv(interp_path, nrows=1)
+        _check_utm_cols(df_head)
+        epsg = None
+        try:
+            cols = [c for c in ("utm_zone", "lat", "lon") if c in df_head.columns]
+            epsg = self._utm_epsg_from_df(pd.read_csv(interp_path, usecols=cols) if cols
+                                          else df_head)
+        except Exception:
+            pass
+
+        run_dir = self._next_run_dir(Path(output_dir) / "sensor_netcdf" / channel)
+        pipeline = self._build_sensor_grid(
+            interp_path, run_dir, channel, cell_size, aggregation, fill_method
+        )
+
+        easting, northing, depth, data = grid_to_arrays(
+            pipeline.df_grid.reset_index(), scalar_col=pipeline.scalar_name
+        )
+        out_path = str(run_dir / f"{channel}.nc")
+        write_gridded_netcdf(
+            out_path,
+            easting=easting, northing=northing, depth=depth, data=data,
+            channel=channel, units=units, epsg=epsg,
+            title=f"{channel} gridded sensor field",
+            log_fn=self._log,
+        )
+
+        self._save_meta(str(run_dir / "run.meta.json"), {
+            "product": "sensor_netcdf",
+            "channel": channel,
+            "settings": {
+                "cell_size_m": cell_size,
+                "aggregation": aggregation,
+                "fill_method": fill_method,
+                "units": units,
+                "epsg": epsg,
+            },
+        })
+        self._log(f"Sensor NetCDF ({channel}): {out_path}")
+        return out_path
+
+    # ------------------------------------------------------------------
     # Raster slice outputs (PNG per depth band) — target-based
     #
     # Slices are generated FROM an existing 3D run directory (which already
@@ -443,6 +511,7 @@ class OutputService:
             scalar_col=pipeline.scalar_name,
             color_mode="rgb",
             pixels_per_cell=pixels_per_cell,
+            legend_label="depth (m)",
         )
         self._save_meta(str(slice_run_dir), {
             "product": "nav_raster_slices",
@@ -464,6 +533,8 @@ class OutputService:
         log_scale: bool = False,
         percentile_cap: float = 100.0,
         local_norm: bool = False,
+        vmin: float | None = None,
+        vmax: float | None = None,
     ) -> str:
         """Write depth-slice PNGs from an existing sensor 3D model run.
 
@@ -484,6 +555,7 @@ class OutputService:
         if pipeline is None:
             raise ValueError(f"grid.csv.gz in {run_dir} is empty — regenerate the 3D PLY.")
 
+        channel = run_dir_path.parent.name  # sensor_3d/{channel}/run_NNN
         slice_run_dir = self._next_run_dir(run_dir_path / "slices")
         pipeline.to_raster_slices(
             str(slice_run_dir),
@@ -494,8 +566,10 @@ class OutputService:
             percentile_cap=percentile_cap,
             pixels_per_cell=pixels_per_cell,
             local_norm=local_norm,
+            vmin=vmin,
+            vmax=vmax,
+            legend_label=channel,
         )
-        channel = run_dir_path.parent.name  # sensor_3d/{channel}/run_NNN
         self._save_meta(str(slice_run_dir), {
             "product": "sensor_raster_slices",
             "channel": channel,
@@ -506,6 +580,8 @@ class OutputService:
                 "log_scale": log_scale,
                 "percentile_cap": percentile_cap,
                 "local_norm": local_norm,
+                "vmin": vmin,
+                "vmax": vmax,
                 "source_run": run_dir_path.name,
             },
         })
@@ -741,6 +817,96 @@ class OutputService:
         })
         self._log(f"Depth-slice GeoTIFFs ({channel}): {len(out_paths)} files in {run_dir}")
         return out_paths
+
+    # ------------------------------------------------------------------
+    # Data quality / QC report
+    # ------------------------------------------------------------------
+
+    def generate_qc_report(
+        self,
+        interp_path: str,
+        output_dir: str,
+        sensor_files: "list | None" = None,
+        channels: "list[str] | None" = None,
+        max_gap_s: float = 60.0,
+    ) -> list[str]:
+        """Write a per-run data-quality report for the frame record.
+
+        Summarises, per sensor channel: value statistics + histogram, source
+        coverage window, frames that fell outside coverage (clamped values),
+        and source gaps larger than max_gap_s (bridged values).  Coverage/gap
+        analysis is only possible when the originating SensorFileConfig list is
+        supplied so the raw source timestamps can be re-read; otherwise only
+        value statistics are reported.
+
+        Args:
+            interp_path:  Path to interp_full.csv (or a filtered interp.csv).
+            output_dir:   Root outputs directory; a qc_report/run_NNN is created.
+            sensor_files: Optional list of SensorFileConfig used to reload the
+                          source timestamps for coverage/gap analysis.
+            channels:     Restrict the report to these channels; None ⇒ every
+                          configured sensor channel found in the CSV.
+            max_gap_s:    Source spacing above which a span counts as a gap.
+
+        Returns:
+            List of written file paths (report, json, then histogram PNGs).
+        """
+        import qc_report
+        from sensor_service import SensorService
+
+        df = pd.read_csv(interp_path)
+        if "unix_time" not in df.columns:
+            raise ValueError("interp CSV has no 'unix_time' column — cannot build QC report.")
+
+        # Map each requested channel to its source unix-time array (or None).
+        channel_sources: dict[str, "np.ndarray | None"] = {}
+        for cfg in (sensor_files or []):
+            try:
+                src_df = SensorService.load_sensor_dataframe(cfg)
+            except Exception as exc:
+                self._log(f"  QC: could not reload {getattr(cfg, 'csv_path', '?')}: {exc}")
+                src_df = None
+            for ch in getattr(cfg, "channels", []):
+                name = ch.display_name
+                if channels and name not in channels:
+                    continue
+                if name not in df.columns:
+                    continue
+                if src_df is not None and ch.source_column in src_df.columns:
+                    present = src_df[src_df[ch.source_column].notna()]
+                    channel_sources[name] = present["unix_time"].to_numpy(dtype=float)
+                else:
+                    channel_sources[name] = None
+
+        # If no sensor configs were supplied, still report stats for any channel
+        # the caller named (or every non-coordinate numeric column).
+        if not channel_sources:
+            skip = {"unix_time", "timestamp", "lat", "lon", "latitude", "longitude",
+                    "easting", "northing", "depth", "alt", "altitude", "heading",
+                    "pitch", "roll", "utm_zone"}
+            for col in df.columns:
+                if channels and col not in channels:
+                    continue
+                if col in skip:
+                    continue
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    channel_sources[col] = None
+
+        run_dir = self._next_run_dir(Path(output_dir) / "qc_report")
+        written = qc_report.generate_report(
+            df, channel_sources, str(run_dir),
+            max_gap_s=max_gap_s, log_fn=self._log,
+        )
+        self._save_meta(str(run_dir / "run.meta.json"), {
+            "product": "qc_report",
+            "settings": {
+                "max_gap_s": max_gap_s,
+                "channels": list(channel_sources.keys()),
+                "interp_source": Path(interp_path).name,
+            },
+        })
+        self._log(f"QC report: {len(written)} file(s) in {run_dir}")
+        return written
 
     # ------------------------------------------------------------------
     # Internal helpers

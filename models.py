@@ -650,8 +650,10 @@ TASK_INFO: dict[str, dict] = {
     "sensor_2d":            {"label": "Sensor 2D GeoTIFF",           "requires": ["interp", "sensor"],     "per_channel": True,  "category": "Outputs"},
     "depth_slice_geotiffs": {"label": "Depth-Slice GeoTIFFs",        "requires": ["interp", "sensor"],     "per_channel": True,  "category": "Outputs"},
     "sensor_slices":        {"label": "PNG Depth Slices",            "requires": ["interp", "sensor"],     "per_channel": True,  "category": "Outputs"},
+    "sensor_netcdf":        {"label": "Sensor NetCDF (CF)",          "requires": ["interp", "sensor"],     "per_channel": True,  "category": "Export"},
     "photogrammetry":       {"label": "Photogrammetry",              "requires": ["video"],                "per_channel": False, "category": "Photogrammetry"},
     "qgis_project":         {"label": "QGIS Project (.qgs)",         "requires": ["interp"],               "per_channel": False, "category": "Export"},
+    "qc_report":            {"label": "Data QC Report",              "requires": ["interp"],               "per_channel": False, "category": "Export"},
 }
 
 # Order the Create-Task menu groups appear in.

@@ -13,9 +13,121 @@ import pandas as pd
 from typing import Tuple, Dict, Optional, Callable
 import csv
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageDraw
 from plyfile import PlyElement, PlyData
-import matplotlib.cm as cm
+import matplotlib
+
+
+# ---------------------------------------------------------------------------
+# Colormap selection + standalone legend rendering
+# ---------------------------------------------------------------------------
+#
+# Rendering deliberately avoids matplotlib.pyplot (it is not thread-safe
+# alongside Qt — see requirements.txt).  Colormaps are pulled from the
+# matplotlib colormap *registry*, and the legend is drawn by hand with PIL.
+
+# Colormaps offered in the UI for slice / PLY rendering.  "grayscale" is a
+# friendly alias for matplotlib's "gray"; "rgb" (legacy) maps to viridis.
+SLICE_COLORMAPS: list[str] = [
+    "viridis", "plasma", "inferno", "magma", "cividis",
+    "turbo", "coolwarm", "jet", "grayscale",
+]
+
+
+def resolve_cmap(color_mode: str):
+    """Resolve a color_mode string to a matplotlib Colormap.
+
+    Accepts the legacy "rgb" (→ viridis), "grayscale" (→ gray), or any
+    registered matplotlib colormap name.  Falls back to viridis on an unknown
+    name.  Uses the colormap registry rather than pyplot to stay thread-safe.
+    """
+    name = (color_mode or "rgb").strip().lower()
+    if name in ("rgb", ""):
+        name = "viridis"
+    elif name == "grayscale":
+        name = "gray"
+    try:
+        return matplotlib.colormaps[name]
+    except KeyError:
+        return matplotlib.colormaps["viridis"]
+
+
+def write_colorbar_legend(
+    path: str,
+    *,
+    cmap,
+    vmin: float,
+    vmax: float,
+    label: str = "",
+    log_scale: bool = False,
+    bar_height: int = 360,
+    n_ticks: int = 6,
+) -> None:
+    """Write a standalone vertical colourbar legend PNG (no pyplot).
+
+    A stack of slices that share one colour scale can carry a single legend
+    that maps colours back to real data units.  Tick labels are evenly spaced
+    in linear space, or in log space when log_scale is True.
+
+    Args:
+        path:       Output PNG path.
+        cmap:       A matplotlib Colormap (use resolve_cmap()).
+        vmin, vmax: Real-unit bounds the colour scale spans.
+        label:      Title drawn above the bar (e.g. "Temperature (°C)").
+        log_scale:  When True, tick labels are spaced logarithmically.
+        bar_height: Height of the gradient bar in pixels.
+        n_ticks:    Number of labelled ticks (>= 2).
+    """
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        # Degenerate range — nothing meaningful to draw.
+        return
+
+    n_ticks = max(2, int(n_ticks))
+    bar_w   = 34
+    pad_l   = 10
+    gap     = 6
+    label_w = 96
+    pad_top = 26 if label else 12
+    pad_bot = 14
+
+    width  = pad_l + bar_w + gap + label_w
+    height = pad_top + bar_height + pad_bot
+
+    img  = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    # Gradient bar: top = vmax, bottom = vmin.  Colour position p is what the
+    # data was normalised to, so p maps directly through the colormap.
+    for row in range(bar_height):
+        p = 1.0 - row / (bar_height - 1)
+        r, g, b = (np.array(cmap(p)[:3]) * 255).astype(int)
+        y = pad_top + row
+        draw.line([(pad_l, y), (pad_l + bar_w, y)], fill=(int(r), int(g), int(b)))
+
+    # Border around the bar.
+    draw.rectangle(
+        [pad_l, pad_top, pad_l + bar_w, pad_top + bar_height - 1],
+        outline=(60, 60, 60),
+    )
+
+    # Title.
+    if label:
+        draw.text((pad_l, 6), label, fill=(20, 20, 20))
+
+    # Ticks + labels.
+    if log_scale:
+        lo, hi = np.log(max(vmin, 1e-12)), np.log(max(vmax, 1e-12))
+    for k in range(n_ticks):
+        p = k / (n_ticks - 1)             # 0 = bottom (vmin), 1 = top (vmax)
+        if log_scale:
+            value = float(np.exp(lo + p * (hi - lo)))
+        else:
+            value = vmin + p * (vmax - vmin)
+        y = pad_top + int((1.0 - p) * (bar_height - 1))
+        draw.line([(pad_l + bar_w, y), (pad_l + bar_w + 4, y)], fill=(60, 60, 60))
+        draw.text((pad_l + bar_w + gap, y - 5), f"{value:.3g}", fill=(20, 20, 20))
+
+    img.save(path)
 
 
 def idw_fill(power: float = 2, max_distance: Optional[float] = None) -> Callable:
@@ -444,7 +556,8 @@ class PointCloudPipeline:
             filepath: Output PLY file path
             scalar_col: Column name for coloring. If None, uses constant color.
             binary: If True, write binary PLY; if False, write ASCII
-            color_mode: 'rgb' uses viridis colormap; 'grayscale' maps to gray ramp
+            color_mode: colormap name (see SLICE_COLORMAPS); 'rgb' → viridis,
+                        'grayscale' → gray ramp, or any matplotlib colormap
             show_empty: If True, empty cells are white; if False, omitted
             log_scale: If True, apply log scaling before color mapping — spreads
                        low-end variation that linear scale would compress
@@ -504,11 +617,8 @@ class PointCloudPipeline:
                     else np.full(len(clipped), 0.5)
                 )
 
-                if color_mode == 'grayscale':
-                    gray   = (normalized * 255).astype(np.uint8)
-                    colors = np.stack([gray, gray, gray], axis=1)
-                else:
-                    colors = (cm.viridis(normalized)[:, :3] * 255).astype(np.uint8)
+                cmap   = resolve_cmap(color_mode)
+                colors = (cmap(normalized)[:, :3] * 255).astype(np.uint8)
 
                 rgb[has_data] = colors
 
@@ -535,7 +645,11 @@ class PointCloudPipeline:
                          color_mode: str = 'rgb', log_scale: bool = False,
                          percentile_cap: float = 100.0,
                          pixels_per_cell: int = 1,
-                         local_norm: bool = False) -> None:
+                         local_norm: bool = False,
+                         vmin: Optional[float] = None,
+                         vmax: Optional[float] = None,
+                         write_legend: bool = True,
+                         legend_label: str = "") -> None:
         """
         Export 2D raster PNG slices at regular altitude intervals.
 
@@ -556,6 +670,14 @@ class PointCloudPipeline:
             local_norm: Normalize each slice to its own min/max instead of the
                         global range. Maximises contrast within each slice but
                         makes slices incomparable to each other.
+            vmin: Override the lower bound of the global colour scale (raw
+                  sensor value, before log/cap). When provided alongside vmax,
+                  all slices are colour-mapped to this fixed range instead of
+                  the range computed from this grid's own data.
+            vmax: Override the upper bound of the global colour scale.
+            write_legend: When True (and not local_norm), write a single
+                          _legend.png mapping colours to real data units.
+            legend_label: Title drawn on the legend (e.g. "Temperature (°C)").
         """
         if self.df_grid is None:
             raise ValueError("Create grid first with create_3d_grid()")
@@ -587,12 +709,32 @@ class PointCloudPipeline:
             all_vals = np.clip(all_vals, None, cap_val)
             self._logln(f"  Percentile cap ({percentile_cap}%): {cap_val:.2f}")
 
+        # Real-unit bounds (post-cap, pre-log) — used for the legend tick labels.
+        raw_lo = float(all_vals.min())
+        raw_hi = float(all_vals.max())
+
         if log_scale:
             floor_val = max(all_vals.min(), 1e-9)
             all_vals  = np.log(np.maximum(all_vals, floor_val))
 
-        global_min = all_vals.min()
-        global_max = all_vals.max()
+        if vmin is not None and vmax is not None:
+            # External bounds supplied (e.g. from the full-dataset run so that
+            # per-interval slices stay on the same colour scale as each other).
+            v_lo, v_hi = float(vmin), float(vmax)
+            if cap_val is not None:
+                v_hi = min(v_hi, float(cap_val))
+            raw_lo, raw_hi = v_lo, v_hi
+            if log_scale and floor_val is not None:
+                global_min = np.log(max(v_lo, floor_val))
+                global_max = np.log(max(v_hi, floor_val))
+            else:
+                global_min, global_max = v_lo, v_hi
+            self._logln(f"  Colour scale: fixed [{vmin:.4g}, {vmax:.4g}]")
+        else:
+            global_min = all_vals.min()
+            global_max = all_vals.max()
+
+        cmap = resolve_cmap(color_mode)
 
         # --- Slice centres ---
         z_min = df['z'].min()
@@ -609,14 +751,18 @@ class PointCloudPipeline:
                   f"({self.cell_size}); some slices may be empty")
 
         slice_centers = np.arange(z_min + half, z_max + half + 1e-9, altitude_step)
-        self._logln(f"\nRendering {len(slice_centers)} slices into {output_dir}/")
+        self._logln(f"\nRendering up to {len(slice_centers)} slices into {output_dir}/")
 
+        n_written = 0
         for center in slice_centers:
             band = df[(df['z'] >= center - half) & (df['z'] < center + half)]
             band = band.dropna(subset=[scalar_col])
 
             # Aggregate multiple z cells within the band onto the x-y plane
             agg = band.groupby(['ix', 'iy'])[scalar_col].mean().reset_index()
+
+            if len(agg) == 0:
+                continue
 
             # White background — shape (ny, nx, 3)
             img = np.full((ny, nx, 3), 255, dtype=np.uint8)
@@ -643,11 +789,7 @@ class PointCloudPipeline:
                         else np.full(len(vals), 0.5)
                     )
 
-                if color_mode == 'grayscale':
-                    gray   = (normalized * 255).astype(np.uint8)
-                    colors = np.stack([gray, gray, gray], axis=1)
-                else:
-                    colors = (cm.viridis(normalized)[:, :3] * 255).astype(np.uint8)
+                colors = (cmap(normalized)[:, :3] * 255).astype(np.uint8)
 
                 xi = agg['ix'].values
                 yi = ny - 1 - agg['iy'].values  # flip so north is up
@@ -661,8 +803,27 @@ class PointCloudPipeline:
             fname = Path(output_dir) / f"slice_z{center:+09.3f}m.png"
             Image.fromarray(img, "RGB").save(str(fname))
             self._logln(f"  {fname.name}  ({len(agg)} cells with data)")
+            n_written += 1
 
-        self._logln(f"Done.")
+        n_skipped = len(slice_centers) - n_written
+
+        # A single legend only makes sense when every slice shares one scale.
+        # Under local_norm each slice has its own range, so skip it there.
+        if write_legend and n_written > 0 and not local_norm:
+            legend_path = Path(output_dir) / "_legend.png"
+            try:
+                write_colorbar_legend(
+                    str(legend_path), cmap=cmap, vmin=raw_lo, vmax=raw_hi,
+                    label=legend_label, log_scale=log_scale,
+                )
+                self._logln(f"  Legend: {legend_path.name}  [{raw_lo:.4g}, {raw_hi:.4g}]")
+            except Exception as exc:
+                self._logln(f"  Legend skipped: {exc}")
+
+        self._logln(
+            f"Done: {n_written} slices written"
+            + (f", {n_skipped} skipped (no data in band)" if n_skipped else "")
+        )
 
     def summary(self) -> str:
         """Return a summary of the current pipeline state."""

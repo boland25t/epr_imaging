@@ -294,10 +294,49 @@ class TaskConfigDialog(QDialog):
             w["ppc"].setRange(1, 20)
             w["ppc"].setValue(int(s.get("ppc", 4)))
             form.addRow("Pixels per cell:", w["ppc"])
-            w["color"] = self._combo(["rgb (viridis)", "grayscale"], s.get("color", "rgb (viridis)"))
-            form.addRow("Color mode:", w["color"])
-            w["local_norm"] = self._check("Local normalization", bool(s.get("local_norm", False)))
+            w["color"] = self._combo(
+                ["viridis", "plasma", "inferno", "magma", "cividis",
+                 "turbo", "coolwarm", "jet", "grayscale"],
+                s.get("color", "viridis"),
+            )
+            form.addRow("Colormap:", w["color"])
+            w["log_scale"] = self._check("Log scale", bool(s.get("log_scale", False)))
+            w["log_scale"].setToolTip(
+                "Apply logarithmic scaling before colour mapping.\n"
+                "Spreads low-end variation that linear scale compresses."
+            )
+            form.addRow("", w["log_scale"])
+            w["local_norm"] = self._check("Per-slice colour scale", bool(s.get("local_norm", False)))
+            w["local_norm"].setToolTip(
+                "Checked: each slice is normalised to its own min/max (interval-wise).\n"
+                "Unchecked: all slices share the same colour scale (full-dataset-wise)."
+            )
             form.addRow("", w["local_norm"])
+            w["manual_range"] = self._check("Manual colour range", bool(s.get("manual_range", False)))
+            w["manual_range"].setToolTip(
+                "Fix the colour scale to explicit min/max values (raw data units),\n"
+                "so slices stay comparable across separate runs / dives / jobs.\n"
+                "When off, per-job runs inherit the full-dataset range automatically."
+            )
+            form.addRow("", w["manual_range"])
+            w["vmin"] = self._dspin(-1e9, 1e9, float(s.get("vmin", 0.0)))
+            w["vmax"] = self._dspin(-1e9, 1e9, float(s.get("vmax", 1.0)))
+            w["vmin"].setDecimals(4)
+            w["vmax"].setDecimals(4)
+            form.addRow("Colour min:", w["vmin"])
+            form.addRow("Colour max:", w["vmax"])
+
+            def _sync_range(*_a) -> None:
+                manual = w["manual_range"].isChecked()
+                per_slice = w["local_norm"].isChecked()
+                on = manual and not per_slice
+                w["vmin"].setEnabled(on)
+                w["vmax"].setEnabled(on)
+                w["manual_range"].setEnabled(not per_slice)
+            w["manual_range"].toggled.connect(_sync_range)
+            w["local_norm"].toggled.connect(_sync_range)
+            _sync_range()
+
             note = QLabel("Targets the most recent Sensor 3D PLY run for the same channel/target.")
             note.setStyleSheet("color: #888; font-size: 9px; font-style: italic;")
             note.setWordWrap(True)
@@ -307,6 +346,42 @@ class TaskConfigDialog(QDialog):
             w["project_name"] = QLineEdit(s.get("project_name", "EPR Survey"))
             form.addRow("Project name:", w["project_name"])
             note = QLabel("Includes every GeoTIFF in the target's output directory.")
+            note.setStyleSheet("color: #888; font-size: 9px; font-style: italic;")
+            note.setWordWrap(True)
+            form.addRow("", note)
+
+        elif t == "sensor_netcdf":
+            w["cell_size"] = self._dspin(0.1, 100.0, s.get("cell_size", 1.0), " m")
+            form.addRow("Cell size:", w["cell_size"])
+            w["aggregation"] = self._combo(
+                ["mean", "min", "max", "count"], s.get("aggregation", "mean"),
+            )
+            form.addRow("Aggregation:", w["aggregation"])
+            w["fill"] = self._combo(
+                ["IDW fill", "Kriging fill", "RBF fill", "No fill"],
+                s.get("fill", "IDW fill"),
+            )
+            form.addRow("Fill:", w["fill"])
+            note = QLabel(
+                "Writes a CF-1.8 gridded NetCDF (depth × northing × easting) in UTM, "
+                "for xarray / QGIS / Panoply. One file per selected channel."
+            )
+            note.setStyleSheet("color: #888; font-size: 9px; font-style: italic;")
+            note.setWordWrap(True)
+            form.addRow("", note)
+
+        elif t == "qc_report":
+            w["max_gap"] = self._dspin(1.0, 36000.0, float(s.get("max_gap_s", 60.0)), " s")
+            w["max_gap"].setToolTip(
+                "A span between consecutive source sensor samples longer than this\n"
+                "counts as a gap. Frames inside a gap received bridged (interpolated\n"
+                "across the gap) values rather than true measurements."
+            )
+            form.addRow("Gap threshold:", w["max_gap"])
+            note = QLabel(
+                "Reports per-channel coverage, out-of-coverage frames, source gaps, "
+                "value stats, and histograms for the target's interp record."
+            )
             note.setStyleSheet("color: #888; font-size: 9px; font-style: italic;")
             note.setWordWrap(True)
             form.addRow("", note)
@@ -719,7 +794,11 @@ class TaskConfigDialog(QDialog):
             s["altitude_step"] = w["altitude_step"].value()
             s["ppc"]           = w["ppc"].value()
             s["color"]         = w["color"].currentText()
+            s["log_scale"]     = w["log_scale"].isChecked()
             s["local_norm"]    = w["local_norm"].isChecked()
+            s["manual_range"]  = w["manual_range"].isChecked()
+            s["vmin"]          = w["vmin"].value()
+            s["vmax"]          = w["vmax"].value()
 
         elif t == "photogrammetry":
             # Frame source
@@ -786,6 +865,14 @@ class TaskConfigDialog(QDialog):
 
         elif t == "qgis_project":
             s["project_name"] = w["project_name"].text().strip() or "EPR Survey"
+
+        elif t == "sensor_netcdf":
+            s["cell_size"]   = w["cell_size"].value()
+            s["aggregation"] = w["aggregation"].currentText()
+            s["fill"]        = w["fill"].currentText()
+
+        elif t == "qc_report":
+            s["max_gap_s"] = w["max_gap"].value()
 
         super().accept()
 

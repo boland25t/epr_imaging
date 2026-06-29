@@ -27,6 +27,9 @@ utm>=0.7
 # 3D point cloud and PLY file output (used by PointCloudPipeline)
 plyfile>=0.9
 
+# CF-compliant gridded NetCDF export (xarray / QGIS / Panoply interchange)
+netCDF4>=1.6
+
 # PNG image writing for raster slices (thread-safe; avoids pyplot Qt conflict)
 Pillow>=10.0
 

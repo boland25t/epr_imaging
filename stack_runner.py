@@ -274,9 +274,10 @@ class StackWorker(QObject):
 
     def _run_slices(self, svc, step: dict, kwargs: dict) -> Optional[list[str]]:
         """Resolve the target 3D run directory, then generate PNG slices from it."""
-        product   = step["product_type"]
-        parent_3d = "sensor_3d" if product == "sensor_slices" else "nav_3d"
-        run_glob  = kwargs.pop("_run_glob", None)
+        product      = step["product_type"]
+        parent_3d    = "sensor_3d" if product == "sensor_slices" else "nav_3d"
+        run_glob     = kwargs.pop("_run_glob", None)
+        scale_glob   = kwargs.pop("_scale_source_glob", None)
 
         # Prefer a run created earlier in THIS execution; else newest on disk.
         key     = (step["scope_id"], parent_3d, step.get("channel"))
@@ -291,11 +292,44 @@ class StackWorker(QObject):
             )
             return None
 
+        # Inject the full-dataset colour range so interval slices stay on the
+        # same scale as the full trackline (and as each other).
+        if product == "sensor_slices" and scale_glob and "vmin" not in kwargs:
+            scale_run = self._latest_run_dir(scale_glob)
+            if scale_run and scale_run != run_dir:
+                vmin, vmax = self._grid_scalar_range(scale_run)
+                if vmin is not None:
+                    kwargs["vmin"] = vmin
+                    kwargs["vmax"] = vmax
+                    self._emit(
+                        f"  Colour scale: full-dataset range "
+                        f"[{vmin:.4g}, {vmax:.4g}]"
+                    )
+
         method = getattr(svc, "generate_sensor_slices_from_run"
                          if product == "sensor_slices"
                          else "generate_nav_slices_from_run")
         result = method(run_dir=run_dir, **kwargs)
         return self._as_path_list(result)
+
+    def _grid_scalar_range(self, run_dir: str) -> tuple:
+        """Return (min, max) raw scalar values from a grid.csv.gz, or (None, None)."""
+        grid_path = Path(run_dir) / "grid.csv.gz"
+        if not grid_path.exists():
+            return None, None
+        try:
+            import pandas as pd
+            df = pd.read_csv(str(grid_path))
+            coord_cols = {"x", "y", "z", "ix", "iy", "iz"}
+            scalar_cols = [c for c in df.columns if c not in coord_cols]
+            if not scalar_cols:
+                return None, None
+            vals = df[scalar_cols[0]].dropna().values
+            if len(vals) == 0:
+                return None, None
+            return float(vals.min()), float(vals.max())
+        except Exception:
+            return None, None
 
     def _run_sampling(self, step: dict) -> list[str]:
         """Run a frame-extraction pipeline pass from a prebuilt PipelineConfig.

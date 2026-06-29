@@ -1421,15 +1421,29 @@ class MainWindow(QMainWindow):
                     }, f"Depth-Slice GeoTIFFs — {ch}" + tag))
 
             elif t == "sensor_slices":
-                color = "grayscale" if "grayscale" in s.get("color", "") else "rgb"
+                color = s.get("color", "viridis") or "viridis"
+                local_norm = bool(s.get("local_norm", False))
+                manual_range = bool(s.get("manual_range", False)) and not local_norm
+                full_sensor_3d = str(Path(self._outputs_root()) / "sensor_3d")
                 for ch in channels:
-                    plan.append(self._step(t, scope_id, ch, None, {
+                    kw: dict = {
                         "altitude_step": float(s.get("altitude_step", 5.0)),
                         "pixels_per_cell": int(s.get("ppc", 4)),
                         "color_mode": color,
-                        "local_norm": bool(s.get("local_norm", False)),
+                        "log_scale": bool(s.get("log_scale", False)),
+                        "local_norm": local_norm,
                         "_run_glob": str(Path(output_dir) / "sensor_3d" / ch),
-                    }, f"PNG Depth Slices — {ch}" + tag))
+                    }
+                    if manual_range:
+                        # Explicit user range wins over any auto-derived scale.
+                        kw["vmin"] = float(s.get("vmin", 0.0))
+                        kw["vmax"] = float(s.get("vmax", 1.0))
+                    elif scope_id != "full":
+                        # Per-job runs: point the runner at the full-dataset
+                        # sensor_3d tree so it can derive a shared colour range.
+                        kw["_scale_source_glob"] = str(Path(full_sensor_3d) / ch)
+                    plan.append(self._step(t, scope_id, ch, None, kw,
+                                           f"PNG Depth Slices — {ch}" + tag))
 
             elif t == "photogrammetry":
                 # Frame source: either linked to a sampling task (depends_on) or manual.
@@ -1502,6 +1516,25 @@ class MainWindow(QMainWindow):
                     "output_dir": output_dir,
                     "project_name": s.get("project_name", "EPR Survey"),
                 }, "QGIS Project" + tag))
+
+            elif t == "qc_report":
+                plan.append(self._step(t, scope_id, None, "generate_qc_report", {
+                    "interp_path": interp_path,
+                    "output_dir": output_dir,
+                    "sensor_files": self.sensor_files,
+                    "channels": task.channels or None,
+                    "max_gap_s": float(s.get("max_gap_s", 60.0)),
+                }, "Data QC Report" + tag))
+
+            elif t == "sensor_netcdf":
+                for ch in channels:
+                    plan.append(self._step(t, scope_id, ch, "generate_sensor_netcdf", {
+                        "interp_path": interp_path, "output_dir": output_dir, "channel": ch,
+                        "cell_size": float(s.get("cell_size", 1.0)),
+                        "aggregation": s.get("aggregation", "mean"),
+                        "fill_method": self._FILL_3CH.get(s.get("fill", "IDW fill"), "idw"),
+                        "units": self._get_raster_channel_units(ch),
+                    }, f"Sensor NetCDF — {ch}" + tag))
 
         return plan
 
@@ -2018,20 +2051,27 @@ class MainWindow(QMainWindow):
         )
         s_slices_layout.addRow("Pixels per cell:", self.sensor_slices_ppc_spin)
         self.sensor_slices_color_combo = QComboBox()
-        self.sensor_slices_color_combo.addItems(["rgb (viridis)", "grayscale"])
-        s_slices_layout.addRow("Color mode:", self.sensor_slices_color_combo)
+        self.sensor_slices_color_combo.addItems([
+            "viridis", "plasma", "inferno", "magma", "cividis",
+            "turbo", "coolwarm", "jet", "grayscale",
+        ])
+        self.sensor_slices_color_combo.setToolTip(
+            "Colormap for slice rendering. A matching _legend.png is written\n"
+            "alongside the slices mapping colours back to real data units."
+        )
+        s_slices_layout.addRow("Colormap:", self.sensor_slices_color_combo)
         self.sensor_slices_log_check = QCheckBox("Log scale")
         self.sensor_slices_log_check.setToolTip(
             "Apply log scaling before colour mapping.\n"
             "Useful for data with a large dynamic range."
         )
         s_slices_layout.addRow("", self.sensor_slices_log_check)
-        self.sensor_slices_local_norm_check = QCheckBox("Local normalization")
+        self.sensor_slices_local_norm_check = QCheckBox("Per-slice colour scale")
         self.sensor_slices_local_norm_check.setToolTip(
-            "Normalize each slice to its own min/max value.\n"
-            "Use when all values are in a narrow absolute range (e.g. low CO₂):\n"
-            "reveals spatial variation even when the signal is uniformly weak.\n\n"
-            "Leave unchecked to keep slices colour-comparable across depths."
+            "Checked: each slice is normalised to its own min/max (interval-wise).\n"
+            "Reveals spatial variation even when the signal is uniformly weak at a depth.\n\n"
+            "Unchecked: all slices share the same colour scale (full-dataset-wise).\n"
+            "Keeps slices colour-comparable across depths."
         )
         s_slices_layout.addRow("", self.sensor_slices_local_norm_check)
         self.sensor_slices_pct_spin = QDoubleSpinBox()
@@ -2044,6 +2084,40 @@ class MainWindow(QMainWindow):
             "Set below 100 to suppress outliers (e.g. 99 or 95)."
         )
         s_slices_layout.addRow("Percentile cap:", self.sensor_slices_pct_spin)
+
+        # Manual colour range — fixes the colour scale to explicit data values
+        # so slices stay comparable across separate runs / dives / workspaces.
+        self.sensor_slices_manual_range_check = QCheckBox("Manual colour range")
+        self.sensor_slices_manual_range_check.setToolTip(
+            "Fix the colour scale to explicit min/max values (raw data units).\n"
+            "Use to compare slices across separate runs or dives on one scale.\n"
+            "When off, the scale is taken from this run's own data."
+        )
+        s_slices_layout.addRow("", self.sensor_slices_manual_range_check)
+        self.sensor_slices_vmin_spin = QDoubleSpinBox()
+        self.sensor_slices_vmin_spin.setRange(-1e9, 1e9)
+        self.sensor_slices_vmin_spin.setDecimals(4)
+        self.sensor_slices_vmin_spin.setValue(0.0)
+        self.sensor_slices_vmax_spin = QDoubleSpinBox()
+        self.sensor_slices_vmax_spin.setRange(-1e9, 1e9)
+        self.sensor_slices_vmax_spin.setDecimals(4)
+        self.sensor_slices_vmax_spin.setValue(1.0)
+        s_slices_layout.addRow("Colour min:", self.sensor_slices_vmin_spin)
+        s_slices_layout.addRow("Colour max:", self.sensor_slices_vmax_spin)
+
+        def _sync_slice_range_enabled() -> None:
+            # Manual range is meaningless under per-slice normalisation.
+            manual = self.sensor_slices_manual_range_check.isChecked()
+            per_slice = self.sensor_slices_local_norm_check.isChecked()
+            on = manual and not per_slice
+            self.sensor_slices_vmin_spin.setEnabled(on)
+            self.sensor_slices_vmax_spin.setEnabled(on)
+            self.sensor_slices_manual_range_check.setEnabled(not per_slice)
+
+        self.sensor_slices_manual_range_check.toggled.connect(_sync_slice_range_enabled)
+        self.sensor_slices_local_norm_check.toggled.connect(_sync_slice_range_enabled)
+        _sync_slice_range_enabled()
+
         self.sensor_slices_generate_btn = QPushButton("Generate Depth Slices")
         self.sensor_slices_generate_btn.setStyleSheet("font-weight: bold; padding: 6px;")
         s_slices_layout.addRow(self.sensor_slices_generate_btn)
@@ -4044,10 +4118,17 @@ class MainWindow(QMainWindow):
             self.sensor_3d_zero_spin.setValue(float(data.get("out_sensor_3d_zero_mask", 5.0)))
             self.sensor_slices_step_spin.setValue(float(data.get("out_sensor_slices_step", 5.0)))
             self.sensor_slices_ppc_spin.setValue(int(data.get("out_sensor_slices_ppc", 4)))
-            _set_combo(self.sensor_slices_color_combo, "out_sensor_slices_color", "rgb (viridis)")
+            # Legacy workspaces stored "rgb (viridis)"; migrate to "viridis".
+            _legacy_cmap = {"rgb (viridis)": "viridis", "rgb": "viridis"}
+            _saved_cmap = data.get("out_sensor_slices_color", "viridis")
+            data["out_sensor_slices_color"] = _legacy_cmap.get(_saved_cmap, _saved_cmap)
+            _set_combo(self.sensor_slices_color_combo, "out_sensor_slices_color", "viridis")
             self.sensor_slices_log_check.setChecked(bool(data.get("out_sensor_slices_log", False)))
             self.sensor_slices_local_norm_check.setChecked(bool(data.get("out_sensor_slices_local_norm", False)))
             self.sensor_slices_pct_spin.setValue(float(data.get("out_sensor_slices_pct", 100.0)))
+            self.sensor_slices_manual_range_check.setChecked(bool(data.get("out_sensor_slices_manual_range", False)))
+            self.sensor_slices_vmin_spin.setValue(float(data.get("out_sensor_slices_vmin", 0.0)))
+            self.sensor_slices_vmax_spin.setValue(float(data.get("out_sensor_slices_vmax", 1.0)))
             self.sensor_geo_slices_step_spin.setValue(float(data.get("out_sensor_geo_slices_step", 5.0)))
             self.sensor_geo_slices_cell_spin.setValue(float(data.get("out_sensor_geo_slices_cell", 2.0)))
             _set_combo(self.sensor_geo_slices_fill_combo, "out_sensor_geo_slices_fill", "IDW fill")
@@ -4168,6 +4249,9 @@ class MainWindow(QMainWindow):
             out_sensor_slices_log=self.sensor_slices_log_check.isChecked(),
             out_sensor_slices_local_norm=self.sensor_slices_local_norm_check.isChecked(),
             out_sensor_slices_pct=float(self.sensor_slices_pct_spin.value()),
+            out_sensor_slices_manual_range=self.sensor_slices_manual_range_check.isChecked(),
+            out_sensor_slices_vmin=float(self.sensor_slices_vmin_spin.value()),
+            out_sensor_slices_vmax=float(self.sensor_slices_vmax_spin.value()),
             photo_engine="metashape" if self.photo_engine_meta_radio.isChecked() else "colmap",
             photo_quality=self.photo_quality_combo.currentText(),
             photo_build_dense=self.photo_dense_check.isChecked(),
@@ -4870,8 +4954,18 @@ class MainWindow(QMainWindow):
                 "or right-click and choose 'Make Slices from this run'."
             )
             return
-        color_text = self.sensor_slices_color_combo.currentText()
-        color_mode = "grayscale" if "grayscale" in color_text else "rgb"
+        color_mode = self.sensor_slices_color_combo.currentText()
+        vmin = vmax = None
+        if (self.sensor_slices_manual_range_check.isChecked()
+                and not self.sensor_slices_local_norm_check.isChecked()):
+            vmin = float(self.sensor_slices_vmin_spin.value())
+            vmax = float(self.sensor_slices_vmax_spin.value())
+            if vmax <= vmin:
+                QMessageBox.warning(
+                    self, "Invalid colour range",
+                    f"Colour max ({vmax:g}) must be greater than colour min ({vmin:g})."
+                )
+                return
         self._run_output_task(
             "generate_sensor_slices_from_run",
             run_dir=self._selected_sensor_run,
@@ -4881,6 +4975,8 @@ class MainWindow(QMainWindow):
             log_scale=self.sensor_slices_log_check.isChecked(),
             percentile_cap=float(self.sensor_slices_pct_spin.value()),
             local_norm=self.sensor_slices_local_norm_check.isChecked(),
+            vmin=vmin,
+            vmax=vmax,
         )
 
     def _generate_sensor_geo_slices(self) -> None:
