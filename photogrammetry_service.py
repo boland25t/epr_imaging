@@ -330,9 +330,8 @@ def run_metashape(
             log_fn(msg)
 
     # Version-appropriate dense/sparse bindings (1.x vs 2.x — see _meta_api).
-    api          = _meta_api(Metashape)
-    major        = _metashape_major(Metashape)
-    dense_source = api["dense_source"]
+    api   = _meta_api(Metashape)
+    major = _metashape_major(Metashape)
 
     # Point limits: 0 in the UI means "Auto" — translate to Metashape's own
     # documented defaults rather than passing 0, which Metashape reads as
@@ -357,6 +356,77 @@ def run_metashape(
         doc.save()
     log(f"Project created: {psx_path}")
 
+    opts = dict(
+        align_accuracy=align_accuracy,
+        key_point_limit=key_point_limit,
+        tie_point_limit=tie_point_limit,
+        generic_preselect=generic_preselect,
+        reference_preselect=reference_preselect,
+        adaptive_fitting=adaptive_fitting,
+        reset_cameras=reset_cameras,
+        build_dense=build_dense,
+        dense_quality=dense_quality,
+        depth_filter=depth_filter,
+        reuse_depth=reuse_depth,
+        build_mesh=build_mesh,
+        mesh_surface=mesh_surface,
+        mesh_faces=mesh_faces,
+        mesh_source=mesh_source,
+        mesh_vertex_colors=mesh_vertex_colors,
+        build_texture=build_texture,
+        texture_size=texture_size,
+        texture_blending=texture_blending,
+        texture_fill_holes=texture_fill_holes,
+        export_dense_ply=export_dense_ply,
+        export_mesh_obj=export_mesh_obj,
+        nav_csv=nav_csv,
+        use_nav_reference=use_nav_reference,
+        nav_accuracy_h=nav_accuracy_h,
+        nav_accuracy_v=nav_accuracy_v,
+    )
+    products = _process_metashape_chunk(
+        Metashape, doc, chunk, run_dir, api=api, major=major,
+        opts=opts, save_project=save_project, log=log,
+    )
+    products["metashape_psx"] = psx_path
+    if save_project:
+        doc.save()
+    log("Metashape run complete.")
+    return products
+
+
+def _process_metashape_chunk(Metashape, doc, chunk, run_dir, *, api, major,
+                             opts, save_project, log):
+    """Process ONE Metashape chunk: georeference seed -> align -> dense ->
+    mesh -> texture -> exports.  Returns the products dict (without the .psx,
+    which the caller adds).  Shared by run_metashape and run_metashape_batch."""
+    align_accuracy = opts['align_accuracy']
+    key_point_limit = opts['key_point_limit']
+    tie_point_limit = opts['tie_point_limit']
+    generic_preselect = opts['generic_preselect']
+    reference_preselect = opts['reference_preselect']
+    adaptive_fitting = opts['adaptive_fitting']
+    reset_cameras = opts['reset_cameras']
+    build_dense = opts['build_dense']
+    dense_quality = opts['dense_quality']
+    depth_filter = opts['depth_filter']
+    reuse_depth = opts['reuse_depth']
+    build_mesh = opts['build_mesh']
+    mesh_surface = opts['mesh_surface']
+    mesh_faces = opts['mesh_faces']
+    mesh_source = opts['mesh_source']
+    mesh_vertex_colors = opts['mesh_vertex_colors']
+    build_texture = opts['build_texture']
+    texture_size = opts['texture_size']
+    texture_blending = opts['texture_blending']
+    texture_fill_holes = opts['texture_fill_holes']
+    export_dense_ply = opts['export_dense_ply']
+    export_mesh_obj = opts['export_mesh_obj']
+    nav_csv = opts['nav_csv']
+    use_nav_reference = opts['use_nav_reference']
+    nav_accuracy_h = opts['nav_accuracy_h']
+    nav_accuracy_v = opts['nav_accuracy_v']
+    dense_source = api['dense_source']
     # ── Georeference: pre-seed camera positions ────────────────────────────────
     seeded_nav = False
     if nav_csv and use_nav_reference and Path(nav_csv).exists():
@@ -492,11 +562,123 @@ def run_metashape(
     except Exception:
         pass  # non-fatal
 
-    products["metashape_psx"] = psx_path
+    return products
+
+
+def run_metashape_batch(
+    project_psx,
+    frame_sets,                       # list of (frame_dir, run_dir, nav_csv)
+    *,
+    align_accuracy: str = "High",
+    key_point_limit: int = 40000,
+    tie_point_limit: int = 10000,
+    generic_preselect: bool = True,
+    reference_preselect: bool = True,
+    adaptive_fitting: bool = True,
+    reset_cameras: bool = False,
+    build_dense: bool = True,
+    dense_quality: str = "Medium",
+    depth_filter: str = "Moderate",
+    reuse_depth: bool = False,
+    build_mesh: bool = False,
+    mesh_surface: str = "Arbitrary",
+    mesh_faces: str = "Medium",
+    mesh_source: str = "Dense cloud",
+    mesh_vertex_colors: bool = True,
+    build_texture: bool = False,
+    texture_size: int = 4096,
+    texture_blending: str = "Mosaic",
+    texture_fill_holes: bool = True,
+    export_dense_ply: bool = True,
+    export_mesh_obj: bool = False,
+    use_nav_reference: bool = True,
+    nav_accuracy_h: float = 0.1,
+    nav_accuracy_v: float = 0.5,
+    save_project: bool = True,
+    log_fn: Optional[Callable[[str], None]] = None,
+    file_log_fn: Optional[Callable[[str], None]] = None,
+) -> dict[str, list[str]]:
+    """Batch photogrammetry: ONE Metashape project, one chunk per interval.
+
+    This is the headless equivalent of Metashape's Batch Process — no GUI: a
+    single Document holds one chunk per frame set, each chunk is processed with
+    the same per-chunk pipeline as run_metashape, and each chunk's products are
+    exported into ITS OWN run directory in the app's file tree.  One *dataset*
+    (a contiguous trackline) → one .psx; its intervals → chunks.
+
+    frame_sets : list of (frame_dir, run_dir, nav_csv) — nav_csv is that
+                 interval's interp.csv (per-chunk georeferencing).
+
+    Returns {run_dir: [product paths]} — one entry per chunk.
+    """
+    import Metashape
+
+    def log(msg: str) -> None:
+        if log_fn:
+            log_fn(msg)
+
+    api   = _meta_api(Metashape)
+    major = _metashape_major(Metashape)
+    if key_point_limit <= 0:
+        key_point_limit = 40000
+    if tie_point_limit <= 0:
+        tie_point_limit = 4000
+
+    project_psx = Path(project_psx)
+    project_psx.parent.mkdir(parents=True, exist_ok=True)
+    doc = Metashape.Document()
+    doc.save(str(project_psx))
+    log(f"Metashape {major}.x batch project: {project_psx}")
+    log(f"  {len(frame_sets)} chunk(s) — one per interval, exported to the file tree")
+
+    results: dict[str, list[str]] = {}
+    for idx, (frame_dir, run_dir, nav_csv) in enumerate(frame_sets, start=1):
+        run_dir = Path(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        photos = _collect_frames(frame_dir)
+        if not photos:
+            log(f"  ⚠ chunk {idx}: no images in {frame_dir} — skipping")
+            results[str(run_dir)] = []
+            continue
+
+        chunk = doc.addChunk()
+        chunk.label = run_dir.name
+        chunk.addPhotos(photos)
+        if save_project:
+            doc.save()
+        log(f"  ── chunk {idx}/{len(frame_sets)}: {len(photos)} frames → {run_dir}")
+
+        opts = dict(
+            align_accuracy=align_accuracy, key_point_limit=key_point_limit,
+            tie_point_limit=tie_point_limit, generic_preselect=generic_preselect,
+            reference_preselect=reference_preselect, adaptive_fitting=adaptive_fitting,
+            reset_cameras=reset_cameras, build_dense=build_dense,
+            dense_quality=dense_quality, depth_filter=depth_filter, reuse_depth=reuse_depth,
+            build_mesh=build_mesh, mesh_surface=mesh_surface, mesh_faces=mesh_faces,
+            mesh_source=mesh_source, mesh_vertex_colors=mesh_vertex_colors,
+            build_texture=build_texture, texture_size=texture_size,
+            texture_blending=texture_blending, texture_fill_holes=texture_fill_holes,
+            export_dense_ply=export_dense_ply, export_mesh_obj=export_mesh_obj,
+            nav_csv=nav_csv, use_nav_reference=use_nav_reference,
+            nav_accuracy_h=nav_accuracy_h, nav_accuracy_v=nav_accuracy_v,
+        )
+        try:
+            products = _process_metashape_chunk(
+                Metashape, doc, chunk, run_dir, api=api, major=major,
+                opts=opts, save_project=save_project, log=log,
+            )
+            products["metashape_psx"] = str(project_psx)
+            for k, v in products.items():
+                log(f"        [metashape] {k}: {v}")
+            results[str(run_dir)] = list(products.values())
+        except Exception as exc:  # noqa: BLE001 — one bad chunk must not abort the batch
+            log(f"  ⚠ chunk {idx} failed (continuing): {exc}")
+            results[str(run_dir)] = []
+
     if save_project:
         doc.save()
-    log("Metashape run complete.")
-    return products
+    log(f"Metashape batch complete. Project: {project_psx}")
+    return results
 
 
 def _collect_frames(frame_dir: str) -> list[str]:

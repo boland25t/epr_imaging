@@ -219,7 +219,66 @@ class TaskConfigDialog(QDialog):
         w = self._widgets
         form = self._form
 
-        if t == "sampling":
+        if t == "build_interp":
+            w["sample_hz"] = self._dspin(0.001, 100.0, s.get("sample_hz", 1.0), " Hz", 0.1, 3)
+            form.addRow("Sample rate:", w["sample_hz"])
+            note = QLabel(
+                "Interpolates navigation + sensor channels onto a regular time grid "
+                "and writes interp_full.csv at the workspace root — the prerequisite "
+                "for all output tasks. No video needed. Always runs over the full dataset."
+            )
+            note.setStyleSheet("color: #888; font-size: 9px; font-style: italic;")
+            note.setWordWrap(True)
+            form.addRow("", note)
+
+        elif t == "frame_stats":
+            # Frame source (link to a sampling task in the stack, or a manual dir).
+            w["fs_from_task"] = QRadioButton("From sampling task in stack")
+            w["fs_manual"]    = QRadioButton("Manual directory")
+            w["fs_task_combo"] = QComboBox()
+            for tid, tlabel in self._sampling_tasks:
+                w["fs_task_combo"].addItem(tlabel, userData=tid)
+            if not self._sampling_tasks:
+                w["fs_from_task"].setEnabled(False)
+            w["frame_dir"] = QLineEdit(s.get("frame_dir", ""))
+            w["frame_dir"].setPlaceholderText("Path to frames directory…")
+            browse = QPushButton("…"); browse.setMaximumWidth(30)
+            browse.clicked.connect(self._browse_frame_dir)
+            row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(w["frame_dir"]); row.addWidget(browse)
+            holder = QWidget(); holder.setLayout(row)
+            form.addRow("Frame source:", w["fs_from_task"])
+            form.addRow("", w["fs_task_combo"])
+            form.addRow("", w["fs_manual"])
+            form.addRow("Manual dir:", holder)
+            if self._task.depends_on is not None and self._sampling_tasks:
+                w["fs_from_task"].setChecked(True)
+                for i in range(w["fs_task_combo"].count()):
+                    if w["fs_task_combo"].itemData(i) == self._task.depends_on:
+                        w["fs_task_combo"].setCurrentIndex(i); break
+            else:
+                w["fs_manual"].setChecked(True)
+
+            def _sync_fs():
+                ft = w["fs_from_task"].isChecked()
+                w["fs_task_combo"].setEnabled(ft and bool(self._sampling_tasks))
+                w["frame_dir"].setEnabled(not ft); browse.setEnabled(not ft)
+            w["fs_from_task"].toggled.connect(lambda _: _sync_fs())
+            _sync_fs()
+
+            w["sharpness_min"]  = self._dspin(0.0, 10000.0, s.get("sharpness_min", 100.0), "", 10.0, 0)
+            form.addRow("Min sharpness:", w["sharpness_min"])
+            w["brightness_min"] = self._dspin(0.0, 255.0, s.get("brightness_min", 20.0), "", 1.0, 0)
+            form.addRow("Min brightness:", w["brightness_min"])
+            w["brightness_max"] = self._dspin(0.0, 255.0, s.get("brightness_max", 235.0), "", 1.0, 0)
+            form.addRow("Max brightness:", w["brightness_max"])
+            note = QLabel("Per-frame sharpness/brightness/contrast/exposure + each frame's "
+                          "sensor & nav values; flags blurry / dark / over-exposed frames.")
+            note.setStyleSheet("color: #888; font-size: 9px; font-style: italic;")
+            note.setWordWrap(True)
+            form.addRow("", note)
+
+        elif t == "sampling":
             w["mode"] = QComboBox()
             w["mode"].addItems(["Fixed rate", "Dynamic spacing"])
             w["mode"].setCurrentText("Dynamic spacing" if s.get("mode") == "dynamic" else "Fixed rate")
@@ -759,7 +818,21 @@ class TaskConfigDialog(QDialog):
         w = self._widgets
         t = task.task_type
 
-        if t == "sampling":
+        if t == "build_interp":
+            s["sample_hz"] = w["sample_hz"].value()
+
+        elif t == "frame_stats":
+            if w["fs_from_task"].isChecked() and w["fs_task_combo"].count() > 0:
+                task.depends_on = w["fs_task_combo"].currentData()
+                s["frame_dir"]  = ""
+            else:
+                task.depends_on = None
+                s["frame_dir"]  = w["frame_dir"].text().strip()
+            s["sharpness_min"]  = w["sharpness_min"].value()
+            s["brightness_min"] = w["brightness_min"].value()
+            s["brightness_max"] = w["brightness_max"].value()
+
+        elif t == "sampling":
             s["mode"]       = "dynamic" if w["mode"].currentText() == "Dynamic spacing" else "fixed"
             s["frame_rate"] = w["frame_rate"].value()
             s["spacing_m"]  = w["spacing_m"].value()

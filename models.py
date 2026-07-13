@@ -643,6 +643,7 @@ class PhotogrammetryRun:
 #   "sensor" → at least one SensorFileConfig is configured
 #   "interp" → interp_full.csv exists (the build step has run)
 TASK_INFO: dict[str, dict] = {
+    "build_interp":         {"label": "Build interp_full.csv",       "requires": ["nav", "sensor"],        "per_channel": False, "category": "Prepare"},
     "sampling":             {"label": "Sampling (frame extraction)", "requires": ["video"],               "per_channel": False, "category": "Sampling"},
     "nav_3d":               {"label": "Nav Trackline PLY",           "requires": ["interp"],               "per_channel": False, "category": "Outputs"},
     "nav_2d":               {"label": "Nav Depth GeoTIFF",           "requires": ["interp"],               "per_channel": False, "category": "Outputs"},
@@ -651,13 +652,14 @@ TASK_INFO: dict[str, dict] = {
     "depth_slice_geotiffs": {"label": "Depth-Slice GeoTIFFs",        "requires": ["interp", "sensor"],     "per_channel": True,  "category": "Outputs"},
     "sensor_slices":        {"label": "PNG Depth Slices",            "requires": ["interp", "sensor"],     "per_channel": True,  "category": "Outputs"},
     "sensor_netcdf":        {"label": "Sensor NetCDF (CF)",          "requires": ["interp", "sensor"],     "per_channel": True,  "category": "Export"},
+    "frame_stats":          {"label": "Frame Statistics",            "requires": [],                       "per_channel": False, "category": "Export"},
     "photogrammetry":       {"label": "Photogrammetry",              "requires": ["video"],                "per_channel": False, "category": "Photogrammetry"},
     "qgis_project":         {"label": "QGIS Project (.qgs)",         "requires": ["interp"],               "per_channel": False, "category": "Export"},
     "qc_report":            {"label": "Data QC Report",              "requires": ["interp"],               "per_channel": False, "category": "Export"},
 }
 
 # Order the Create-Task menu groups appear in.
-TASK_CATEGORIES: list[str] = ["Sampling", "Outputs", "Photogrammetry", "Export"]
+TASK_CATEGORIES: list[str] = ["Prepare", "Sampling", "Outputs", "Photogrammetry", "Export"]
 
 
 @dataclass
@@ -714,6 +716,10 @@ class Task:
         """One-line summary used in the stack list, e.g. 'Sampling @ 5 Hz — Full dataset'."""
         bits = [self.type_label]
         s = self.settings
+        if self.task_type == "build_interp":
+            bits.append(f"@ {s.get('sample_hz', 1.0):g} Hz")
+            # interp_full.csv is workspace-level; target is always full dataset.
+            return "  ·  ".join(bits)
         if self.task_type == "sampling":
             if s.get("mode") == "dynamic":
                 bits.append(f"~{s.get('spacing_m', 1.0):g} m spacing")
@@ -721,6 +727,9 @@ class Task:
                 bits.append(f"@ {s.get('frame_rate', 1.0):g} Hz")
         elif self.task_type == "photogrammetry":
             bits.append(f"{s.get('engine', 'Metashape')} / {s.get('quality', 'Normal')}")
+            if self.depends_on is not None:
+                bits.append(f"← Task #{self.depends_on}")
+        elif self.task_type == "frame_stats":
             if self.depends_on is not None:
                 bits.append(f"← Task #{self.depends_on}")
         elif self.per_channel and self.channels:

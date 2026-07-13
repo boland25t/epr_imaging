@@ -627,6 +627,7 @@ class MainWindow(QMainWindow):
             self._stack_data_availability,
         )
         self._stack_panel.run_requested.connect(self._run_stack)
+        self._stack_panel.rerun_failed_requested.connect(self._rerun_failed)
         self._stack_panel.tasks_changed.connect(self._on_tasks_changed)
         stack_dock = QDockWidget("Task Stack", self)
         stack_dock.setObjectName("StackDock")
@@ -1146,6 +1147,15 @@ class MainWindow(QMainWindow):
         )
         job_layout.addWidget(self.job_interval_list)
 
+        # Export this job's intervals (with the videos covering each) to CSV.
+        self.job_export_csv_btn = QPushButton("Export Intervals (CSV)…")
+        self.job_export_csv_btn.setToolTip(
+            "Write this job's intervals to a CSV: real start/end time, duration,\n"
+            "the video(s) covering each interval, and the in-video timecodes."
+        )
+        self.job_export_csv_btn.clicked.connect(self._export_job_intervals_csv)
+        job_layout.addWidget(self.job_export_csv_btn)
+
         job_btn_row = QHBoxLayout()
         self.job_clear_btn = QPushButton("Clear Job")
         self.job_new_btn = QPushButton("New Job")
@@ -1282,10 +1292,16 @@ class MainWindow(QMainWindow):
     def _stack_data_availability(self) -> dict:
         """Return which data inputs are currently loaded (gates the Create menu)."""
         interp = self._interp_full_path()
+        interp_exists = bool(interp) and Path(interp).exists()
+        has_sensor = bool(self.sensor_files)
+        has_nav    = self.navigation_file is not None
         return {
-            "interp": bool(interp) and Path(interp).exists(),
-            "sensor": bool(self.sensor_files),
-            "nav":    self.navigation_file is not None,
+            # "interp" is satisfied when interp_full.csv exists OR can be built
+            # this run (nav+sensor present) — so a fresh, database-only start can
+            # add a Build interp_full.csv task plus the output tasks in one stack.
+            "interp": interp_exists or (has_sensor and has_nav),
+            "sensor": has_sensor,
+            "nav":    has_nav,
             "video":  bool(self.videos),
         }
 
@@ -1313,6 +1329,10 @@ class MainWindow(QMainWindow):
         one scope per named job; 'all_jobs' fans out over every job that has
         intervals.  Jobs without intervals are dropped (and reported as skips).
         """
+        # interp_full.csv is workspace-level — never fan it out per job.
+        if task.task_type == "build_interp":
+            return [self._scope_full()]
+
         tgt  = task.target or {"kind": "full"}
         kind = tgt.get("kind", "full")
         scopes: list[tuple] = []
@@ -1365,7 +1385,18 @@ class MainWindow(QMainWindow):
             s = task.settings
             channels = task.channels or self._stack_available_channels()
 
-            if t == "sampling":
+            if t == "build_interp":
+                config = self._build_interp_config(task)
+                if config is None:
+                    continue
+                plan.append({
+                    "label": "Build interp_full.csv",
+                    "product_type": "build_interp", "scope_id": "full",
+                    "channel": None, "method": None, "engine": None,
+                    "kwargs": {}, "config": config,
+                })
+
+            elif t == "sampling":
                 config = self._build_sampling_config(task, job, scope_id)
                 if config is None:
                     continue
@@ -1444,6 +1475,23 @@ class MainWindow(QMainWindow):
                         kw["_scale_source_glob"] = str(Path(full_sensor_3d) / ch)
                     plan.append(self._step(t, scope_id, ch, None, kw,
                                            f"PNG Depth Slices — {ch}" + tag))
+
+            elif t == "frame_stats":
+                # Frame source resolved at runtime (depends_on sampling task or
+                # manual dir), same as photogrammetry.
+                plan.append({
+                    "label": "Frame Statistics" + tag,
+                    "product_type": "frame_stats", "scope_id": scope_id,
+                    "channel": None, "method": None, "engine": None,
+                    "depends_on_task_id": task.depends_on,
+                    "kwargs": {
+                        "output_dir":     output_dir,
+                        "frame_dir":      s.get("frame_dir", "").strip(),
+                        "sharpness_min":  float(s.get("sharpness_min", 100.0)),
+                        "brightness_min": float(s.get("brightness_min", 20.0)),
+                        "brightness_max": float(s.get("brightness_max", 235.0)),
+                    },
+                })
 
             elif t == "photogrammetry":
                 # Frame source: either linked to a sampling task (depends_on) or manual.
@@ -1537,6 +1585,125 @@ class MainWindow(QMainWindow):
                     }, f"Sensor NetCDF — {ch}" + tag))
 
         return plan
+
+    @staticmethod
+    def _hms(seconds: float) -> str:
+        """Format a duration/offset in seconds as HH:MM:SS.s"""
+        if seconds is None or seconds < 0:
+            return ""
+        h, rem = divmod(float(seconds), 3600)
+        m, s = divmod(rem, 60)
+        return f"{int(h):02d}:{int(m):02d}:{s:04.1f}"
+
+    def _export_job_intervals_csv(self) -> None:
+        """Write the current job's intervals to a CSV.
+
+        One row per interval: real start/end time, duration, the video(s) that
+        cover it (comma-separated), each video's own start timestamp, and the
+        in-video timecode range where the interval falls.
+        """
+        import csv
+
+        job = self.pending_job
+        if job is None or not job.intervals:
+            QMessageBox.information(
+                self, "No intervals",
+                "This job has no intervals yet. Add some on the Manual or "
+                "Threshold Intervals tab first."
+            )
+            return
+
+        default_name = f"job_{job.job_id:03d}_intervals.csv"
+        start_dir = str(Path(self.workspace_path) / default_name) if self.workspace_path else default_name
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Job Intervals", start_dir, "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            return
+
+        rows = []
+        for idx, iv in enumerate(job.intervals, start=1):
+            duration_s = (iv.end_time - iv.start_time).total_seconds()
+
+            # Videos whose coverage overlaps this interval, in time order.
+            names, vid_starts, timecodes = [], [], []
+            for v in sorted(self.videos, key=lambda v: v.start_time):
+                if v.end_time <= iv.start_time or v.start_time >= iv.end_time:
+                    continue  # no overlap
+                ov_start = max(iv.start_time, v.start_time)
+                ov_end   = min(iv.end_time, v.end_time)
+                in_start = (ov_start - v.start_time).total_seconds()
+                in_end   = (ov_end   - v.start_time).total_seconds()
+                names.append(v.filename)
+                vid_starts.append(v.start_time.isoformat())
+                timecodes.append(f"{self._hms(in_start)}-{self._hms(in_end)}")
+
+            rows.append({
+                "job_id":            job.job_id,
+                "job_name":          job.name or "",
+                "interval":          idx,
+                "start_time":        iv.start_time.isoformat(),
+                "end_time":          iv.end_time.isoformat(),
+                "duration_s":        round(duration_s, 1),
+                "duration_hms":      self._hms(duration_s),
+                "videos":            ",".join(names),
+                "video_start_times": ",".join(vid_starts),
+                "video_timecodes":   ",".join(timecodes),
+                "source":            iv.source,
+            })
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export failed", f"Could not write:\n{path}\n\n{exc}")
+            return
+
+        n_no_video = sum(1 for r in rows if not r["videos"])
+        msg = f"Exported {len(rows)} interval(s) → {path}"
+        if n_no_video:
+            msg += f"\n\nNote: {n_no_video} interval(s) had no overlapping video."
+        self.log_text.append(msg)
+        QMessageBox.information(self, "Intervals exported", msg)
+
+    def _build_interp_config(self, task: "Task"):
+        """Build a PipelineConfig that writes workspace-level interp_full.csv.
+
+        Database-only: needs nav + sensor sources and a saved workspace; no video.
+        Returns None (with a recorded skip reason) when it can't run.
+        """
+        from pipeline_service import PipelineConfig
+
+        def _skip(reason: str):
+            self.log_text.append(f"Stack: Build interp_full.csv skipped — {reason}")
+            if hasattr(self, "_plan_skips"):
+                self._plan_skips.append(f"Build interp_full.csv — {reason}")
+            return None
+
+        if not self.workspace_path:
+            return _skip("save the workspace first (interp_full.csv is written there).")
+        if self.navigation_file is None:
+            return _skip("no navigation configured (Inputs tab).")
+        if not self.sensor_files:
+            return _skip("no sensor files configured (Inputs tab).")
+
+        return PipelineConfig(
+            video_directory=Path(self.workspace_path),
+            output_directory=Path(self.workspace_path),
+            video_filename_time_format="",
+            videos=[],
+            selected_intervals=[],
+            navigation_file=self.navigation_file,
+            sensor_files=self.sensor_files,
+            depth_source=self.depth_source,
+            speed_source=self.speed_source,
+            sample_images=False,
+            selected_steps=["build_full_interp"],
+            full_interp_sample_hz=float(task.settings.get("sample_hz", 1.0)),
+            workspace_directory=self.workspace_path,
+        )
 
     def _build_sampling_config(self, task: "Task", job: "Job | None" = None,
                                scope_id: str = "full"):
@@ -1663,6 +1830,15 @@ class MainWindow(QMainWindow):
                                     "See the log for skipped-task reasons.")
             return
 
+        skip_existing = bool(self._stack_panel and self._stack_panel.skip_existing())
+        self._launch_stack(plan, skip_existing=skip_existing)
+
+    def _launch_stack(self, plan: list[dict], skip_existing: bool = False) -> None:
+        """Spin up a StackWorker thread on a resolved plan (shared by run & re-run)."""
+        if self._stack_worker_is_running() or self._output_worker_is_running():
+            QMessageBox.warning(self, "Busy", "A task is already running.")
+            return
+
         # Complete, uncapped task log written beside the workspace, timestamped.
         log_dir = Path(self.workspace_path) / "logs"
         try:
@@ -1672,7 +1848,9 @@ class MainWindow(QMainWindow):
         except Exception:
             log_file = None
 
-        self.log_text.append(f"Stack: {len(plan)} step(s) queued.")
+        self._last_plan = plan   # for "Re-run failed"
+        self.log_text.append(f"Stack: {len(plan)} step(s) queued"
+                             + ("  (skip-if-done on)" if skip_existing else "") + ".")
         if log_file:
             self.log_text.append(f"Full task log → {log_file}")
         self._status_label.setText("Running stack…")
@@ -1683,7 +1861,7 @@ class MainWindow(QMainWindow):
 
         from stack_runner import StackWorker
         thread = QThread(self)
-        worker = StackWorker(plan, log_file=log_file)
+        worker = StackWorker(plan, log_file=log_file, skip_existing=skip_existing)
         self.stack_worker_thread = thread
         self.stack_worker        = worker
         worker.moveToThread(thread)
@@ -1702,6 +1880,22 @@ class MainWindow(QMainWindow):
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_stack_worker)
         thread.start()
+
+    def _rerun_failed(self) -> None:
+        """Re-run only the steps that FAILED in the last run (from its report)."""
+        plan   = getattr(self, "_last_plan", None)
+        report = getattr(self, "_last_report", None)
+        if not plan or not report:
+            return
+        failed_idx = [e["index"] for e in report
+                      if e.get("status") == "failed" and e.get("index") is not None]
+        subplan = [plan[i] for i in failed_idx if 0 <= i < len(plan)]
+        if not subplan:
+            QMessageBox.information(self, "Nothing to re-run", "No failed steps to re-run.")
+            return
+        self.log_text.append(f"Re-running {len(subplan)} failed step(s)…")
+        # Don't skip-if-done on a failed-step re-run — we want them to actually run.
+        self._launch_stack(subplan, skip_existing=False)
 
     def _stack_worker_is_running(self) -> bool:
         try:
@@ -1762,6 +1956,11 @@ class MainWindow(QMainWindow):
             f"───────── {c} completed · {f} failed · {sk} skipped · "
             f"{total_files} file(s) written ─────────"
         )
+
+        # Remember the report so "Re-run failed" can rebuild a failed-only plan.
+        self._last_report = report
+        if self._stack_panel is not None:
+            self._stack_panel.set_failed_count(f)
 
         self._workspace_panel.refresh()
         QTimer.singleShot(0, lambda: QMessageBox.information(self, "Stack complete", msg))

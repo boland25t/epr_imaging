@@ -20,16 +20,22 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMenu,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
+import preset_service
 from models import Task, TaskStack, TASK_INFO, TASK_CATEGORIES
 from task_config_dialog import TaskConfigDialog
 
@@ -37,8 +43,9 @@ from task_config_dialog import TaskConfigDialog
 class StackPanel(QWidget):
     """Dockable task-stack editor + runner."""
 
-    run_requested = Signal()
-    tasks_changed = Signal()   # emitted whenever the stack is mutated
+    run_requested          = Signal()
+    rerun_failed_requested = Signal()
+    tasks_changed          = Signal()   # emitted whenever the stack is mutated
 
     def __init__(self, stack: TaskStack, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -64,7 +71,18 @@ class StackPanel(QWidget):
         """Disable editing controls while a run is in progress."""
         self._run_btn.setEnabled(not running)
         self._create_btn.setEnabled(not running)
+        self._tmpl_btn.setEnabled(not running)
+        self._rerun_btn.setEnabled(not running)
         self._run_btn.setText("Running…" if running else "▶  Run Stack")
+
+    def skip_existing(self) -> bool:
+        """Whether to skip steps whose deterministic output already exists."""
+        return self._skip_check.isChecked()
+
+    def set_failed_count(self, n: int) -> None:
+        """Show/hide the Re-run Failed button after a run, with the failure count."""
+        self._rerun_btn.setVisible(n > 0)
+        self._rerun_btn.setText(f"↻  Re-run Failed ({n})" if n else "↻  Re-run Failed")
 
     # -----------------------------------------------------------------------
 
@@ -115,10 +133,31 @@ class StackPanel(QWidget):
         move_row.addWidget(self._dup_btn)
         layout.addLayout(move_row)
 
+        # Templates: save/reuse tasks and whole stacks across surveys.
+        self._tmpl_btn = QPushButton("⧉ Templates ▾")
+        self._tmpl_btn.clicked.connect(self._show_templates_menu)
+        layout.addWidget(self._tmpl_btn)
+
+        # Failure recovery: skip steps whose deterministic output already exists.
+        self._skip_check = QCheckBox("Skip steps already done (interp / frames)")
+        self._skip_check.setToolTip(
+            "When re-running a stack, skip Build interp_full.csv and Sampling steps "
+            "whose output already exists on disk, so only the missing work runs.\n"
+            "Versioned products (3D/2D/photogrammetry) always re-run."
+        )
+        layout.addWidget(self._skip_check)
+
         self._run_btn = QPushButton("▶  Run Stack")
         self._run_btn.setStyleSheet("font-weight: bold; padding: 6px; font-size: 13px;")
         self._run_btn.clicked.connect(self.run_requested)
         layout.addWidget(self._run_btn)
+
+        # Re-run failed — hidden until a run finishes with failures.
+        self._rerun_btn = QPushButton("↻  Re-run Failed")
+        self._rerun_btn.setStyleSheet("font-weight: bold; padding: 4px; color: #b25000;")
+        self._rerun_btn.clicked.connect(self.rerun_failed_requested)
+        self._rerun_btn.setVisible(False)
+        layout.addWidget(self._rerun_btn)
 
     # -----------------------------------------------------------------------
 
@@ -250,3 +289,186 @@ class StackPanel(QWidget):
         self._stack.add(clone)
         self.refresh()
         self.tasks_changed.emit()
+
+    # -----------------------------------------------------------------------
+    # Templates (presets.json — reusable across surveys)
+    # -----------------------------------------------------------------------
+
+    def _show_templates_menu(self) -> None:
+        menu = QMenu(self)
+
+        save_task = menu.addAction("Save selected task as template…")
+        save_task.setEnabled(self._selected_task_id() is not None)
+        save_task.triggered.connect(self._save_task_template)
+
+        save_stack = menu.addAction("Save stack as template…")
+        save_stack.setEnabled(bool(self._stack.tasks))
+        save_stack.triggered.connect(self._save_stack_template)
+
+        menu.addSeparator()
+
+        # Insert task from template
+        task_tmpls = preset_service.list_task_templates()
+        insert_menu = menu.addMenu("Insert task from template")
+        insert_menu.setEnabled(bool(task_tmpls))
+        for tmpl in task_tmpls:
+            label = f"{tmpl.get('name')}  ({TASK_INFO.get(tmpl.get('task_type'), {}).get('label', tmpl.get('task_type'))})"
+            act = insert_menu.addAction(label)
+            act.triggered.connect(lambda _c=False, t=tmpl: self._insert_task_from_template(t))
+
+        # Load stack from template
+        stack_tmpls = preset_service.list_stack_templates()
+        load_menu = menu.addMenu("Load stack from template")
+        load_menu.setEnabled(bool(stack_tmpls))
+        for tmpl in stack_tmpls:
+            act = load_menu.addAction(f"{tmpl.get('name')}  ({len(tmpl.get('tasks', []))} tasks)")
+            act.triggered.connect(lambda _c=False, t=tmpl: self._load_stack_from_template(t))
+
+        menu.addSeparator()
+        manage = menu.addAction("Manage templates…")
+        manage.setEnabled(bool(task_tmpls or stack_tmpls))
+        manage.triggered.connect(self._manage_templates)
+
+        menu.exec(self._tmpl_btn.mapToGlobal(self._tmpl_btn.rect().bottomLeft()))
+
+    def _save_task_template(self) -> None:
+        tid = self._selected_task_id()
+        if tid is None:
+            return
+        task = self._stack.get(tid)
+        if task is None:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Save Task Template", "Template name:",
+            text=task.type_label,
+        )
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if self._name_exists(preset_service.list_task_templates(), name) and \
+           not self._confirm_overwrite(name):
+            return
+        preset_service.add_task_template(name, task)
+
+    def _save_stack_template(self) -> None:
+        if not self._stack.tasks:
+            return
+        name, ok = QInputDialog.getText(self, "Save Stack Template", "Template name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if self._name_exists(preset_service.list_stack_templates(), name) and \
+           not self._confirm_overwrite(name):
+            return
+        preset_service.add_stack_template(name, self._stack.tasks)
+
+    def _insert_task_from_template(self, tmpl: dict) -> None:
+        task = preset_service.template_to_task(tmpl, self._stack.new_id())
+        self._stack.add(task)
+        self.refresh()
+        self.tasks_changed.emit()
+
+    def _load_stack_from_template(self, tmpl: dict) -> None:
+        bodies = tmpl.get("tasks", [])
+        if not bodies:
+            return
+        replace = True
+        if self._stack.tasks:
+            box = QMessageBox(self)
+            box.setWindowTitle("Load Stack Template")
+            box.setText(f"Load template '{tmpl.get('name')}' ({len(bodies)} tasks)?")
+            box.setInformativeText("Replace the current stack, or append to it?")
+            replace_btn = box.addButton("Replace", QMessageBox.AcceptRole)
+            append_btn  = box.addButton("Append", QMessageBox.ActionRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is None or clicked not in (replace_btn, append_btn):
+                return
+            replace = clicked is replace_btn
+
+        if replace:
+            self._stack.tasks = []
+        # Instantiate tasks, then remap positional depends_on_index → new task_id
+        # so intra-stack links (photogrammetry → sampling) survive the load.
+        new_tasks = [preset_service.template_to_task(b, self._stack.new_id()) for b in bodies]
+        for body, task in zip(bodies, new_tasks):
+            di = body.get("depends_on_index")
+            if di is not None and 0 <= di < len(new_tasks):
+                task.depends_on = new_tasks[di].task_id
+        for task in new_tasks:
+            self._stack.add(task)
+        self.refresh()
+        self.tasks_changed.emit()
+
+    def _manage_templates(self) -> None:
+        ManageTemplatesDialog(self).exec()
+
+    @staticmethod
+    def _name_exists(items: list[dict], name: str) -> bool:
+        return any(i.get("name") == name for i in items)
+
+    def _confirm_overwrite(self, name: str) -> bool:
+        return QMessageBox.question(
+            self, "Overwrite Template",
+            f"A template named '{name}' already exists. Overwrite it?",
+        ) == QMessageBox.Yes
+
+
+# ---------------------------------------------------------------------------
+# Manage Templates dialog — delete saved task / stack templates
+# ---------------------------------------------------------------------------
+
+class ManageTemplatesDialog(QDialog):
+    """Lists saved task and stack templates with a Delete action for each."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Manage Templates")
+        self.setMinimumWidth(380)
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Task templates"))
+        self._task_list = QListWidget()
+        layout.addWidget(self._task_list)
+        layout.addWidget(QLabel("Stack templates"))
+        self._stack_list = QListWidget()
+        layout.addWidget(self._stack_list)
+
+        btn_row = QHBoxLayout()
+        del_task = QPushButton("Delete selected task template")
+        del_task.clicked.connect(self._delete_task)
+        btn_row.addWidget(del_task)
+        del_stack = QPushButton("Delete selected stack template")
+        del_stack.clicked.connect(self._delete_stack)
+        btn_row.addWidget(del_stack)
+        layout.addLayout(btn_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+        self._reload()
+
+    def _reload(self) -> None:
+        self._task_list.clear()
+        for t in preset_service.list_task_templates():
+            self._task_list.addItem(f"{t.get('name')}  ({t.get('task_type')})")
+        self._stack_list.clear()
+        for s in preset_service.list_stack_templates():
+            self._stack_list.addItem(f"{s.get('name')}  ({len(s.get('tasks', []))} tasks)")
+
+    def _delete_task(self) -> None:
+        names = preset_service.list_task_templates()
+        row = self._task_list.currentRow()
+        if 0 <= row < len(names):
+            preset_service.delete_task_template(names[row].get("name"))
+            self._reload()
+
+    def _delete_stack(self) -> None:
+        names = preset_service.list_stack_templates()
+        row = self._stack_list.currentRow()
+        if 0 <= row < len(names):
+            preset_service.delete_stack_template(names[row].get("name"))
+            self._reload()
