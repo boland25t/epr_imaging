@@ -117,11 +117,14 @@ class TimelineWidget(PlotWidget):
                 # Sensor file with named data channels (temperature, salinity, etc.).
                 # Each channel gets its own row so they can have different time ranges
                 # in theory (in practice they share the same file, so same range).
+                # Navigation channels arrive as pseudo-channels labelled "NAV: …"
+                # (see MainWindow._refresh_timeline) and keep the nav colour.
                 for channel in sensor.channels:
                     label = channel.display_name or channel.source_column
+                    color = "#f8c555" if label.startswith("NAV:") else "#61d095"
                     rows.append((label, current_y))
                     if sensor.start_time and sensor.end_time:
-                        self._draw_segment(sensor.start_time, sensor.end_time, current_y, "#61d095", width=6)
+                        self._draw_segment(sensor.start_time, sensor.end_time, current_y, color, width=6)
                     current_y += 1.0
             else:
                 # Navigation-only source (lat/lon/alt CSV without sensor channels).

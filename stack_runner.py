@@ -33,6 +33,7 @@ slice target when this execution did not itself just create the matching 3D run.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -148,8 +149,10 @@ class StackWorker(QObject):
             skipped   = 0
             all_paths: list[str] = []
             report: list[dict] = []   # per-step record for the final report
+            t_run = time.time()
 
             self._log_event(f"═══ Stack run started — {total} step(s) queued ═══")
+            self._log_environment_header()
 
             for i, step in enumerate(self._plan, start=1):
                 if self._abort:
@@ -161,37 +164,50 @@ class StackWorker(QObject):
                 self.step_started.emit(i, total, label)
                 self.sub_progress.emit(0)
                 self._log_step_header(i, total, step, label)
+                t_step = time.time()
 
                 # Skip-if-done: deterministic-output steps whose product exists.
                 if self._skip_existing and self._already_done(step):
                     skipped += 1
+                    # A skipped sampling step must still feed its dependents:
+                    # record the existing segment dirs so photogrammetry /
+                    # frame-stats steps that depend on it can resolve frames.
+                    self._record_skipped_sampling_outputs(step)
                     self._log_event(f"⊘ [{i}/{total}] SKIPPED (already done) — {label}")
-                    report.append({"index": idx, "label": label, "status": "skipped", "paths": []})
+                    report.append({"index": idx, "label": label, "status": "skipped",
+                                   "paths": [], "duration_s": 0.0})
                     continue
 
                 try:
                     paths = self._run_step(svc, step)
+                    dt = time.time() - t_step
                     if paths is None:
                         skipped += 1
                         self._log_event(f"⊘ [{i}/{total}] SKIPPED — {label}")
-                        report.append({"index": idx, "label": label, "status": "skipped", "paths": []})
+                        report.append({"index": idx, "label": label, "status": "skipped",
+                                       "paths": [], "duration_s": round(dt, 1)})
                         continue
                     completed += 1
                     all_paths.extend(paths)
                     self._log_outputs(label, paths)
                     self.sub_progress.emit(100)
-                    self._log_event(f"✓ [{i}/{total}] DONE — {label} ({len(paths)} file(s) written)")
+                    self._log_event(f"✓ [{i}/{total}] DONE — {label} "
+                                    f"({len(paths)} file(s) written in {dt:.1f} s)")
                     self.step_finished.emit(label, paths)
-                    report.append({"index": idx, "label": label, "status": "completed", "paths": list(paths)})
+                    report.append({"index": idx, "label": label, "status": "completed",
+                                   "paths": list(paths), "duration_s": round(dt, 1)})
                 except Exception as exc:  # noqa: BLE001 — one failed product must
                     failed += 1            # not abort the rest of the stack
+                    dt = time.time() - t_step
                     self.step_failed.emit(label, str(exc))
-                    self._log_event(f"✗ [{i}/{total}] FAILED — {label}: {exc}")
-                    report.append({"index": idx, "label": label, "status": "failed", "paths": [], "error": str(exc)})
+                    self._log_event(f"✗ [{i}/{total}] FAILED after {dt:.1f} s — {label}: {exc}")
+                    report.append({"index": idx, "label": label, "status": "failed",
+                                   "paths": [], "error": str(exc),
+                                   "duration_s": round(dt, 1)})
 
             self._log_event(
-                f"═══ Stack run finished — {completed} completed, "
-                f"{failed} failed, {skipped} skipped ═══"
+                f"═══ Stack run finished in {time.time() - t_run:.1f} s — "
+                f"{completed} completed, {failed} failed, {skipped} skipped ═══"
             )
             self.finished.emit({
                 "completed": completed,
@@ -215,6 +231,56 @@ class StackWorker(QObject):
     # -----------------------------------------------------------------------
     # Logging helpers
     # -----------------------------------------------------------------------
+
+    def _log_environment_header(self) -> None:
+        """Log the full execution environment once per run (GUI + file).
+
+        Gives a failed-run log everything needed to reproduce: app version,
+        interpreter, platform, and which photogrammetry engines were found.
+        """
+        import platform as _platform
+        import sys as _sys
+        try:
+            version = (Path(__file__).parent / "version.txt").read_text().strip()
+        except OSError:
+            version = "unknown"
+        self._logln(f"      app version  : {version}")
+        self._logln(f"      python       : {_sys.version.split()[0]}  ({_sys.executable})")
+        self._logln(f"      platform     : {_platform.platform()}")
+        try:
+            import photogrammetry_service as ps
+            engines = ps.detect_engines()
+            self._logln(f"      colmap       : {engines.get('colmap') or 'not found'}")
+            if engines.get("metashape"):
+                self._logln(f"      metashape    : {engines['metashape']}")
+            else:
+                reason = ps.metashape_unavailable_reason() or "unavailable"
+                self._logln(f"      metashape    : unavailable — {reason}")
+        except Exception as exc:  # noqa: BLE001 — env probing must never kill a run
+            self._logln(f"      engine probe failed: {exc}")
+
+    def _record_skipped_sampling_outputs(self, step: dict) -> None:
+        """When a sampling step is skipped as already-done, register its
+        existing on-disk segment dirs so dependent steps (photogrammetry,
+        frame stats) can still resolve their frame source this run."""
+        if step.get("product_type") != "sampling":
+            return
+        cfg = step.get("config")
+        task_id = step.get("task_id")
+        if cfg is None or task_id is None:
+            return
+        out = getattr(cfg, "output_directory", None)
+        if not out or not Path(out).is_dir():
+            return
+        seg_dirs = sorted(
+            str(d) for d in Path(out).iterdir()
+            if d.is_dir() and d.name.startswith("segment_")
+            and (d / "frames").is_dir() and any((d / "frames").iterdir())
+        )
+        if seg_dirs:
+            self._sampling_outputs[(task_id, step.get("scope_id"))] = seg_dirs
+            self._logln(f"      (skip-if-done: {len(seg_dirs)} existing segment "
+                        "dir(s) registered for dependent tasks)")
 
     def _log_step_header(self, i: int, total: int, step: dict, label: str) -> None:
         """Emit a descriptive header announcing a step and its resolved paths."""
@@ -243,6 +309,23 @@ class StackWorker(QObject):
             ch = step.get("channel")
             if ch:
                 self._logln(f"      channel      : {ch}")
+        # Complete resolved-settings dump — task log file only, so the GUI log
+        # stays readable but the file records every parameter of every step.
+        self._file_write(f"      -- resolved step settings ({product or 'step'}) --")
+        for k in sorted(kwargs):
+            v = kwargs[k]
+            if isinstance(v, (list, tuple)) and len(v) > 6:
+                v = f"[{len(v)} items]"
+            self._file_write(f"        {k} = {v}")
+        cfg = step.get("config")
+        if cfg is not None:
+            for attr in ("output_directory", "sampling_mode", "frame_rate",
+                         "dynamic_target_spacing_m", "frame_quality",
+                         "full_interp_sample_hz", "selected_steps"):
+                if hasattr(cfg, attr):
+                    self._file_write(f"        config.{attr} = {getattr(cfg, attr)}")
+            n_iv = len(getattr(cfg, "selected_intervals", []) or [])
+            self._file_write(f"        config.selected_intervals = {n_iv} interval(s)")
 
     def _log_outputs(self, label: str, paths: list) -> None:
         """List every output path the step produced, each on its own line."""
@@ -272,12 +355,30 @@ class StackWorker(QObject):
             return bool(ws) and (Path(ws) / "interp_full.csv").exists()
         if product == "sampling" and cfg is not None:
             out = getattr(cfg, "output_directory", None)
-            if out and Path(out).is_dir():
-                # done when at least one segment has a non-empty frames/ dir
-                for seg in Path(out).iterdir():
+            if not out or not Path(out).is_dir():
+                return False
+            intervals = list(getattr(cfg, "selected_intervals", None) or [])
+            if intervals:
+                # Done only when EVERY interval's expected segment dir has
+                # frames — "any segment has frames" would skip a job whose
+                # extraction was interrupted partway through.  (Threshold-split
+                # runs use segment_*_range_* dirs and so re-enter the pipeline,
+                # which itself skips segments whose frames already exist.)
+                for idx, interval in enumerate(intervals):
+                    seg = Path(out) / (
+                        f"segment_{idx + 1:03d}_"
+                        f"{interval.start_time.strftime('%Y%m%dT%H%M%S')}_"
+                        f"{interval.end_time.strftime('%Y%m%dT%H%M%S')}"
+                    )
                     frames = seg / "frames"
-                    if frames.is_dir() and any(frames.iterdir()):
-                        return True
+                    if not (frames.is_dir() and any(frames.iterdir())):
+                        return False
+                return True
+            # No interval list on the config — fall back to "any frames exist".
+            for seg in Path(out).iterdir():
+                frames = seg / "frames"
+                if frames.is_dir() and any(frames.iterdir()):
+                    return True
             return False
         return False
 
@@ -523,10 +624,10 @@ class StackWorker(QObject):
 
         frame_dirs = self._resolve_frame_dirs(step, kwargs)
 
-        # Decision rule: Metashape + multiple intervals → ONE project, one chunk
-        # per interval (headless batch).  COLMAP, or a single Metashape frame
-        # set, use the per-set path below.
-        if engine == "metashape" and len(frame_dirs) > 1:
+        # Metashape ALWAYS runs as one project: every interval becomes one or
+        # more chunks (≤ chunk_size images each) inside a single .psx.  COLMAP
+        # keeps the per-frame-set path below (no chunked-project concept).
+        if engine == "metashape":
             return self._run_metashape_batch(kwargs, frame_dirs)
 
         all_products: list[str] = []
@@ -538,69 +639,35 @@ class StackWorker(QObject):
             self._emit(f"      frames in    : {frame_dir}")
             self._emit(f"      run dir      : {run_dir}")
 
-            if engine == "metashape":
-                products = ps.run_metashape(
-                    run_dir=run_dir,
-                    frame_dir=frame_dir,
-                    align_accuracy=kwargs.get("align_accuracy", "High"),
-                    key_point_limit=int(kwargs.get("key_point_limit", 40000)),
-                    tie_point_limit=int(kwargs.get("tie_point_limit", 10000)),
-                    generic_preselect=bool(kwargs.get("generic_preselect", True)),
-                    reference_preselect=bool(kwargs.get("reference_preselect", True)),
-                    adaptive_fitting=bool(kwargs.get("adaptive_fitting", True)),
-                    reset_cameras=bool(kwargs.get("reset_cameras", False)),
-                    build_dense=bool(kwargs.get("build_dense", True)),
-                    dense_quality=kwargs.get("dense_quality", "Medium"),
-                    depth_filter=kwargs.get("depth_filter", "Moderate"),
-                    reuse_depth=bool(kwargs.get("reuse_depth", False)),
-                    build_mesh=bool(kwargs.get("build_mesh", False)),
-                    mesh_surface=kwargs.get("mesh_surface", "Arbitrary"),
-                    mesh_faces=kwargs.get("mesh_faces", "Medium"),
-                    mesh_source=kwargs.get("mesh_source", "Dense cloud"),
-                    mesh_vertex_colors=bool(kwargs.get("mesh_vertex_colors", True)),
-                    build_texture=bool(kwargs.get("build_texture", False)),
-                    texture_size=int(kwargs.get("texture_size", 4096)),
-                    texture_blending=kwargs.get("texture_blending", "Mosaic"),
-                    texture_fill_holes=bool(kwargs.get("texture_fill_holes", True)),
-                    export_dense_ply=bool(kwargs.get("export_dense_ply", True)),
-                    export_mesh_obj=bool(kwargs.get("export_mesh_obj", False)),
-                    nav_csv=kwargs.get("nav_csv"),
-                    use_nav_reference=bool(kwargs.get("use_nav_reference", True)),
-                    nav_accuracy_h=float(kwargs.get("nav_accuracy_h", 0.1)),
-                    nav_accuracy_v=float(kwargs.get("nav_accuracy_v", 0.5)),
-                    save_project=bool(kwargs.get("save_project", True)),
-                    log_fn=self._emit,
-                )
-            else:
-                # COLMAP's dense (MVS) stage is driven by its own "Run dense
-                # reconstruction (MVS)" toggle (run_mvs), NOT the Metashape-only
-                # Dense Cloud group (build_dense, which stays at its default for
-                # COLMAP tasks).  Fall back to build_dense for old saved stacks.
-                run_mvs = bool(kwargs.get("run_mvs", kwargs.get("build_dense", True)))
-                # Prefer the per-segment interp.csv beside the frames (it carries
-                # this segment's frame_filename → position rows) for georeferencing;
-                # fall back to the global interp passed from the plan.
-                seg_nav = Path(frame_dir).parent / "interp.csv"
-                nav_csv = str(seg_nav) if seg_nav.exists() else kwargs.get("colmap_nav_csv")
-                self._emit(f"      nav for georef: {nav_csv or '(none — georef disabled)'}")
-                products = ps.run_colmap(
-                    run_dir=run_dir,
-                    frame_dir=frame_dir,
-                    nav_csv=nav_csv,
-                    single_camera=bool(kwargs.get("single_camera", True)),
-                    matcher=kwargs.get("matcher", "Exhaustive"),
-                    max_features=int(kwargs.get("max_features", 8192)),
-                    georeference=bool(kwargs.get("georeference", True)),
-                    build_dense=run_mvs,
-                    export_camera_trajectory=bool(kwargs.get("export_camera_trajectory", True)),
-                    export_undistorted=bool(kwargs.get("export_undistorted", False)),
-                    export_depth_maps=bool(kwargs.get("export_depth_maps", False)),
-                    build_poisson_mesh=bool(kwargs.get("build_poisson_mesh", False)),
-                    build_delaunay_mesh=bool(kwargs.get("build_delaunay_mesh", False)),
-                    colmap_bin=kwargs.get("colmap_bin", "colmap"),
-                    log_fn=self._emit,            # GUI (capped) + file
-                    file_log_fn=self._file_write,  # full COLMAP output → file only
-                )
+            # COLMAP's dense (MVS) stage is driven by its own "Run dense
+            # reconstruction (MVS)" toggle (run_mvs), NOT the Metashape-only
+            # Dense Cloud group (build_dense, which stays at its default for
+            # COLMAP tasks).  Fall back to build_dense for old saved stacks.
+            run_mvs = bool(kwargs.get("run_mvs", kwargs.get("build_dense", True)))
+            # Prefer the per-segment interp.csv beside the frames (it carries
+            # this segment's frame_filename → position rows) for georeferencing;
+            # fall back to the global interp passed from the plan.
+            seg_nav = Path(frame_dir).parent / "interp.csv"
+            nav_csv = str(seg_nav) if seg_nav.exists() else kwargs.get("colmap_nav_csv")
+            self._emit(f"      nav for georef: {nav_csv or '(none — georef disabled)'}")
+            products = ps.run_colmap(
+                run_dir=run_dir,
+                frame_dir=frame_dir,
+                nav_csv=nav_csv,
+                single_camera=bool(kwargs.get("single_camera", True)),
+                matcher=kwargs.get("matcher", "Exhaustive"),
+                max_features=int(kwargs.get("max_features", 8192)),
+                georeference=bool(kwargs.get("georeference", True)),
+                build_dense=run_mvs,
+                export_camera_trajectory=bool(kwargs.get("export_camera_trajectory", True)),
+                export_undistorted=bool(kwargs.get("export_undistorted", False)),
+                export_depth_maps=bool(kwargs.get("export_depth_maps", False)),
+                build_poisson_mesh=bool(kwargs.get("build_poisson_mesh", False)),
+                build_delaunay_mesh=bool(kwargs.get("build_delaunay_mesh", False)),
+                colmap_bin=kwargs.get("colmap_bin", "colmap"),
+                log_fn=self._emit,            # GUI (capped) + file
+                file_log_fn=self._file_write,  # full COLMAP output → file only
+            )
 
             # Log each photogrammetry product, labelled by friendly name + path.
             self._emit(f"[{self._ts()}] [photogrammetry] products from frame set {seg_i}:")
@@ -611,29 +678,39 @@ class StackWorker(QObject):
         return all_products
 
     def _run_metashape_batch(self, kwargs: dict, frame_dirs: list) -> list[str]:
-        """Headless Metashape batch: one project, one chunk per interval.
+        """Headless Metashape batch: ONE project, chunks of ≤ chunk_size images.
 
-        Each interval gets its own run_NNN directory (so products appear in the
-        Workspace tree per interval) and the shared project.psx lives at the job
-        root.  Per-chunk georeferencing uses each interval's interp.csv.
+        Every interval's frame dir is split (via build_chunk_sets) into
+        sequential groups of at most chunk_size images; groups never span
+        interval boundaries.  Each group becomes one chunk in the single
+        project.psx and gets its own run_NNN directory (so products appear in
+        the Workspace tree per chunk).  Per-chunk georeferencing uses each
+        interval's interp.csv.
         """
         import photogrammetry_service as ps
 
         output_root = kwargs["output_root"]
         job_id      = kwargs.get("job_id", 0)
+        chunk_size  = int(kwargs.get("chunk_size", 250))
         project_psx = Path(output_root) / f"job_{job_id:03d}" / "project.psx"
 
-        self._emit(f"[{self._ts()}] [photogrammetry] Metashape BATCH — "
-                   f"{len(frame_dirs)} chunk(s) in one project")
+        chunk_specs = [s for s in ps.build_chunk_sets([str(d) for d in frame_dirs],
+                                                      chunk_size)
+                       if s["photos"]]
+        n_images = sum(len(s["photos"]) for s in chunk_specs)
+        self._emit(f"[{self._ts()}] [photogrammetry] Metashape — ONE project, "
+                   f"{len(chunk_specs)} chunk(s) of ≤{chunk_size or 'unlimited'} images "
+                   f"({n_images} images across {len(frame_dirs)} interval(s))")
         self._emit(f"      project      : {project_psx}")
 
         frame_sets = []
-        for frame_dir in frame_dirs:
+        for spec in chunk_specs:
             run_dir = ps.prepare_run_dir(output_root, job_id=job_id)
-            seg_nav = Path(frame_dir).parent / "interp.csv"
+            seg_nav = Path(spec["frame_dir"]).parent / "interp.csv"
             nav_csv = str(seg_nav) if seg_nav.exists() else kwargs.get("nav_csv")
-            frame_sets.append((frame_dir, str(run_dir), nav_csv))
-            self._emit(f"      chunk → {run_dir}  (nav: {nav_csv or 'none'})")
+            frame_sets.append((spec["photos"], str(run_dir), nav_csv, spec["label"]))
+            self._emit(f"      chunk '{spec['label']}' — {len(spec['photos'])} images "
+                       f"→ {run_dir}  (nav: {Path(nav_csv).name if nav_csv else 'none'})")
 
         results = ps.run_metashape_batch(
             project_psx, frame_sets,

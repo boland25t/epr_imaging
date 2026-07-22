@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QRadioButton,
     QScrollArea,
@@ -83,7 +84,7 @@ from chat_panel import ChatPanel
 from claude_service import save_api_key, load_api_key
 from config_service import ConfigService
 from workspace_panel import WorkspacePanel
-from models import AnnotationConfig, Job, NavigationConfig, Task, TaskStack, SegmentRecord, SelectedTimeRange, SensorFileConfig, ThresholdConfig, TimeValueSourceConfig, VideoRecord
+from models import AnnotationConfig, Job, NavigationConfig, Task, TaskStack, SegmentRecord, SelectedTimeRange, SensorChannel, SensorFileConfig, ThresholdConfig, TimeValueSourceConfig, VideoRecord
 from pipeline_service import PipelineConfig, PipelineService
 from sensor_service import SensorService
 from video_service import VideoScanError, VideoService
@@ -629,6 +630,7 @@ class MainWindow(QMainWindow):
         self._stack_panel.run_requested.connect(self._run_stack)
         self._stack_panel.rerun_failed_requested.connect(self._rerun_failed)
         self._stack_panel.tasks_changed.connect(self._on_tasks_changed)
+        self._stack_panel.one_click_requested.connect(self._open_one_click_dialog)
         stack_dock = QDockWidget("Task Stack", self)
         stack_dock.setObjectName("StackDock")
         stack_dock.setWidget(self._stack_panel)
@@ -1147,14 +1149,28 @@ class MainWindow(QMainWindow):
         )
         job_layout.addWidget(self.job_interval_list)
 
-        # Export this job's intervals (with the videos covering each) to CSV.
+        # Export / import this job's intervals as CSV.  The two are a lossless
+        # round trip: an exported file re-imports unchanged, and external files
+        # (e.g. MATLAB anomaly detections) just need start/end columns.
+        csv_row = QHBoxLayout()
         self.job_export_csv_btn = QPushButton("Export Intervals (CSV)…")
         self.job_export_csv_btn.setToolTip(
             "Write this job's intervals to a CSV: real start/end time, duration,\n"
             "the video(s) covering each interval, and the in-video timecodes."
         )
         self.job_export_csv_btn.clicked.connect(self._export_job_intervals_csv)
-        job_layout.addWidget(self.job_export_csv_btn)
+        csv_row.addWidget(self.job_export_csv_btn)
+
+        self.job_import_csv_btn = QPushButton("Import Intervals (CSV)…")
+        self.job_import_csv_btn.setToolTip(
+            "Load interval boundaries from CSV file(s).  Accepts this app's\n"
+            "exported interval format, or any CSV with start/end time columns\n"
+            "(ISO timestamps or unix seconds).  Each file can be appended to\n"
+            "the current job or become its own new job."
+        )
+        self.job_import_csv_btn.clicked.connect(self._import_job_intervals_csv)
+        csv_row.addWidget(self.job_import_csv_btn)
+        job_layout.addLayout(csv_row)
 
         job_btn_row = QHBoxLayout()
         self.job_clear_btn = QPushButton("Clear Job")
@@ -1269,13 +1285,22 @@ class MainWindow(QMainWindow):
     # -----------------------------------------------------------------------
 
     def _stack_available_jobs(self) -> list[tuple]:
-        """Return [(job_id, name), ...] for jobs that have intervals."""
+        """Return [(job_id, name), ...] for jobs that have intervals.
+
+        After "Save Job" the pending job and its deep copy in job_history share
+        a job_id — dedupe by id (pending version wins) so an "All jobs" target
+        never fans out to the same job twice.
+        """
         jobs = []
+        seen: set[int] = set()
         if self.pending_job.intervals:
-            jobs.append((self.pending_job.job_id, self.pending_job.name or f"Job #{self.pending_job.job_id}"))
+            jobs.append((self.pending_job.job_id,
+                         self.pending_job.name or f"Job #{self.pending_job.job_id}"))
+            seen.add(self.pending_job.job_id)
         for j in self.job_history:
-            if j.intervals:
+            if j.intervals and j.job_id not in seen:
                 jobs.append((j.job_id, j.name or f"Job #{j.job_id}"))
+                seen.add(j.job_id)
         return jobs
 
     def _stack_available_channels(self) -> list[str]:
@@ -1476,6 +1501,42 @@ class MainWindow(QMainWindow):
                     plan.append(self._step(t, scope_id, ch, None, kw,
                                            f"PNG Depth Slices — {ch}" + tag))
 
+            elif t == "job_interp":
+                # One interp.csv per interval of the target job. Works with or
+                # without video (video coverage columns are added when videos
+                # are loaded).  Needs a JOB scope — "Full dataset" has no intervals.
+                if job is None:
+                    if hasattr(self, "_plan_skips"):
+                        self._plan_skips.append(
+                            f"{task.display_label()} — target a Job (Full dataset has no "
+                            "intervals; this task writes one interp.csv per interval)."
+                        )
+                    continue
+                if not job.intervals:
+                    if hasattr(self, "_plan_skips"):
+                        self._plan_skips.append(
+                            f"{task.display_label()} — job '{job.name or job.job_id}' has no intervals."
+                        )
+                    continue
+                ivs = [
+                    (calendar.timegm(iv.start_time.timetuple()),
+                     calendar.timegm(iv.end_time.timetuple()))
+                    for iv in job.intervals
+                ]
+                vids = [
+                    (calendar.timegm(v.start_time.timetuple()),
+                     calendar.timegm(v.end_time.timetuple()),
+                     v.filename)
+                    for v in self.videos
+                ] if (self.videos and s.get("annotate_video", True)) else None
+                plan.append(self._step(t, scope_id, None, "generate_job_interval_interps", {
+                    "interp_path": interp_path,
+                    "output_dir":  output_dir,
+                    "intervals":   ivs,
+                    "videos":      vids,
+                    "job_name":    job.name or f"Job #{job.job_id}",
+                }, f"Job Interval interp.csv set ({len(ivs)} intervals)" + tag))
+
             elif t == "frame_stats":
                 # Frame source resolved at runtime (depends_on sampling task or
                 # manual dir), same as photogrammetry.
@@ -1504,9 +1565,14 @@ class MainWindow(QMainWindow):
                     "channel": None, "method": None, "engine": engine,
                     "depends_on_task_id": task.depends_on,   # None → use frame_dir
                     "kwargs": {
-                        # output_root + job_id: runner calls prepare_run_dir per segment
+                        # output_root + job_id: runner calls prepare_run_dir per segment.
+                        # job_id is the REAL target job's id (0 = full dataset) so the
+                        # photogrammetry tree and the batch project.psx land under the
+                        # right job folder instead of a misleading job_000.
                         "output_root": str(Path(output_dir) / "photogrammetry"),
-                        "job_id":      0,
+                        "job_id":      job.job_id if job is not None else 0,
+                        # Metashape single-project chunking: max images per chunk.
+                        "chunk_size":  int(s.get("chunk_size", 250)),
                         # manual fallback dir (empty when using depends_on)
                         "frame_dir":   s.get("frame_dir", "").strip(),
                         "nav_csv":     interp_path if s.get("use_nav_reference", True) else None,
@@ -1668,6 +1734,174 @@ class MainWindow(QMainWindow):
         self.log_text.append(msg)
         QMessageBox.information(self, "Intervals exported", msg)
 
+    def _import_job_intervals_csv(self) -> None:
+        """Import interval boundaries from one or more CSV files.
+
+        Each file is parsed (lenient: the app's export format, or any CSV with
+        start/end columns), previewed with per-file parse and coverage
+        warnings, and routed per the user's choice: appended to the current
+        pending job, or turned into a NEW saved job named after the file.
+        """
+        from interval_io import parse_intervals_csv, coverage_warnings
+
+        start_dir = self.workspace_path or ""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Import Interval CSVs", start_dir,
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if not paths:
+            return
+
+        nav = self.navigation_file
+        video_ranges = [(v.start_time, v.end_time) for v in self.videos]
+        parsed:  list[tuple[Path, list, list]] = []   # (path, intervals, warnings)
+        errors:  list[str] = []
+        for p in paths:
+            try:
+                ivs, warns = parse_intervals_csv(p)
+                warns += coverage_warnings(
+                    ivs,
+                    nav.start_time if nav else None,
+                    nav.end_time if nav else None,
+                    video_ranges or None,
+                )
+                parsed.append((Path(p), ivs, warns))
+                self.log_text.append(
+                    f"Interval import: parsed {len(ivs)} interval(s) from "
+                    f"{Path(p).name}" + (f" ({len(warns)} warning(s))" if warns else "")
+                )
+                for w in warns:
+                    self.log_text.append(f"    ⚠ {Path(p).name}: {w}")
+            except ValueError as exc:
+                errors.append(str(exc))
+                self.log_text.append(f"Interval import failed: {exc}")
+
+        if errors:
+            QMessageBox.warning(
+                self, "Some files could not be imported",
+                "\n\n".join(errors)
+                + ("\n\nThe remaining files are still available to import." if parsed else "")
+            )
+        if not parsed:
+            return
+
+        choices = self._show_interval_import_dialog(parsed)
+        if choices is None:
+            return   # cancelled
+
+        n_to_current = 0
+        new_jobs: list[str] = []
+        for (path, ivs, _warns), dest in zip(parsed, choices):
+            if not ivs:
+                continue
+            if dest == "current":
+                self.pending_job.intervals.extend(ivs)
+                n_to_current += len(ivs)
+                self.log_text.append(
+                    f"Imported {len(ivs)} interval(s) from {path.name} → "
+                    f"Job #{self.pending_job.job_id} (current job)"
+                )
+            else:
+                self.next_job_id += 1
+                job = Job(
+                    job_id=self.next_job_id,
+                    name=path.stem,
+                    intervals=list(ivs),
+                    status="saved",
+                    settings_snapshot=self._collect_settings_snapshot(),
+                )
+                self.job_history.append(job)
+                new_jobs.append(job.name)
+                self.log_text.append(
+                    f"Imported {len(ivs)} interval(s) from {path.name} → "
+                    f"NEW job '{job.name}' (Job #{job.job_id})"
+                )
+
+        self._refresh_job_builder_ui()
+        self._refresh_job_history_dropdown()
+        self._refresh_history_overlay()
+        self._refresh_summary()
+        self._refresh_output_source_combo()
+        self._auto_save_workspace()
+
+        bits = []
+        if n_to_current:
+            bits.append(f"{n_to_current} interval(s) added to the current job")
+        if new_jobs:
+            bits.append(f"new job(s): {', '.join(new_jobs)}")
+        if bits:
+            QMessageBox.information(self, "Intervals imported", ";  ".join(bits) + ".")
+
+    def _show_interval_import_dialog(self, parsed: list) -> "list[str] | None":
+        """Preview dialog for interval import.
+
+        Shows one row per file (interval count, span, destination combo) and a
+        combined warnings pane.  Returns a per-file destination list
+        ("current" | "new_job") in the same order as `parsed`, or None on
+        cancel.  Default destination: single file → current job; multiple
+        files → one new job per file.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import Intervals — Preview")
+        dlg.setMinimumWidth(620)
+        layout = QVBoxLayout(dlg)
+
+        cur_name = self.pending_job.name or f"Job #{self.pending_job.job_id}"
+        layout.addWidget(QLabel(
+            f"Review the parsed files below and choose where each one's "
+            f"intervals should go.  Current job: {cur_name}."
+        ))
+
+        default_new = len(parsed) > 1
+        combos: list[QComboBox] = []
+        grid = QGridLayout()
+        grid.addWidget(QLabel("<b>File</b>"),        0, 0)
+        grid.addWidget(QLabel("<b>Intervals</b>"),   0, 1)
+        grid.addWidget(QLabel("<b>Time span</b>"),   0, 2)
+        grid.addWidget(QLabel("<b>Destination</b>"), 0, 3)
+        for r, (path, ivs, warns) in enumerate(parsed, start=1):
+            name_lbl = QLabel(path.name)
+            name_lbl.setToolTip(str(path))
+            grid.addWidget(name_lbl, r, 0)
+            count_txt = str(len(ivs))
+            if warns:
+                count_txt += f"  (⚠{len(warns)})"
+            grid.addWidget(QLabel(count_txt), r, 1)
+            if ivs:
+                t0 = min(iv.start_time for iv in ivs)
+                t1 = max(iv.end_time for iv in ivs)
+                span = f"{t0:%Y-%m-%d %H:%M} → {t1:%m-%d %H:%M}"
+            else:
+                span = "—"
+            grid.addWidget(QLabel(span), r, 2)
+            combo = QComboBox()
+            combo.addItem(f"Add to current job ({cur_name})", userData="current")
+            combo.addItem(f"New job: '{path.stem}'", userData="new_job")
+            combo.setCurrentIndex(1 if default_new else 0)
+            combo.setEnabled(bool(ivs))
+            grid.addWidget(combo, r, 3)
+            combos.append(combo)
+        layout.addLayout(grid)
+
+        all_warns = [f"{p.name}: {w}" for p, _ivs, ws in parsed for w in ws]
+        if all_warns:
+            warn_box = QTextEdit()
+            warn_box.setReadOnly(True)
+            warn_box.setMaximumHeight(120)
+            warn_box.setPlainText("\n".join(all_warns))
+            layout.addWidget(QLabel(f"Warnings ({len(all_warns)}):"))
+            layout.addWidget(warn_box)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Import")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        return [c.currentData() for c in combos]
+
     def _build_interp_config(self, task: "Task"):
         """Build a PipelineConfig that writes workspace-level interp_full.csv.
 
@@ -1792,6 +2026,52 @@ class MainWindow(QMainWindow):
     def _on_tasks_changed(self) -> None:
         """Persist the stack after any add/edit/remove/reorder (if a workspace exists)."""
         self.workspace_saved = False
+
+    def _open_one_click_dialog(self) -> None:
+        """One-Click Pipeline: one dialog → generated task stack → immediate run."""
+        if not self.workspace_path:
+            QMessageBox.warning(self, "No workspace",
+                                "Save the workspace first (File → Save Workspace) — "
+                                "all products are written inside it.")
+            return
+        if self._stack_worker_is_running() or self._output_worker_is_running():
+            QMessageBox.warning(self, "Busy", "A task is already running.")
+            return
+
+        from one_click_dialog import OneClickPipelineDialog
+        interp = self._interp_full_path()
+        dlg = OneClickPipelineDialog(
+            jobs=self._stack_available_jobs(),
+            channels=self._stack_available_channels(),
+            availability=self._stack_data_availability(),
+            interp_exists=bool(interp) and Path(interp).exists(),
+            parent=self,
+        )
+        if not dlg.exec():
+            return
+
+        tasks = dlg.build_tasks(self._task_stack)
+        if not tasks:
+            QMessageBox.information(self, "Nothing to run", "No tasks were generated.")
+            return
+        if dlg.replace_stack():
+            self._task_stack.tasks = []
+        for t in tasks:
+            self._task_stack.add(t)
+        if self._stack_panel is not None:
+            self._stack_panel.refresh()
+        self._on_tasks_changed()
+
+        # _run_stack() clears the log first, so emit the generation summary
+        # after launching (it lands right under the plan header).
+        self._run_stack()
+        self.log_text.append(
+            f"One-Click Pipeline: generated {len(tasks)} task(s)"
+            + (" (replaced previous stack)" if dlg.replace_stack() else " (appended)")
+            + ":"
+        )
+        for t in tasks:
+            self.log_text.append(f"    • {t.display_label()}")
 
     def _run_stack(self) -> None:
         if not self.workspace_path:
@@ -1946,7 +2226,9 @@ class MainWindow(QMainWindow):
         for entry in report:
             status = entry.get("status", "?")
             mark = {"completed": "✓", "failed": "✗", "skipped": "⊘"}.get(status, "•")
-            self.log_text.append(f"{mark} {entry.get('label', '?')}  [{status}]")
+            dur = entry.get("duration_s")
+            dur_txt = f"  ({dur:.1f} s)" if isinstance(dur, (int, float)) and dur else ""
+            self.log_text.append(f"{mark} {entry.get('label', '?')}  [{status}]{dur_txt}")
             if status == "failed" and entry.get("error"):
                 self.log_text.append(f"      error: {entry['error']}")
             for p in entry.get("paths", []):
@@ -3232,8 +3514,13 @@ class MainWindow(QMainWindow):
         self._refresh_all_views()
 
     def _add_navigation_file(self) -> None:
-        """Open NavigationImportDialog and store the resulting NavigationConfig."""
-        dialog = NavigationImportDialog(self)
+        """Open NavigationImportDialog and store the resulting NavigationConfig.
+
+        Passing the current config makes the dialog an editor: every already-
+        configured source is pre-populated, so a user can add or change one
+        channel (e.g. altitude) without re-entering lat/lon or the others.
+        """
+        dialog = NavigationImportDialog(self, current_config=self.navigation_file)
         if dialog.exec():
             result = dialog.get_result()
             if result is not None:
@@ -4687,13 +4974,29 @@ class MainWindow(QMainWindow):
             return interp_path, output_dir
         return self._interp_full_path(), self._outputs_root()
 
+    @staticmethod
+    def _job_intervals_fingerprint(job) -> str:
+        """Stable hash of a job's interval boundaries, for cache invalidation."""
+        import hashlib
+        pairs = sorted(
+            (calendar.timegm(iv.start_time.timetuple()),
+             calendar.timegm(iv.end_time.timetuple()))
+            for iv in job.intervals
+        )
+        return hashlib.sha1(repr(pairs).encode()).hexdigest()
+
     def _get_filtered_interp_for_job(self, job) -> str:
         """Return path to interp_full.csv filtered to job's time intervals.
 
-        Writes <workspace>/job_NNN/filtered_interp.csv each call (fast — just
-        DataFrame filtering).  Falls back to interp_full.csv on any error.
+        Writes <workspace>/job_NNN/filtered_interp.csv (fast — just DataFrame
+        filtering).  Falls back to interp_full.csv on any error.
+
+        Cache validity requires BOTH: the cached file is newer than
+        interp_full.csv AND the job's interval set is unchanged (fingerprint
+        stored in filtered_interp.meta.json) — an mtime check alone served
+        stale data after the user edited the job's intervals.
         """
-        import calendar
+        import json
         import pandas as pd
 
         interp_full = self._interp_full_path()
@@ -4704,12 +5007,18 @@ class MainWindow(QMainWindow):
 
         job_dir = Path(self.workspace_path) / self._job_output_dirname(job)
         job_dir.mkdir(parents=True, exist_ok=True)
-        out_path = job_dir / "filtered_interp.csv"
+        out_path  = job_dir / "filtered_interp.csv"
+        meta_path = job_dir / "filtered_interp.meta.json"
+        fingerprint = self._job_intervals_fingerprint(job)
 
-        # Skip re-filtering if filtered_interp.csv is already up to date
         if (out_path.exists()
                 and out_path.stat().st_mtime >= Path(interp_full).stat().st_mtime):
-            return str(out_path)
+            try:
+                cached = json.loads(meta_path.read_text()).get("intervals_fingerprint")
+            except (OSError, ValueError):
+                cached = None
+            if cached == fingerprint:
+                return str(out_path)
 
         try:
             df = pd.read_csv(interp_full)
@@ -4721,8 +5030,16 @@ class MainWindow(QMainWindow):
                     mask |= (df["unix_time"] >= t0) & (df["unix_time"] < t1)
                 df = df[mask]
             df.to_csv(str(out_path), index=False)
+            meta_path.write_text(json.dumps({
+                "intervals_fingerprint": fingerprint,
+                "n_intervals": len(job.intervals),
+                "n_rows": len(df),
+            }, indent=2))
             name = job.name or f"Job #{job.job_id}"
-            self.log_text.append(f"Filtered interp: {len(df)} rows for '{name}'")
+            self.log_text.append(
+                f"Filtered interp: {len(df)} rows across {len(job.intervals)} "
+                f"interval(s) for '{name}' → {out_path}"
+            )
         except Exception as exc:
             self.log_text.append(f"Warning: could not filter interp for job: {exc}")
             return interp_full
@@ -5379,17 +5696,26 @@ class MainWindow(QMainWindow):
         """
         timeline_items: list[SensorFileConfig] = []
         if self.navigation_file:
+            nav = self.navigation_file
+            # Every configured navigation channel gets its own timeline row, so
+            # coverage gaps in (say) heading are as visible as gaps in lat/lon.
             for label, source in [
-                ("NAV: Latitude", self.navigation_file.latitude_source),
-                ("NAV: Longitude", self.navigation_file.longitude_source),
-                ("NAV: Altitude", self.navigation_file.altitude_source),
+                ("Latitude",  nav.latitude_source),
+                ("Longitude", nav.longitude_source),
+                ("Altitude",  nav.altitude_source),
+                ("Depth",     nav.depth_source),
+                ("Heading",   nav.heading_source),
+                ("Pitch",     nav.pitch_source),
+                ("Roll",      nav.roll_source),
             ]:
                 if source is None:
                     continue
                 timeline_items.append(SensorFileConfig(
                     csv_path=source.csv_path,
                     timestamp_column=source.timestamp_column,
-                    channels=[],
+                    # One pseudo-channel carrying the label, so the timeline
+                    # names the CHANNEL rather than repeating the filename.
+                    channels=[SensorChannel(source.value_column, f"NAV: {label}")],
                     start_time=source.start_time,
                     end_time=source.end_time,
                 ))
@@ -7098,18 +7424,21 @@ class MainWindow(QMainWindow):
             if rec is None:
                 return
             if act == open_act:
-                import subprocess
                 folder = rec.output_path
                 if Path(folder).exists():
-                    subprocess.Popen(["xdg-open", folder])
+                    try:
+                        WorkspacePanel._open_path_with_os(folder)
+                    except OSError as exc:
+                        QMessageBox.warning(self, "Could not open folder",
+                                            f"{folder}\n\n{exc}")
                 else:
                     QMessageBox.warning(self, "Folder not found",
                                         f"The folder no longer exists:\n{folder}")
             elif act == del_act:
+                # Remove exactly the clicked record — matching by (job_id,
+                # start_time) also removed look-alike records from other runs.
                 self.segment_history = [
-                    r for r in self.segment_history
-                    if not (r.job_id == rec.job_id and
-                            r.interval.start_time == rec.interval.start_time)
+                    r for r in self.segment_history if r is not rec
                 ]
                 self._refresh_job_history_dropdown()
                 self._refresh_history_overlay()

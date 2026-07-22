@@ -23,3 +23,25 @@ Thumbs.db
 .claude/
 workspace/
 *workspace*.json
+
+# --- Generated GrapherMatrix outputs (regenerable; too large / not source) ---
+# Result caches: hundreds of MB each, exceed GitHub's 100 MB limit.
+grapher_matrix_results.mat
+grapher_matrix_results_*.mat
+# Assembled report PDFs (large; rebuild with BuildReportPDF.m).
+GrapherMatrix_Report.pdf
+GrapherMatrix_AllPlots.pdf
+# Per-channel classified-event exports (regenerated each run).
+anomaly_events_*.csv
+# Figure PNGs are intentionally KEPT tracked so results are browsable on GitHub.
+
+# --- Bulk input / working data (not source; keep local, out of the repo) ---
+BioIntervals/
+interp_full.csv
+interp.csv
+*/interp_full.csv
+*/interp.csv
+*.lon_zero.bak
+*.csv.lon_zero.bak
+# Generated point-cloud outputs
+*.ply

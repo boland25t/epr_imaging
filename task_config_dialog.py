@@ -163,6 +163,12 @@ class TaskConfigDialog(QDialog):
                 item = self._job_list.item(i)
                 if item.data(Qt.UserRole) in sel_ids:
                     item.setCheckState(Qt.Checked)
+        elif (self._task.task_type == "job_interp" and self._tgt_jobs.isEnabled()
+              and self._job_list.count() > 0):
+            # job_interp can only run on a job scope — a "Full dataset" default
+            # would be skipped at run time, so pre-select the first job instead.
+            self._tgt_jobs.setChecked(True)
+            self._job_list.item(0).setCheckState(Qt.Checked)
         else:
             self._tgt_full.setChecked(True)
 
@@ -226,6 +232,24 @@ class TaskConfigDialog(QDialog):
                 "Interpolates navigation + sensor channels onto a regular time grid "
                 "and writes interp_full.csv at the workspace root — the prerequisite "
                 "for all output tasks. No video needed. Always runs over the full dataset."
+            )
+            note.setStyleSheet("color: #888; font-size: 9px; font-style: italic;")
+            note.setWordWrap(True)
+            form.addRow("", note)
+
+        elif t == "job_interp":
+            w["annotate_video"] = self._check(
+                "Annotate video coverage (when videos are loaded)",
+                bool(s.get("annotate_video", True)))
+            w["annotate_video"].setToolTip(
+                "Adds video_filename + video_time_s columns showing which video "
+                "covers each row and the in-video timecode. Ignored if no videos "
+                "are loaded — the task works fine without video.")
+            form.addRow("", w["annotate_video"])
+            note = QLabel(
+                "Writes ONE interp.csv per interval of the target job (nav + sensor on "
+                "the interp_full.csv time grid). Works with or without video. "
+                "Requires a Job target — 'Full dataset' has no intervals."
             )
             note.setStyleSheet("color: #888; font-size: 9px; font-style: italic;")
             note.setWordWrap(True)
@@ -521,6 +545,18 @@ class TaskConfigDialog(QDialog):
         eng_form  = QFormLayout(eng_group)
         w["engine"] = self._combo(["Metashape", "COLMAP"], s.get("engine", "Metashape"))
         eng_form.addRow("Engine:", w["engine"])
+        w["chunk_size"] = QSpinBox()
+        w["chunk_size"].setRange(0, 100000)
+        w["chunk_size"].setSingleStep(50)
+        w["chunk_size"].setSpecialValueText("Unlimited")
+        w["chunk_size"].setValue(int(s.get("chunk_size", 250)))
+        w["chunk_size"].setToolTip(
+            "Metashape only: the whole image set goes into ONE project, split\n"
+            "into chunks of at most this many images.  Chunks never span\n"
+            "interval boundaries — an interval larger than this is split into\n"
+            "sequential parts.  0 = unlimited (one chunk per interval)."
+        )
+        eng_form.addRow("Max images per chunk:", w["chunk_size"])
         vbox.addWidget(eng_group)
 
         # ── Metashape settings container ──────────────────────────────────────
@@ -788,6 +824,7 @@ class TaskConfigDialog(QDialog):
             is_meta = w["engine"].currentText() == "Metashape"
             self._meta_widget.setVisible(is_meta)
             self._colmap_widget.setVisible(not is_meta)
+            w["chunk_size"].setEnabled(is_meta)   # chunked project is Metashape-only
         w["engine"].currentTextChanged.connect(lambda _: _sync_engine())
         _sync_engine()
 
@@ -820,6 +857,9 @@ class TaskConfigDialog(QDialog):
 
         if t == "build_interp":
             s["sample_hz"] = w["sample_hz"].value()
+
+        elif t == "job_interp":
+            s["annotate_video"] = w["annotate_video"].isChecked()
 
         elif t == "frame_stats":
             if w["fs_from_task"].isChecked() and w["fs_task_combo"].count() > 0:
@@ -882,7 +922,8 @@ class TaskConfigDialog(QDialog):
                 task.depends_on = None
                 s["frame_dir"]  = w["frame_dir"].text().strip()
 
-            s["engine"] = w["engine"].currentText()
+            s["engine"]     = w["engine"].currentText()
+            s["chunk_size"] = w["chunk_size"].value()
 
             # Alignment
             s["align_accuracy"]     = w["align_accuracy"].currentText()

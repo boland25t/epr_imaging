@@ -222,6 +222,48 @@ class _SourceSection(QWidget):
         self.headerless_warning.setVisible(headerless)
         self.load_no_header_button.setVisible(headerless)
 
+    def prefill(self, source) -> None:
+        """Populate this section from an existing TimeValueSourceConfig.
+
+        Lets the dialog reopen with what's already configured, so a user can
+        add or change ONE channel without re-entering the others.  Failures are
+        non-fatal — the section is simply left blank for the user to redo.
+        """
+        if source is None:
+            return
+        path = str(source.csv_path)
+        self.path_edit.setText(path)
+        self._no_header = bool(getattr(source, "no_header", False))
+        try:
+            preview_df = SensorService.read_preview(path, nrows=5, no_header=self._no_header)
+            columns    = SensorService.read_columns(path, no_header=self._no_header)
+        except Exception:
+            return  # file moved/unreadable — leave blank rather than crash the dialog
+        self._populate_preview_table(preview_df)
+        self._populate_column_combos(columns)
+
+        def _select(combo, value):
+            if value is None:
+                return
+            i = combo.findText(str(value))
+            if i >= 0:
+                combo.setCurrentIndex(i)
+
+        _select(self.timestamp_combo, source.timestamp_column)
+        _select(self.value_combo,     source.value_column)
+        if getattr(source, "date_column", None):
+            self.separate_check.setChecked(True)
+            _select(self.date_combo, source.date_column)
+        if self._no_header:
+            # Reflect the stored no-header state on the controls, exactly as if
+            # the user had clicked "Load without headers" themselves.
+            self.headerless_warning.setText(
+                "Loaded without headers — columns numbered 0, 1, 2, …")
+            self.headerless_warning.setVisible(True)
+            self.load_no_header_button.setText("✓ Loaded without headers")
+            self.load_no_header_button.setEnabled(False)
+            self.load_no_header_button.setVisible(True)
+
     def _reload_without_headers(self) -> None:
         """Reload the current file treating all rows as data (no header row).
 
@@ -376,10 +418,20 @@ class NavigationImportDialog(QDialog):
     (or two for lat/lon only, if altitude was not configured).
     """
 
-    def __init__(self, parent=None):
-        """Initialise the dialog and build all UI widgets."""
+    def __init__(self, parent=None, current_config: NavigationConfig | None = None):
+        """Initialise the dialog and build all UI widgets.
+
+        Args:
+            current_config: An existing NavigationConfig to pre-populate every
+                section from.  This makes the dialog an EDITOR as well as an
+                importer — you can add or change one channel (e.g. altitude)
+                without re-entering lat/lon or any other already-configured
+                source.  None starts blank (first-time import).
+        """
         super().__init__(parent)
-        self.setWindowTitle("Configure Navigation Sources")
+        self.setWindowTitle(
+            "Edit Navigation Sources" if current_config else "Configure Navigation Sources"
+        )
         self.resize(900, 750)
 
         # Stores the validated result; remains None if the dialog is cancelled
@@ -387,6 +439,23 @@ class NavigationImportDialog(QDialog):
         self._result_config: NavigationConfig | None = None
 
         self._build_ui()
+        if current_config is not None:
+            self._prefill_from(current_config)
+
+    def _prefill_from(self, cfg: NavigationConfig) -> None:
+        """Populate every section from an existing config so nothing is retyped."""
+        for section, source in (
+            (self.lat_section,     cfg.latitude_source),
+            (self.lon_section,     cfg.longitude_source),
+            (self.alt_section,     cfg.altitude_source),
+            (self.depth_section,   cfg.depth_source),
+            (self.heading_section, cfg.heading_source),
+            (self.pitch_section,   cfg.pitch_source),
+            (self.roll_section,    cfg.roll_source),
+        ):
+            section.prefill(source)
+        if hasattr(self, "negate_depth_check"):
+            self.negate_depth_check.setChecked(bool(cfg.negate_depth))
 
     def _build_ui(self) -> None:
         """Construct the dialog layout: intro label, scrollable source sections, buttons."""

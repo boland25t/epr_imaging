@@ -1087,3 +1087,106 @@ class OutputService:
                 crs=utm_crs, transform=transform, nodata=float("nan"),
             ) as dst:
                 dst.write(grid, 1)
+
+    # -----------------------------------------------------------------------
+    # Per-interval interp CSVs for a job (works with or without video)
+    # -----------------------------------------------------------------------
+
+    def generate_job_interval_interps(
+        self,
+        interp_path: str,
+        output_dir: str,
+        intervals: list,
+        videos: list | None = None,
+        job_name: str = "",
+    ) -> list[str]:
+        """Write one interp CSV per interval of a job.
+
+        Slices the workspace interp_full.csv (nav + sensor on a regular time
+        grid) into one file per interval, so a job gets a per-interval record
+        WITHOUT needing video or frame extraction.  When videos are supplied,
+        two extra columns are added per row — which video covers that instant
+        and the in-video timecode — so the same task works with or without video.
+
+        Args:
+            interp_path: path to interp_full.csv
+            output_dir:  scope outputs root; a job_interp/run_NNN dir is created
+            intervals:   [(start_unix, end_unix), ...] in time order
+            videos:      optional [(start_unix, end_unix, filename), ...]
+            job_name:    for the manifest / log only
+
+        Returns the list of written file paths (per-interval CSVs + manifest).
+        """
+        from datetime import datetime, timezone
+
+        df = pd.read_csv(interp_path)
+        if "unix_time" not in df.columns:
+            raise ValueError(
+                f"{interp_path} has no 'unix_time' column — rebuild interp_full.csv."
+            )
+
+        run_dir = self._next_run_dir(Path(output_dir) / "job_interp")
+        self._log(f"Job interval interp CSVs ({job_name or 'job'}): "
+                  f"{len(intervals)} interval(s) → {run_dir}")
+
+        def _stamp(u: float) -> str:
+            return datetime.fromtimestamp(float(u), tz=timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+        written: list[str] = []
+        manifest_rows = []
+        t = df["unix_time"].to_numpy(dtype=float)
+
+        for idx, (start_u, end_u) in enumerate(intervals, start=1):
+            start_u, end_u = float(start_u), float(end_u)
+            sub = df.loc[(t >= start_u) & (t <= end_u)].copy()
+
+            # Annotate video coverage when videos are available (optional).
+            if videos:
+                names, offsets = [], []
+                for row_t in sub["unix_time"].to_numpy(dtype=float):
+                    name, off = "", float("nan")
+                    for v_start, v_end, v_name in videos:
+                        if float(v_start) <= row_t <= float(v_end):
+                            name, off = v_name, row_t - float(v_start)
+                            break
+                    names.append(name)
+                    offsets.append(off)
+                sub["video_filename"] = names
+                sub["video_time_s"]   = offsets
+
+            fname = f"interval_{idx:03d}_{_stamp(start_u)}_{_stamp(end_u)}.csv"
+            out_path = run_dir / fname
+            sub.to_csv(out_path, index=False)
+            written.append(str(out_path))
+
+            n_vid = int((sub["video_filename"] != "").sum()) if videos else 0
+            self._log(f"  interval {idx:03d}: {len(sub)} rows"
+                      + (f", {n_vid} with video" if videos else "")
+                      + f" → {out_path.name}")
+            if len(sub) == 0:
+                self._log(f"    ⚠ interval {idx:03d} has NO interp rows "
+                          "(outside nav/sensor coverage?)")
+
+            manifest_rows.append({
+                "interval":    idx,
+                "start_time":  datetime.fromtimestamp(start_u, tz=timezone.utc).isoformat(),
+                "end_time":    datetime.fromtimestamp(end_u,   tz=timezone.utc).isoformat(),
+                "duration_s":  round(end_u - start_u, 1),
+                "rows":        len(sub),
+                "rows_with_video": n_vid,
+                "file":        fname,
+            })
+
+        manifest = run_dir / "manifest.csv"
+        pd.DataFrame(manifest_rows).to_csv(manifest, index=False)
+        written.append(str(manifest))
+        self._log(f"  manifest: {manifest}")
+
+        self._save_meta(str(run_dir / "run.meta.json"), {
+            "product":   "job_interp",
+            "job_name":  job_name,
+            "intervals": len(intervals),
+            "with_video": bool(videos),
+            "interp_source": interp_path,
+        })
+        return written

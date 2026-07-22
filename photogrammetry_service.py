@@ -33,6 +33,8 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -70,6 +72,7 @@ _COLMAP_MATCHER_CMD: dict[str, str] = {
     "exhaustive": "exhaustive_matcher",
     "sequential": "sequential_matcher",
     "vocab tree": "vocab_tree_matcher",
+    "spatial":    "spatial_matcher",
 }
 
 
@@ -274,6 +277,114 @@ def save_meta(run_dir: Path, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Detailed-logging helpers (shared by both engines)
+# ---------------------------------------------------------------------------
+
+def _fsize(path: str | Path) -> str:
+    """Human-readable file size for log lines ('' when the file is missing)."""
+    try:
+        n = os.path.getsize(str(path))
+    except OSError:
+        return "size unknown"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+@contextmanager
+def _stage_timer(log: Callable[[str], None], name: str):
+    """Log the start of a processing stage and its elapsed wall time on exit.
+
+    The elapsed line is emitted even when the stage raises, so the log always
+    shows how long a failing stage ran before it died.
+    """
+    t0 = time.time()
+    log(f"      ▶ {name}…")
+    try:
+        yield
+    except Exception:
+        log(f"      ✗ {name} FAILED after {time.time() - t0:.1f} s")
+        raise
+    log(f"      ✓ {name} done in {time.time() - t0:.1f} s")
+
+
+def _progress_logger(log_fn: Callable[[str], None],
+                     file_fn: Optional[Callable[[str], None]],
+                     stage: str) -> Callable[[float], None]:
+    """Return a Metashape-style progress callback (float percent).
+
+    GUI log (log_fn) gets a line every ≥5%; the uncapped task log file
+    (file_fn) gets every ≥1% tick.  Never raises — a broken progress line must
+    not abort a multi-hour reconstruction.
+    """
+    state = {"gui": -5.0, "file": -1.0}
+
+    def cb(pct: float) -> None:
+        try:
+            pct = float(pct)
+            if file_fn is not None and (pct - state["file"] >= 1.0 or pct >= 100.0):
+                state["file"] = pct
+                file_fn(f"        [{stage}] {pct:.1f}%")
+            if pct - state["gui"] >= 5.0 or pct >= 100.0:
+                state["gui"] = pct
+                log_fn(f"        [{stage}] {pct:.0f}%")
+        except Exception:  # noqa: BLE001
+            pass
+
+    return cb
+
+
+def _call_with_progress(fn: Callable, kwargs: dict,
+                        progress_cb: Optional[Callable[[float], None]]):
+    """Invoke a Metashape API call, attaching a progress callback when supported.
+
+    Older API builds reject the ``progress`` keyword with TypeError — retry
+    without it rather than failing the stage.
+    """
+    if progress_cb is not None:
+        try:
+            return fn(**kwargs, progress=progress_cb)
+        except TypeError:
+            pass
+    return fn(**kwargs)
+
+
+def build_chunk_sets(frame_dirs: list[str], chunk_size: int) -> list[dict]:
+    """Split interval frame dirs into Metashape chunk specs of ≤ chunk_size images.
+
+    Chunks never span interval (frame-dir) boundaries: each frame dir's sorted
+    photo list is cut into sequential groups of at most chunk_size.  A
+    chunk_size of 0 (or less) means unlimited — one chunk per frame dir.
+
+    Returns a list of dicts:
+        {"frame_dir": str, "photos": [str], "interval_idx": int (1-based),
+         "part_idx": int (1-based), "n_parts": int, "label": str}
+    """
+    sets: list[dict] = []
+    for i_idx, frame_dir in enumerate(frame_dirs, start=1):
+        photos = _collect_frames(frame_dir)
+        if not photos:
+            sets.append({
+                "frame_dir": frame_dir, "photos": [], "interval_idx": i_idx,
+                "part_idx": 1, "n_parts": 1,
+                "label": f"interval{i_idx:02d}",
+            })
+            continue
+        size = chunk_size if chunk_size and chunk_size > 0 else len(photos)
+        groups = [photos[k:k + size] for k in range(0, len(photos), size)]
+        for p_idx, group in enumerate(groups, start=1):
+            label = (f"interval{i_idx:02d}_part{p_idx:02d}"
+                     if len(groups) > 1 else f"interval{i_idx:02d}")
+            sets.append({
+                "frame_dir": frame_dir, "photos": group, "interval_idx": i_idx,
+                "part_idx": p_idx, "n_parts": len(groups), "label": label,
+            })
+    return sets
+
+
+# ---------------------------------------------------------------------------
 # Metashape engine
 # ---------------------------------------------------------------------------
 
@@ -396,10 +507,13 @@ def run_metashape(
 
 
 def _process_metashape_chunk(Metashape, doc, chunk, run_dir, *, api, major,
-                             opts, save_project, log):
+                             opts, save_project, log, file_log=None):
     """Process ONE Metashape chunk: georeference seed -> align -> dense ->
     mesh -> texture -> exports.  Returns the products dict (without the .psx,
-    which the caller adds).  Shared by run_metashape and run_metashape_batch."""
+    which the caller adds).  Shared by run_metashape and run_metashape_batch.
+
+    file_log, when given, receives fine-grained progress ticks (every ≥1%)
+    destined for the uncapped task log file."""
     align_accuracy = opts['align_accuracy']
     key_point_limit = opts['key_point_limit']
     tie_point_limit = opts['tie_point_limit']
@@ -428,14 +542,22 @@ def _process_metashape_chunk(Metashape, doc, chunk, run_dir, *, api, major,
     nav_accuracy_v = opts['nav_accuracy_v']
     dense_source = api['dense_source']
     # ── Georeference: pre-seed camera positions ────────────────────────────────
+    # seeded_nav is only True when at least one camera actually received a
+    # reference location — passing reference_preselection with zero references
+    # would silently degrade matching.
     seeded_nav = False
     if nav_csv and use_nav_reference and Path(nav_csv).exists():
-        _seed_camera_locations(chunk, nav_csv, log, nav_accuracy_h, nav_accuracy_v)
-        seeded_nav = True
+        n_seeded = _seed_camera_locations(chunk, nav_csv, log, nav_accuracy_h, nav_accuracy_v)
+        seeded_nav = n_seeded > 0
+    elif use_nav_reference:
+        log(f"      nav seeding skipped: nav CSV not found ({nav_csv or 'none set'})")
 
     # ── Alignment ─────────────────────────────────────────────────────────────
     acc_int = _META_ALIGN_ACC.get(align_accuracy.lower(), 1)
-    log(f"Aligning cameras (accuracy={align_accuracy}, downscale={acc_int})…")
+    log(f"Aligning cameras (accuracy={align_accuracy}, downscale={acc_int}, "
+        f"keypoints={key_point_limit}, tiepoints={tie_point_limit}, "
+        f"generic_preselect={generic_preselect}, "
+        f"reference_preselect={bool(seeded_nav and reference_preselect)})…")
     match_kwargs = dict(
         downscale=acc_int,
         keypoint_limit=key_point_limit,
@@ -451,8 +573,12 @@ def _process_metashape_chunk(Metashape, doc, chunk, run_dir, *, api, major,
         mode_enum = getattr(Metashape, "ReferencePreselectionMode", None)
         if mode_enum is not None and hasattr(mode_enum, "ReferencePreselectionSource"):
             match_kwargs["reference_preselection_mode"] = mode_enum.ReferencePreselectionSource
-    chunk.matchPhotos(**match_kwargs)
-    chunk.alignCameras(adaptive_fitting=adaptive_fitting)
+    with _stage_timer(log, "matchPhotos"):
+        _call_with_progress(chunk.matchPhotos, match_kwargs,
+                            _progress_logger(log, file_log, "matchPhotos"))
+    with _stage_timer(log, "alignCameras"):
+        _call_with_progress(chunk.alignCameras, {"adaptive_fitting": adaptive_fitting},
+                            _progress_logger(log, file_log, "alignCameras"))
     if save_project:
         doc.save()
 
@@ -482,70 +608,88 @@ def _process_metashape_chunk(Metashape, doc, chunk, run_dir, *, api, major,
             log(f"Sparse cloud export skipped (non-fatal): {exc}")
 
     # ── Dense cloud ───────────────────────────────────────────────────────────
+    dq    = _META_DENSE_QUAL.get(dense_quality.lower(), 2)
+    dfilt = _META_DEPTH_FILTER.get(depth_filter.lower(), 2)
+    depth_maps_built = False
     if build_dense:
-        dq   = _META_DENSE_QUAL.get(dense_quality.lower(), 2)
-        df   = _META_DEPTH_FILTER.get(depth_filter.lower(), 2)
         log(f"Building depth maps (quality={dense_quality}, filter={depth_filter})…")
-        chunk.buildDepthMaps(
-            downscale=dq,
-            filter_mode=df,
-            reuse_depth=reuse_depth,
-        )
-        log(f"Building {'point' if major >= 2 else 'dense'} cloud…")
-        api["build_dense"](chunk)   # buildPointCloud() (2.x) / buildDenseCloud() (1.x)
+        with _stage_timer(log, "buildDepthMaps"):
+            _call_with_progress(chunk.buildDepthMaps, dict(
+                downscale=dq, filter_mode=dfilt, reuse_depth=reuse_depth,
+            ), _progress_logger(log, file_log, "buildDepthMaps"))
+        depth_maps_built = True
+        with _stage_timer(log, f"build {'point' if major >= 2 else 'dense'} cloud"):
+            api["build_dense"](chunk)   # buildPointCloud() (2.x) / buildDenseCloud() (1.x)
         if save_project:
             doc.save()
 
         if export_dense_ply:
             dense_path = str(run_dir / "dense_cloud.ply")
-            chunk.exportPointCloud(dense_path, source_data=dense_source, save_colors=True)
+            with _stage_timer(log, "export dense cloud"):
+                chunk.exportPointCloud(dense_path, source_data=dense_source, save_colors=True)
             products["dense_ply"] = dense_path
-            log(f"Dense cloud: {dense_path}")
+            log(f"Dense cloud: {dense_path}  ({_fsize(dense_path)})")
 
     # ── Mesh ──────────────────────────────────────────────────────────────────
-    if build_mesh and build_dense:
+    # Mesh from "Depth maps" does NOT require the dense-cloud stage — build the
+    # depth maps on demand when dense was disabled.  Mesh from "Dense cloud"
+    # genuinely needs build_dense on.
+    mesh_from_depth = mesh_source.lower() == "depth maps"
+    if build_mesh and not build_dense and not mesh_from_depth:
+        log("  ⚠ Mesh skipped: mesh source is 'Dense cloud' but the Dense Cloud "
+            "stage is disabled. Enable it, or switch the mesh source to 'Depth maps'.")
+    if build_mesh and (build_dense or mesh_from_depth):
         surf_attr = _META_SURFACE_TYPE.get(mesh_surface.lower(), "Arbitrary")
         face_attr = _META_FACE_COUNT.get(mesh_faces.lower(), "MediumFaceCount")
-        # Resolve the mesh source enum version-correctly: "dense cloud" maps to
-        # whatever the dense cloud is called in this version; "depth maps" is
-        # stable across versions.
-        if mesh_source.lower() == "depth maps":
+        if mesh_from_depth:
             mesh_src_enum = Metashape.DataSource.DepthMapsData
+            if not depth_maps_built:
+                log(f"Building depth maps for mesh (quality={dense_quality}, filter={depth_filter})…")
+                with _stage_timer(log, "buildDepthMaps"):
+                    _call_with_progress(chunk.buildDepthMaps, dict(
+                        downscale=dq, filter_mode=dfilt, reuse_depth=reuse_depth,
+                    ), _progress_logger(log, file_log, "buildDepthMaps"))
+                depth_maps_built = True
         else:
             mesh_src_enum = dense_source
-        log(f"Building mesh (surface={mesh_surface}, faces={mesh_faces})…")
-        chunk.buildMesh(
-            source_data=mesh_src_enum,
-            surface_type=getattr(Metashape, surf_attr),
-            face_count=getattr(Metashape, face_attr),
-            vertex_colors=mesh_vertex_colors,
-        )
+        log(f"Building mesh (surface={mesh_surface}, faces={mesh_faces}, source={mesh_source})…")
+        with _stage_timer(log, "buildMesh"):
+            _call_with_progress(chunk.buildMesh, dict(
+                source_data=mesh_src_enum,
+                surface_type=getattr(Metashape, surf_attr),
+                face_count=getattr(Metashape, face_attr),
+                vertex_colors=mesh_vertex_colors,
+            ), _progress_logger(log, file_log, "buildMesh"))
         if save_project:
             doc.save()
 
         if export_mesh_obj:
             mesh_path = str(run_dir / "mesh.obj")
-            chunk.exportModel(mesh_path, save_texture=False)
+            with _stage_timer(log, "export mesh"):
+                chunk.exportModel(mesh_path, save_texture=False)
             products["mesh_obj"] = mesh_path
-            log(f"Mesh: {mesh_path}")
+            log(f"Mesh: {mesh_path}  ({_fsize(mesh_path)})")
 
         # ── Texture ───────────────────────────────────────────────────────────
         if build_texture:
             blend_attr = _META_BLENDING.get(texture_blending.lower(), "MosaicBlending")
             log(f"Building texture (size={texture_size}, blending={texture_blending})…")
-            chunk.buildUV()
-            chunk.buildTexture(
-                blending_mode=getattr(Metashape, blend_attr),
-                texture_size=texture_size,
-                fill_holes=texture_fill_holes,
-            )
+            with _stage_timer(log, "buildUV"):
+                chunk.buildUV()
+            with _stage_timer(log, "buildTexture"):
+                _call_with_progress(chunk.buildTexture, dict(
+                    blending_mode=getattr(Metashape, blend_attr),
+                    texture_size=texture_size,
+                    fill_holes=texture_fill_holes,
+                ), _progress_logger(log, file_log, "buildTexture"))
             if save_project:
                 doc.save()
             tex_mesh_path = str(run_dir / "mesh_textured.obj")
-            chunk.exportModel(tex_mesh_path, save_texture=True)
+            with _stage_timer(log, "export textured mesh"):
+                chunk.exportModel(tex_mesh_path, save_texture=True)
             products["mesh_textured_obj"] = tex_mesh_path
             products["texture_png"]       = str(run_dir / "mesh_textured.png")
-            log(f"Textured mesh: {tex_mesh_path}")
+            log(f"Textured mesh: {tex_mesh_path}  ({_fsize(tex_mesh_path)})")
 
     # ── Camera poses export ───────────────────────────────────────────────────
     cameras_path = str(run_dir / "cameras.json")
@@ -598,16 +742,21 @@ def run_metashape_batch(
     log_fn: Optional[Callable[[str], None]] = None,
     file_log_fn: Optional[Callable[[str], None]] = None,
 ) -> dict[str, list[str]]:
-    """Batch photogrammetry: ONE Metashape project, one chunk per interval.
+    """Batch photogrammetry: ONE Metashape project, many chunks.
 
     This is the headless equivalent of Metashape's Batch Process — no GUI: a
-    single Document holds one chunk per frame set, each chunk is processed with
-    the same per-chunk pipeline as run_metashape, and each chunk's products are
-    exported into ITS OWN run directory in the app's file tree.  One *dataset*
-    (a contiguous trackline) → one .psx; its intervals → chunks.
+    single Document holds every chunk, each chunk is processed with the same
+    per-chunk pipeline as run_metashape, and each chunk's products are exported
+    into ITS OWN run directory in the app's file tree.  One *dataset* → one
+    .psx; its intervals (split into ≤N-image parts by the caller) → chunks.
 
-    frame_sets : list of (frame_dir, run_dir, nav_csv) — nav_csv is that
-                 interval's interp.csv (per-chunk georeferencing).
+    frame_sets : list of (photos, run_dir, nav_csv, label) where
+        photos  — explicit list of image paths for this chunk (the caller has
+                  already applied interval-respecting ≤chunk_size splitting
+                  via build_chunk_sets)
+        run_dir — directory this chunk's products are exported into
+        nav_csv — that interval's interp.csv (per-chunk georeferencing)
+        label   — chunk label shown in the Metashape GUI (e.g. interval01_part02)
 
     Returns {run_dir: [product paths]} — one entry per chunk.
     """
@@ -617,6 +766,7 @@ def run_metashape_batch(
         if log_fn:
             log_fn(msg)
 
+    t_batch = time.time()
     api   = _meta_api(Metashape)
     major = _metashape_major(Metashape)
     if key_point_limit <= 0:
@@ -628,25 +778,31 @@ def run_metashape_batch(
     project_psx.parent.mkdir(parents=True, exist_ok=True)
     doc = Metashape.Document()
     doc.save(str(project_psx))
+    n_photos_total = sum(len(fs[0]) for fs in frame_sets)
     log(f"Metashape {major}.x batch project: {project_psx}")
-    log(f"  {len(frame_sets)} chunk(s) — one per interval, exported to the file tree")
+    log(f"  {len(frame_sets)} chunk(s), {n_photos_total} image(s) total — "
+        "all chunks live in this one project")
 
     results: dict[str, list[str]] = {}
-    for idx, (frame_dir, run_dir, nav_csv) in enumerate(frame_sets, start=1):
+    for idx, (photos, run_dir, nav_csv, label) in enumerate(frame_sets, start=1):
         run_dir = Path(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
-        photos = _collect_frames(frame_dir)
         if not photos:
-            log(f"  ⚠ chunk {idx}: no images in {frame_dir} — skipping")
+            log(f"  ⚠ chunk {idx} ({label}): no images — skipping")
             results[str(run_dir)] = []
             continue
 
+        t_chunk = time.time()
         chunk = doc.addChunk()
-        chunk.label = run_dir.name
-        chunk.addPhotos(photos)
+        chunk.label = label or run_dir.name
+        chunk.addPhotos(list(photos))
         if save_project:
             doc.save()
-        log(f"  ── chunk {idx}/{len(frame_sets)}: {len(photos)} frames → {run_dir}")
+        log("")
+        log(f"  ── chunk {idx}/{len(frame_sets)} '{chunk.label}': "
+            f"{len(photos)} frames → {run_dir}")
+        log(f"      images: {Path(photos[0]).name} … {Path(photos[-1]).name}")
+        log(f"      georef: {nav_csv or '(none)'}")
 
         opts = dict(
             align_accuracy=align_accuracy, key_point_limit=key_point_limit,
@@ -666,18 +822,25 @@ def run_metashape_batch(
             products = _process_metashape_chunk(
                 Metashape, doc, chunk, run_dir, api=api, major=major,
                 opts=opts, save_project=save_project, log=log,
+                file_log=file_log_fn,
             )
             products["metashape_psx"] = str(project_psx)
             for k, v in products.items():
                 log(f"        [metashape] {k}: {v}")
             results[str(run_dir)] = list(products.values())
+            log(f"  ── chunk {idx}/{len(frame_sets)} '{chunk.label}' "
+                f"finished in {time.time() - t_chunk:.1f} s")
         except Exception as exc:  # noqa: BLE001 — one bad chunk must not abort the batch
-            log(f"  ⚠ chunk {idx} failed (continuing): {exc}")
+            log(f"  ⚠ chunk {idx} ('{label}') failed after "
+                f"{time.time() - t_chunk:.1f} s (continuing): {exc}")
             results[str(run_dir)] = []
 
     if save_project:
         doc.save()
-    log(f"Metashape batch complete. Project: {project_psx}")
+    ok = sum(1 for v in results.values() if v)
+    log(f"Metashape batch complete in {time.time() - t_batch:.1f} s — "
+        f"{ok}/{len(frame_sets)} chunk(s) produced output. Project: {project_psx} "
+        f"({_fsize(project_psx)})")
     return results
 
 
@@ -694,66 +857,105 @@ def _seed_camera_locations(
     log_fn: Callable,
     accuracy_h: float = 0.1,
     accuracy_v: float = 0.5,
-) -> None:
-    """Pre-populate camera reference locations from interp_full.csv.
+) -> int:
+    """Pre-populate camera reference locations from an interp CSV.
 
     Matches each camera to the closest nav timestamp derived from the frame
-    filename (format YYYYMMDD_HHMMSS or unix-based).  Sets chunk.crs to
-    Metashape.CoordinateSystem("EPSG::4326") and assigns lat/lon/alt with
-    per-camera reference accuracy.
+    filename.  Sets chunk.crs to Metashape.CoordinateSystem("EPSG::4326") and
+    assigns lat/lon/alt with per-camera reference accuracy.
+
+    The app's interp CSVs carry the time as ``timestamp_iso`` (plus
+    ``unix_time``); a plain ``timestamp`` column is accepted for external
+    files.  Returns the number of cameras seeded (0 on any failure) so the
+    caller can decide whether reference preselection is meaningful.
     """
     try:
         import Metashape
         import pandas as pd
 
         nav = pd.read_csv(nav_csv)
-        if "timestamp" not in nav.columns or "lat" not in nav.columns:
-            log_fn("Nav seeding skipped: required columns missing from interp_full.csv")
-            return
+        cols = {c.lower(): c for c in nav.columns}
+        lat_col = cols.get("lat") or cols.get("latitude")
+        lon_col = cols.get("lon") or cols.get("longitude")
+        alt_col = cols.get("alt") or cols.get("altitude")
+        ts_col  = cols.get("timestamp_iso") or cols.get("timestamp")
 
-        nav["timestamp"] = pd.to_datetime(nav["timestamp"], utc=False)
-        nav = nav.sort_values("timestamp").reset_index(drop=True)
+        if lat_col is None or lon_col is None:
+            log_fn(f"      nav seeding skipped: no lat/lon columns in {nav_csv}")
+            return 0
+        if ts_col is not None:
+            nav["_ts"] = pd.to_datetime(nav[ts_col], utc=False, errors="coerce")
+        elif "unix_time" in cols:
+            nav["_ts"] = pd.to_datetime(nav[cols["unix_time"]], unit="s", errors="coerce")
+        else:
+            log_fn(f"      nav seeding skipped: no timestamp_iso/timestamp/unix_time column in {nav_csv}")
+            return 0
+        nav = nav.dropna(subset=["_ts"]).sort_values("_ts").reset_index(drop=True)
+        if nav.empty:
+            log_fn("      nav seeding skipped: no parseable timestamps in nav CSV")
+            return 0
 
         chunk.crs = Metashape.CoordinateSystem("EPSG::4326")
 
         seeded = 0
+        no_ts  = 0
+        far    = 0   # cameras whose nearest nav sample is > 2 s away
         for camera in chunk.cameras:
             ts = _timestamp_from_camera_label(camera.label)
             if ts is None:
+                no_ts += 1
                 continue
-            idx = (nav["timestamp"] - ts).abs().idxmin()
+            deltas = (nav["_ts"] - ts).abs()
+            idx = deltas.idxmin()
+            if deltas.loc[idx].total_seconds() > 2.0:
+                far += 1
             row = nav.iloc[idx]
-            lat = float(row.get("lat", row.get("latitude", 0)))
-            lon = float(row.get("lon", row.get("longitude", 0)))
-            alt = float(row.get("alt", row.get("altitude", 0))) if "alt" in row.index or "altitude" in row.index else 0.0
+            lat = float(row[lat_col])
+            lon = float(row[lon_col])
+            alt = float(row[alt_col]) if (alt_col and pd.notna(row[alt_col])) else 0.0
             camera.reference.location = Metashape.Vector([lon, lat, alt])
             camera.reference.accuracy  = Metashape.Vector([accuracy_h, accuracy_h, accuracy_v])
             camera.reference.enabled   = True
             seeded += 1
 
         log_fn(f"Nav seeding: {seeded}/{len(chunk.cameras)} cameras pre-positioned "
-               f"(H±{accuracy_h} m, V±{accuracy_v} m)")
+               f"(H±{accuracy_h} m, V±{accuracy_v} m)"
+               + (f"; {no_ts} label(s) had no parseable timestamp" if no_ts else "")
+               + (f"; ⚠ {far} matched >2 s from the nearest nav sample" if far else ""))
+        return seeded
     except Exception as exc:
         log_fn(f"Nav seeding skipped: {exc}")
+        return 0
 
 
 def _timestamp_from_camera_label(label: str) -> Optional[datetime]:
-    """Parse a datetime from a frame filename stem.
+    """Parse the FRAME datetime from a frame filename stem.
 
-    Supports the video frame naming convention used by the EPR app:
-      YYYYMMDD_HHMMSS  (prefix, may have _frame_NNNNN suffix)
-    Returns None if the label does not contain a parseable timestamp.
+    Frame names are ``{video_stem}_{YYYYMMDDTHHMMSS}_{mmm}.jpg`` and the video
+    stem itself usually contains the video's start time (``YYYYMMDD_HHMMSS``),
+    so the label holds TWO timestamps.  The frame's own capture time is the
+    LAST one — matching the first would seed every frame of a video to the
+    same (start) position.
     """
     import re
-    m = re.search(r"(\d{4})(\d{2})(\d{2})[_T](\d{2})(\d{2})(\d{2})", label)
-    if m:
+    # The millisecond suffix must be a full 3-digit token (not the first digits
+    # of a FOLLOWING timestamp) — hence the (?!\d) boundary.  Without it, a
+    # label like "20260115_170000_20260115T170600_000" would have its first
+    # match swallow "_202" as milliseconds and corrupt the scan for the second
+    # (frame) timestamp.
+    matches = list(re.finditer(
+        r"(\d{4})(\d{2})(\d{2})[_T](\d{2})(\d{2})(\d{2})(?:_(\d{3})(?!\d))?", label
+    ))
+    for m in reversed(matches):
         try:
+            ms = int(m.group(7)) if m.group(7) else 0
             return datetime(
                 int(m.group(1)), int(m.group(2)), int(m.group(3)),
                 int(m.group(4)), int(m.group(5)), int(m.group(6)),
+                ms * 1000,
             )
         except ValueError:
-            pass
+            continue
     return None
 
 
@@ -1219,6 +1421,7 @@ def _colmap_run(colmap_bin: str, args: list[str], log_fn: Callable,
         cmd = ["stdbuf", "-oL", "-eL"] + cmd
     log_fn(f"  $ {' '.join(cmd)}")
 
+    t0 = time.time()
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -1245,11 +1448,15 @@ def _colmap_run(colmap_bin: str, args: list[str], log_fn: Callable,
                        "full output continues in the task log file)")
                 capped = True
     proc.wait()
+    elapsed = time.time() - t0
     if proc.returncode != 0:
+        log_fn(f"  ✗ colmap {args[0]} exited with code {proc.returncode} "
+               f"after {elapsed:.1f} s")
         raise RuntimeError(
             f"COLMAP '{args[0]}' exited with code {proc.returncode}. "
             "See log above for details."
         )
+    log_fn(f"  ✓ colmap {args[0]} finished in {elapsed:.1f} s")
 
 
 def launch_in_colmap_gui(database_path: str, colmap_bin: str = "colmap") -> None:

@@ -46,6 +46,7 @@ class StackPanel(QWidget):
     run_requested          = Signal()
     rerun_failed_requested = Signal()
     tasks_changed          = Signal()   # emitted whenever the stack is mutated
+    one_click_requested    = Signal()   # open the One-Click Pipeline builder
 
     def __init__(self, stack: TaskStack, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -73,6 +74,7 @@ class StackPanel(QWidget):
         self._create_btn.setEnabled(not running)
         self._tmpl_btn.setEnabled(not running)
         self._rerun_btn.setEnabled(not running)
+        self._one_click_btn.setEnabled(not running)
         self._run_btn.setText("Running…" if running else "▶  Run Stack")
 
     def skip_existing(self) -> bool:
@@ -99,6 +101,18 @@ class StackPanel(QWidget):
         hint = QLabel("Tasks run top-to-bottom. Double-click to edit.")
         hint.setStyleSheet("color: #888; font-size: 10px;")
         layout.addWidget(hint)
+
+        # One-Click Pipeline: generates a fully wired stack from one dialog
+        # (target + products) and runs it immediately.
+        self._one_click_btn = QPushButton("⚡ One-Click Pipeline…")
+        self._one_click_btn.setStyleSheet("font-weight: bold; padding: 5px;")
+        self._one_click_btn.setToolTip(
+            "Pick a target job and the products you want (interp CSVs, point\n"
+            "clouds, rasters, NetCDF, QC, Metashape/COLMAP) in one dialog —\n"
+            "the tasks are generated, wired together, and run immediately."
+        )
+        self._one_click_btn.clicked.connect(self.one_click_requested)
+        layout.addWidget(self._one_click_btn)
 
         self._list = QListWidget()
         self._list.setSelectionMode(QAbstractItemView.SingleSelection)

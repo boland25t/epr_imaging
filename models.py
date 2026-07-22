@@ -644,6 +644,7 @@ class PhotogrammetryRun:
 #   "interp" → interp_full.csv exists (the build step has run)
 TASK_INFO: dict[str, dict] = {
     "build_interp":         {"label": "Build interp_full.csv",       "requires": ["nav", "sensor"],        "per_channel": False, "category": "Prepare"},
+    "job_interp":           {"label": "Job Interval interp.csv set", "requires": ["interp"],               "per_channel": False, "category": "Prepare"},
     "sampling":             {"label": "Sampling (frame extraction)", "requires": ["video"],               "per_channel": False, "category": "Sampling"},
     "nav_3d":               {"label": "Nav Trackline PLY",           "requires": ["interp"],               "per_channel": False, "category": "Outputs"},
     "nav_2d":               {"label": "Nav Depth GeoTIFF",           "requires": ["interp"],               "per_channel": False, "category": "Outputs"},
