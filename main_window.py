@@ -34,7 +34,8 @@ import calendar   # calendar.timegm() for UTC datetime → Unix timestamp withou
 import copy
 import math       # math.floor() used in frame count estimates
 import shutil     # shutil.copy2() used when exporting segment frames
-from datetime import datetime  # datetime.utcfromtimestamp() for Unix → UTC wall clock
+from datetime import datetime  # utc_from_timestamp() for Unix → UTC wall clock
+from timeutil import utc_from_timestamp   # naive-UTC drop-ins for the deprecated datetime APIs
 from pathlib import Path       # Cross-platform path handling throughout
 
 import numpy as np
@@ -105,6 +106,25 @@ def _app_version() -> str:
     except Exception:
         pass
     return "dev"
+
+
+def _iso_to_unix(value) -> "float | None":
+    """ISO-8601 timestamp string → unix seconds, or None if unparseable.
+
+    Reuses interval_io's single timestamp parser so the trailing "Z" written by
+    the anomaly catalog is stripped exactly the way imported interval CSVs are —
+    this project treats all data as one timezone (no UTC shift).
+
+    The naive result is then interpreted as UTC, which is what the rest of the
+    app does: SensorService.normalize_timestamps derives nav unix_time via
+    pandas' ``astype("int64")``, and pandas treats naive datetimes as UTC.
+    Using datetime.timestamp() here instead would apply the machine's local
+    offset and slide every anomaly band off the trackline.
+    """
+    from datetime import timezone
+    from interval_io import _parse_timestamp
+    dt = _parse_timestamp(str(value or ""))
+    return dt.replace(tzinfo=timezone.utc).timestamp() if dt is not None else None
 
 
 # ===========================================================================
@@ -287,6 +307,83 @@ class OutputWorker(QObject):
             filtered = {k: v for k, v in self.kwargs.items() if k in accepted}
             result = method(**filtered)
             self.finished.emit([result] if isinstance(result, str) else list(result))
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+# ===========================================================================
+# AnomalyWorker — runs the anomaly detector / catalog in a QThread
+# ===========================================================================
+
+class AnomalyWorker(QObject):
+    """Runs the MATLAB detector chain and/or the Python site catalog.
+
+    The detector stage is long (GrapherMatrix evaluates 160 strategies per
+    channel across 4 configs), so both stages run off the GUI thread.  Signals
+    mirror OutputWorker so the existing log/status plumbing applies.
+
+    Signals:
+        finished(dict) — catalog summary (counts + artefact paths); {} if only
+                         the detector ran
+        error(str)     — exception message on failure
+        log(str)       — individual log line
+        status(str)    — human-readable stage description
+    """
+
+    finished = Signal(dict)
+    error    = Signal(str)
+    log      = Signal(str)
+    status   = Signal(str)
+
+    def __init__(self, repo, interp_path, out_dir, raw_nav_path,
+                 run_detector: bool, run_catalog: bool) -> None:
+        super().__init__()
+        self.repo         = repo
+        self.interp_path  = interp_path
+        self.out_dir      = out_dir
+        self.raw_nav_path = raw_nav_path
+        self.run_detector = run_detector
+        self.run_catalog  = run_catalog
+        self._cancel      = False
+
+    def cancel(self) -> None:
+        """Request cancellation; polled between/inside stages."""
+        self._cancel = True
+
+    def run(self) -> None:
+        try:
+            import anomaly_service as anomaly
+
+            summary: dict = {}
+            if self.run_detector:
+                reason = anomaly.matlab_unavailable_reason()
+                if reason:
+                    # Degrade gracefully rather than failing the whole run.
+                    self.log.emit(f"DETECTOR SKIPPED — {reason}")
+                else:
+                    self.status.emit("Running MATLAB detector (long stage)…")
+                    anomaly.run_detector(
+                        repo=self.repo,
+                        interp_csv=self.interp_path,
+                        log_fn=self.log.emit,
+                        cancel_cb=lambda: self._cancel,
+                    )
+
+            if self._cancel:
+                self.error.emit("Cancelled.")
+                return
+
+            if self.run_catalog:
+                self.status.emit("Building anomaly site catalog…")
+                summary = anomaly.run_catalog(
+                    repo=self.repo,
+                    interp_csv=self.interp_path,
+                    raw_nav_csv=self.raw_nav_path,
+                    out_dir=self.out_dir,
+                    log_fn=self.log.emit,
+                )
+
+            self.finished.emit(summary)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -497,6 +594,9 @@ class MainWindow(QMainWindow):
         # Background thread and worker for output generation (GeoTIFF / PLY).
         self.output_worker_thread: QThread | None = None
         self.output_worker:        OutputWorker | None = None
+        # Continuation state for the per-channel sensor output queue; see
+        # _on_sensor_queue_step_done for why it lives here and not in a closure.
+        self._sensor_queue_state: dict | None = None
 
         # Background thread and worker for photogrammetry (Metashape / COLMAP).
         self.photo_worker_thread: QThread | None = None
@@ -595,6 +695,7 @@ class MainWindow(QMainWindow):
         # *management* still lives here.)
         self._jobs_tab_widget    = self._build_jobs_tab()
         self.controls_tabs.addTab(self._jobs_tab_widget,                 "Jobs")
+        self.controls_tabs.addTab(self._build_anomaly_tab(),             "Anomalies")
         # Outputs is fully superseded by the Task Stack dock.  Its widget is
         # still constructed (the sampling / output / photogrammetry machinery
         # reads its controls) but kept off the tab bar.  The ref is held on self
@@ -1108,6 +1209,443 @@ class MainWindow(QMainWindow):
         return tab
 
     # -----------------------------------------------------------------------
+    # Anomalies tab
+    # -----------------------------------------------------------------------
+
+    def _build_anomaly_tab(self) -> QWidget:
+        """Anomalies tab: run the detector, review windows, turn them into intervals.
+
+        Three groups:
+          Run      — MATLAB availability, stage toggles, Run/Cancel.
+          Catalog  — summary, artefact buttons (PDF / folder / QGIS).
+          Windows  — tier-filtered table; selection drives the map overlay and
+                     can be committed to the current job as intervals.
+        """
+        import anomaly_service as anomaly
+
+        # Catalog state — initialised BEFORE any widget signal can be connected,
+        # so an early refresh can never hit a missing attribute.
+        self._anomaly_windows: list[dict] = []
+        self._anomaly_visible: list[dict] = []
+        self._anomaly_loaded  = False
+        self._anomaly_thread = None
+        self._anomaly_worker = None
+
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll, stretch=1)
+
+        side = QWidget()
+        layout = QVBoxLayout(side)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        scroll.setWidget(side)
+
+        # ---- Run group -----------------------------------------------------
+        run_group = QGroupBox("Run Anomaly Detection")
+        run_layout = QVBoxLayout(run_group)
+
+        reason = anomaly.matlab_unavailable_reason()
+        self.anomaly_matlab_label = QLabel()
+        self.anomaly_matlab_label.setWordWrap(True)
+        self.anomaly_matlab_label.setStyleSheet("font-size: 10px;")
+        if reason:
+            self.anomaly_matlab_label.setText(f"⚠ {reason}")
+            self.anomaly_matlab_label.setStyleSheet("font-size: 10px; color: #b26a00;")
+        else:
+            self.anomaly_matlab_label.setText(f"MATLAB detected: {anomaly.matlab_binary()}")
+            self.anomaly_matlab_label.setStyleSheet("font-size: 10px; color: gray;")
+        run_layout.addWidget(self.anomaly_matlab_label)
+
+        self.anomaly_run_detector_check = QCheckBox("Run MATLAB detector (GrapherMatrix + exporters)")
+        self.anomaly_run_detector_check.setChecked(not reason)
+        self.anomaly_run_detector_check.setEnabled(not reason)
+        self.anomaly_run_detector_check.setToolTip(
+            "Recomputes the anomaly matrix from interp_full.csv. This is the long "
+            "stage. Uncheck to rebuild the catalog from existing event CSVs."
+        )
+        run_layout.addWidget(self.anomaly_run_detector_check)
+
+        self.anomaly_run_catalog_check = QCheckBox("Build site catalog (windows, sites, QGIS, PDF report)")
+        self.anomaly_run_catalog_check.setChecked(True)
+        run_layout.addWidget(self.anomaly_run_catalog_check)
+
+        btn_row = QHBoxLayout()
+        self.anomaly_run_button = QPushButton("Run")
+        self.anomaly_run_button.clicked.connect(self._anomaly_run)
+        btn_row.addWidget(self.anomaly_run_button)
+        self.anomaly_cancel_button = QPushButton("Cancel")
+        self.anomaly_cancel_button.setEnabled(False)
+        self.anomaly_cancel_button.clicked.connect(self._anomaly_cancel)
+        btn_row.addWidget(self.anomaly_cancel_button)
+        run_layout.addLayout(btn_row)
+
+        self.anomaly_status_label = QLabel("Idle.")
+        self.anomaly_status_label.setWordWrap(True)
+        self.anomaly_status_label.setStyleSheet("font-size: 10px; color: gray;")
+        run_layout.addWidget(self.anomaly_status_label)
+        layout.addWidget(run_group)
+
+        # ---- Catalog artefacts --------------------------------------------
+        cat_group = QGroupBox("Catalog")
+        cat_layout = QVBoxLayout(cat_group)
+        self.anomaly_summary_label = QLabel("No catalog loaded.")
+        self.anomaly_summary_label.setWordWrap(True)
+        self.anomaly_summary_label.setStyleSheet("font-size: 10px;")
+        cat_layout.addWidget(self.anomaly_summary_label)
+
+        art_row = QHBoxLayout()
+        self.anomaly_open_pdf_button = QPushButton("Open Report")
+        self.anomaly_open_pdf_button.clicked.connect(self._anomaly_open_report)
+        art_row.addWidget(self.anomaly_open_pdf_button)
+        self.anomaly_open_dir_button = QPushButton("Open Folder")
+        self.anomaly_open_dir_button.clicked.connect(self._anomaly_open_folder)
+        art_row.addWidget(self.anomaly_open_dir_button)
+        cat_layout.addLayout(art_row)
+        self.anomaly_reload_button = QPushButton("Reload Catalog from Disk")
+        self.anomaly_reload_button.clicked.connect(self._anomaly_reload)
+        cat_layout.addWidget(self.anomaly_reload_button)
+        layout.addWidget(cat_group)
+
+        # ---- Windows table -------------------------------------------------
+        win_group = QGroupBox("Anomaly Windows")
+        win_layout = QVBoxLayout(win_group)
+
+        filt_row = QHBoxLayout()
+        filt_row.addWidget(QLabel("Show:"))
+        self.anomaly_tier_checks: dict[str, QCheckBox] = {}
+        for tier in anomaly.TIERS:
+            box = QCheckBox(tier)
+            box.setChecked(True)
+            box.stateChanged.connect(self._anomaly_refresh_table)
+            colour = anomaly.TIER_COLORS[tier]
+            box.setStyleSheet(f"font-size: 10px; color: {colour}; font-weight: bold;")
+            self.anomaly_tier_checks[tier] = box
+            filt_row.addWidget(box)
+        filt_row.addStretch(1)
+        win_layout.addLayout(filt_row)
+
+        self.anomaly_table = QTableWidget(0, 6)
+        self.anomaly_table.setHorizontalHeaderLabels(
+            ["Window", "Tier", "Score", "Channels", "Start", "Dur (s)"]
+        )
+        self.anomaly_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.anomaly_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.anomaly_table.verticalHeader().setVisible(False)
+        self.anomaly_table.setMinimumHeight(220)
+        self.anomaly_table.itemSelectionChanged.connect(self._anomaly_selection_changed)
+        win_layout.addWidget(self.anomaly_table)
+
+        sel_row = QHBoxLayout()
+        select_all = QPushButton("Select All Shown")
+        select_all.clicked.connect(self.anomaly_table.selectAll)
+        sel_row.addWidget(select_all)
+        clear_sel = QPushButton("Clear Selection")
+        clear_sel.clicked.connect(self.anomaly_table.clearSelection)
+        sel_row.addWidget(clear_sel)
+        win_layout.addLayout(sel_row)
+
+        self.anomaly_add_button = QPushButton("Add Selected to Current Job")
+        self.anomaly_add_button.setToolTip(
+            "Adds each selected anomaly as a job interval using its review window "
+            "(the anomaly padded by 120 s of context, matching the video review queue)."
+        )
+        self.anomaly_add_button.clicked.connect(self._anomaly_add_to_job)
+        win_layout.addWidget(self.anomaly_add_button)
+
+        self.anomaly_hint_label = QLabel(
+            "Selected windows are highlighted on the map. The trackline is "
+            "colour-coded by tier whenever a catalog is loaded."
+        )
+        self.anomaly_hint_label.setWordWrap(True)
+        self.anomaly_hint_label.setStyleSheet("font-size: 10px; color: gray;")
+        win_layout.addWidget(self.anomaly_hint_label)
+        layout.addWidget(win_group)
+
+        layout.addStretch(1)
+        return tab
+
+    # ---- Anomalies tab handlers -------------------------------------------
+
+    def _anomaly_out_dir(self) -> Path:
+        """Catalog output directory for the current workspace."""
+        ws = (self.workspace_path or "").strip()
+        base = Path(ws) if ws else Path(__file__).resolve().parent
+        return base / "anomaly_site_catalog"
+
+    def _anomaly_interp_path(self) -> Path:
+        """interp_full.csv for the current workspace."""
+        ws = (self.workspace_path or "").strip()
+        base = Path(ws) if ws else Path(__file__).resolve().parent
+        return base / "interp_full.csv"
+
+    def _anomaly_run(self) -> None:
+        """Kick off the detector and/or catalog in a background thread."""
+        if self._anomaly_thread is not None:
+            QMessageBox.information(self, "Already running",
+                                    "An anomaly run is already in progress.")
+            return
+        run_detector = self.anomaly_run_detector_check.isChecked()
+        run_catalog  = self.anomaly_run_catalog_check.isChecked()
+        if not (run_detector or run_catalog):
+            QMessageBox.warning(self, "Nothing to run",
+                                "Enable the detector stage, the catalog stage, or both.")
+            return
+
+        interp = self._anomaly_interp_path()
+        if run_detector and not interp.is_file():
+            QMessageBox.warning(
+                self, "interp_full.csv not found",
+                f"The detector needs an interpolated sensor table:\n{interp}\n\n"
+                "Build it first (Prepare → Build interp_full.csv)."
+            )
+            return
+
+        out_dir = self._anomaly_out_dir()
+        self.log_text.append(f"Anomaly run: interp={interp}  out={out_dir}")
+
+        thread = QThread(self)
+        worker = AnomalyWorker(
+            repo=Path(__file__).resolve().parent,
+            interp_path=interp,
+            out_dir=out_dir,
+            raw_nav_path=None,
+            run_detector=run_detector,
+            run_catalog=run_catalog,
+        )
+        self._anomaly_thread = thread
+        self._anomaly_worker = worker
+
+        def _cleanup_this_thread(_thread=thread, _worker=worker):
+            # Only wipe the refs if they still point at THIS run.
+            if self._anomaly_thread is _thread:
+                self._anomaly_thread = None
+            if self._anomaly_worker is _worker:
+                self._anomaly_worker = None
+
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        # Cross-thread slots must be bound methods of a QObject (or real C++
+        # slots) — those are auto-queued onto the main thread.  A lambda or plain
+        # function would instead run on the WORKER thread.  Routed through
+        # MainWindow methods here to match every other worker in this file.
+        worker.log.connect(self._append_log)
+        worker.status.connect(self._anomaly_set_status)
+        worker.finished.connect(self._anomaly_finished)
+        worker.error.connect(self._anomaly_error)
+        # Standard teardown (matches the other workers): stop the event loop,
+        # then let Qt delete both objects.  Without deleteLater the QThread is
+        # parented to the window and one leaks per run.
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(_cleanup_this_thread)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self.anomaly_run_button.setEnabled(False)
+        self.anomaly_cancel_button.setEnabled(True)
+        self.anomaly_status_label.setText("Starting…")
+        thread.start()
+
+    def _anomaly_set_status(self, text: str) -> None:
+        """Status-label sink for AnomalyWorker (main-thread slot)."""
+        self.anomaly_status_label.setText(text)
+
+    def _anomaly_cancel(self) -> None:
+        if self._anomaly_worker is not None:
+            self._anomaly_worker.cancel()
+            self.anomaly_status_label.setText("Cancelling after the current stage…")
+
+    def _anomaly_teardown(self) -> None:
+        """Re-enable the run controls after a run ends.
+
+        The thread is stopped by the finished/error → quit connections and both
+        objects are freed by the thread.finished → deleteLater chain, so this
+        must NOT quit()/wait() here: waiting on the GUI thread would block the
+        UI, and clearing the refs is handled by _cleanup_this_thread once Qt has
+        actually finished with them.
+        """
+        self.anomaly_run_button.setEnabled(True)
+        self.anomaly_cancel_button.setEnabled(False)
+
+    def _anomaly_finished(self, summary: dict) -> None:
+        self._anomaly_teardown()
+        if summary:
+            self.anomaly_status_label.setText("Done.")
+            self.log_text.append(
+                f"Anomaly catalog: {summary.get('windows', 0)} windows, "
+                f"{summary.get('sites', 0)} sites → {summary.get('out_dir')}"
+            )
+        else:
+            self.anomaly_status_label.setText("Detector finished (catalog not run).")
+        self._anomaly_reload()
+
+    def _anomaly_error(self, message: str) -> None:
+        self._anomaly_teardown()
+        self.anomaly_status_label.setText("Failed.")
+        self.log_text.append(f"Anomaly run failed: {message}")
+        QMessageBox.critical(self, "Anomaly run failed", message)
+
+    def _anomaly_reload(self) -> None:
+        """Load the catalog from disk and refresh the table, summary and map."""
+        import anomaly_service as anomaly
+        out_dir = self._anomaly_out_dir()
+        self._anomaly_windows = anomaly.load_windows(out_dir)
+        if not self._anomaly_windows:
+            self.anomaly_summary_label.setText(f"No catalog found in {out_dir}")
+        else:
+            counts = anomaly.tier_counts(self._anomaly_windows)
+            self.anomaly_summary_label.setText(
+                f"{len(self._anomaly_windows)} windows — "
+                f"{counts['HIGH']} HIGH, {counts['MODERATE']} MODERATE, "
+                f"{counts['SCREEN']} SCREEN\n{out_dir}"
+            )
+        self._anomaly_refresh_table()
+
+    def _anomaly_refresh_table(self) -> None:
+        """Apply the tier filter, repopulate the table and recolour the map."""
+        import anomaly_service as anomaly
+        wanted = {t for t, box in self.anomaly_tier_checks.items() if box.isChecked()}
+        self._anomaly_visible = [
+            w for w in self._anomaly_windows
+            if str(w.get("confidence_tier", "")).upper() in wanted
+        ]
+
+        table = self.anomaly_table
+        table.blockSignals(True)
+        table.setRowCount(len(self._anomaly_visible))
+        for row, win in enumerate(self._anomaly_visible):
+            tier = str(win.get("confidence_tier", ""))
+            colour = QColor(anomaly.TIER_COLORS.get(tier, "#666666"))
+            values = [
+                str(win.get("window_id", "")),
+                tier,
+                f"{win.get('evidence_score') or 0:.0f}",
+                str(win.get("channels", "")),
+                str(win.get("start_time", ""))[:19].replace("T", " "),
+                str(win.get("duration_s") or ""),
+            ]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                if col == 1:
+                    item.setForeground(colour)
+                table.setItem(row, col, item)
+        table.resizeColumnsToContents()
+        table.blockSignals(False)
+        self._anomaly_update_map()
+
+    def _anomaly_update_map(self) -> None:
+        """Colour the trackline by tier; emphasise the current table selection.
+
+        Bands are emitted SCREEN → MODERATE → HIGH so the most severe tier is
+        drawn last and wins wherever anomaly windows overlap.
+        """
+        import anomaly_service as anomaly
+        if not hasattr(self, "map_widget") or not hasattr(self, "anomaly_table"):
+            return
+
+        # Map-view toggle wins: clear the overlay when tier colouring is off.
+        if (hasattr(self, "viz_anomaly_tier_check")
+                and not self.viz_anomaly_tier_check.isChecked()):
+            self.map_widget.set_anomaly_ranges([])
+            return
+
+        selected_ids = {
+            self.anomaly_table.item(idx.row(), 0).text()
+            for idx in self.anomaly_table.selectionModel().selectedRows()
+        } if self.anomaly_table.selectionModel() else set()
+
+        ranges: list[tuple[float, float, str, str]] = []
+        for tier in reversed(anomaly.TIERS):          # SCREEN, MODERATE, HIGH
+            for win in self._anomaly_visible:
+                if str(win.get("confidence_tier", "")).upper() != tier:
+                    continue
+                start = _iso_to_unix(win.get("start_time"))
+                end   = _iso_to_unix(win.get("end_time"))
+                if start is None or end is None:
+                    continue
+                colour = ("#00e5ff" if win.get("window_id") in selected_ids
+                          else anomaly.TIER_COLORS[tier])
+                ranges.append((start, end, colour, tier))
+        self.map_widget.set_anomaly_ranges(ranges)
+
+    def _anomaly_selection_changed(self) -> None:
+        self._anomaly_update_map()
+
+    def _anomaly_selected_windows(self) -> list[dict]:
+        rows = sorted({idx.row() for idx in self.anomaly_table.selectionModel().selectedRows()})
+        return [self._anomaly_visible[r] for r in rows if 0 <= r < len(self._anomaly_visible)]
+
+    def _anomaly_add_to_job(self) -> None:
+        """Commit the selected anomaly windows to the current job as intervals."""
+        import anomaly_service as anomaly
+        selected = self._anomaly_selected_windows()
+        if not selected:
+            QMessageBox.information(self, "No selection",
+                                    "Select one or more anomaly windows first.")
+            return
+
+        specs = anomaly.windows_to_intervals(selected, use_review_window=True)
+        if not specs:
+            QMessageBox.warning(self, "No usable intervals",
+                                "The selected windows had no parseable time range.")
+            return
+
+        for spec in specs:
+            self.pending_job.intervals.append(
+                SelectedTimeRange(
+                    start_time=spec["start_dt"],
+                    end_time=spec["end_dt"],
+                    source="threshold",
+                    threshold_desc=spec["threshold_desc"],
+                )
+            )
+        self.log_text.append(
+            f"Added {len(specs)} anomaly interval(s) to Job #{self.pending_job.job_id}"
+        )
+        self._refresh_job_builder_ui()
+        self._refresh_summary()
+        self._auto_save_workspace()
+        QMessageBox.information(
+            self, "Intervals added",
+            f"Added {len(specs)} anomaly interval(s) to Job #{self.pending_job.job_id}."
+        )
+
+    def _anomaly_open_report(self) -> None:
+        import anomaly_service as anomaly
+        pdf = anomaly.catalog_paths(self._anomaly_out_dir())["report_pdf"]
+        if not pdf.is_file():
+            QMessageBox.warning(self, "No report",
+                                f"Report not found:\n{pdf}\n\nRun the catalog stage first.")
+            return
+        self._open_path(pdf)
+
+    def _anomaly_open_folder(self) -> None:
+        out_dir = self._anomaly_out_dir()
+        if not out_dir.is_dir():
+            QMessageBox.warning(self, "No catalog",
+                                f"Directory not found:\n{out_dir}")
+            return
+        self._open_path(out_dir)
+
+    def _open_path(self, path) -> None:
+        """Open a file or folder in the OS default handler (cross-platform).
+
+        Qt's QDesktopServices handles Windows / macOS / Linux uniformly, which
+        matters because this app ships via a Windows installer but is developed
+        under WSL.
+        """
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            self.log_text.append(f"Could not open: {path}")
+
+    # -----------------------------------------------------------------------
     # Jobs tab
     # -----------------------------------------------------------------------
 
@@ -1331,326 +1869,46 @@ class MainWindow(QMainWindow):
         }
 
     def _find_job(self, job_id: int) -> "Job | None":
-        return next(
-            (j for j in [self.pending_job] + list(self.job_history) if j.job_id == job_id),
-            None,
-        )
-
-    def _scope_for_job(self, job: "Job") -> tuple:
-        """Return the (scope_id, interp, out_dir, label, job) tuple for one job."""
-        interp  = self._get_filtered_interp_for_job(job)
-        out_dir = str(Path(self.workspace_path) / self._job_output_dirname(job) / "outputs")
-        return (f"job_{job.job_id}", interp, out_dir, job.name or f"Job #{job.job_id}", job)
-
-    def _scope_full(self) -> tuple:
-        """Return the (scope_id, interp, out_dir, label, job) tuple for full dataset."""
-        return ("full", self._interp_full_path(), self._outputs_root(), "Full dataset", None)
-
-    def _resolve_task_scopes(self, task: "Task") -> list[tuple]:
-        """Expand a task's target into concrete scope tuples (Axis-1 batching).
-
-        Each tuple is (scope_id, interp_path, output_dir, label, job|None).  A
-        target of kind 'full' yields one full-dataset scope; 'job'/'jobs' yield
-        one scope per named job; 'all_jobs' fans out over every job that has
-        intervals.  Jobs without intervals are dropped (and reported as skips).
-        """
-        # interp_full.csv is workspace-level — never fan it out per job.
-        if task.task_type == "build_interp":
-            return [self._scope_full()]
-
-        tgt  = task.target or {"kind": "full"}
-        kind = tgt.get("kind", "full")
-        scopes: list[tuple] = []
-
-        if kind == "full":
-            return [self._scope_full()]
-
-        # Collect the requested job ids.
-        job_ids: list[int] = []
-        if kind == "job":
-            job_ids = [int(tgt.get("job_id", -1))]
-        elif kind == "jobs":
-            job_ids = [int(j.get("job_id", -1)) for j in tgt.get("jobs", [])]
-        elif kind == "all_jobs":
-            job_ids = [jid for jid, _name in self._stack_available_jobs()]
-
-        for jid in job_ids:
-            job = self._find_job(jid)
-            if job is not None and job.intervals:
-                scopes.append(self._scope_for_job(job))
-            elif hasattr(self, "_plan_skips"):
-                self._plan_skips.append(
-                    f"{task.display_label()} — job #{jid} has no intervals (skipped)"
-                )
-        return scopes
-
-    def _iter_task_scopes(self):
-        """Yield (task, scope_tuple) for every task × its resolved target scopes."""
-        for task in self._task_stack.tasks:
-            scopes = self._resolve_task_scopes(task)
-            if not scopes and hasattr(self, "_plan_skips"):
-                self._plan_skips.append(
-                    f"{task.display_label()} — target resolved to no runnable scope"
-                )
-            for scope in scopes:
-                yield task, scope
+        import plan_service
+        return plan_service.find_job(self._plan_context(), job_id)
 
     # ------------------------------------------------------------------
+    # Plan building — the logic lives in plan_service (Qt-free, tested).
+    # MainWindow only supplies the environment via PlanContext.
+    # ------------------------------------------------------------------
 
-    _FILL_3CH = {"IDW fill": "idw", "Kriging fill": "kriging",
-                 "RBF fill": "rbf", "No fill": "none",
-                 "Trackline only (no fill)": "none", "Trackline only": "none"}
+    def _plan_context(self):
+        """Bundle the state/callables plan_service needs from this window."""
+        import plan_service
+        return plan_service.PlanContext(
+            workspace_path=self.workspace_path,
+            pending_job=self.pending_job,
+            job_history=list(self.job_history),
+            sensor_files=self.sensor_files,
+            videos=self.videos,
+            interp_full_path=self._interp_full_path,
+            outputs_root=self._outputs_root,
+            filtered_interp_for_job=self._get_filtered_interp_for_job,
+            job_output_dirname=self._job_output_dirname,
+            available_channels=self._stack_available_channels,
+            build_interp_config=self._build_interp_config,
+            build_sampling_config=self._build_sampling_config,
+            raster_channel_units=self._get_raster_channel_units,
+        )
 
     def _build_task_plan(self) -> list[dict]:
-        """Turn the ordered Task list into runner step dicts (preserving user order)."""
-        plan: list[dict] = []
-        for task, (scope_id, interp_path, output_dir, tlabel, job) in self._iter_task_scopes():
-            tag = f"  [{tlabel}]"
-            t = task.task_type
-            s = task.settings
-            channels = task.channels or self._stack_available_channels()
+        """Turn the ordered Task list into runner step dicts (preserving user order).
 
-            if t == "build_interp":
-                config = self._build_interp_config(task)
-                if config is None:
-                    continue
-                plan.append({
-                    "label": "Build interp_full.csv",
-                    "product_type": "build_interp", "scope_id": "full",
-                    "channel": None, "method": None, "engine": None,
-                    "kwargs": {}, "config": config,
-                })
+        Delegates to plan_service; skipped-task reasons are collected into
+        self._plan_skips, which _run_stack() surfaces to the user.
+        """
+        import plan_service
+        result = plan_service.build_plan(self._plan_context(), self._task_stack)
+        if not hasattr(self, "_plan_skips") or self._plan_skips is None:
+            self._plan_skips = []
+        self._plan_skips.extend(result.skips)
+        return result.steps
 
-            elif t == "sampling":
-                config = self._build_sampling_config(task, job, scope_id)
-                if config is None:
-                    continue
-                plan.append({
-                    "label": f"{task.type_label}{tag}",
-                    "product_type": "sampling", "scope_id": scope_id,
-                    "task_id": task.task_id,   # runner records outputs keyed by this
-                    "channel": None, "method": None, "engine": None,
-                    "kwargs": {}, "config": config,
-                })
-
-            elif t == "nav_3d":
-                plan.append(self._step(t, scope_id, None, "generate_nav_3d_ply", {
-                    "interp_path": interp_path, "output_dir": output_dir,
-                    "cell_size": float(s.get("cell_size", 1.0)),
-                }, "Nav Trackline PLY" + tag))
-
-            elif t == "nav_2d":
-                plan.append(self._step(t, scope_id, None, "generate_nav_2d_geotiff", {
-                    "interp_path": interp_path, "output_dir": output_dir,
-                    "cell_size_m": float(s.get("cell_size", 5.0)),
-                    "crs_mode": "wgs84" if s.get("crs") == "WGS84" else "utm",
-                }, "Nav Depth GeoTIFF" + tag))
-
-            elif t == "sensor_3d":
-                for ch in channels:
-                    plan.append(self._step(t, scope_id, ch, "generate_sensor_3d_ply", {
-                        "interp_path": interp_path, "output_dir": output_dir, "channel": ch,
-                        "cell_size": float(s.get("cell_size", 1.0)),
-                        "aggregation": s.get("aggregation", "mean"),
-                        "fill_method": self._FILL_3CH.get(s.get("fill", "IDW fill"), "idw"),
-                        "zero_mask_pct": float(s.get("zero_mask", 5.0)),
-                    }, f"Sensor 3D PLY — {ch}" + tag))
-
-            elif t == "sensor_2d":
-                for ch in channels:
-                    plan.append(self._step(t, scope_id, ch, "generate_sensor_2d_geotiff", {
-                        "interp_path": interp_path, "output_dir": output_dir, "channel": ch,
-                        "cell_size_m": float(s.get("cell_size", 5.0)),
-                        "crs_mode": "wgs84" if s.get("crs") == "WGS84" else "utm",
-                        "fill_method": self._FILL_3CH.get(s.get("fill", "IDW fill"), "idw"),
-                    }, f"Sensor 2D GeoTIFF — {ch}" + tag))
-
-            elif t == "depth_slice_geotiffs":
-                fill = ("idw" if "IDW" in s.get("fill", "IDW fill")
-                        else "rbf" if "RBF" in s.get("fill", "") else "none")
-                for ch in channels:
-                    plan.append(self._step(t, scope_id, ch, "generate_depth_slice_geotiffs", {
-                        "interp_path": interp_path, "output_dir": output_dir, "channel": ch,
-                        "altitude_step": float(s.get("altitude_step", 5.0)),
-                        "cell_size_m": float(s.get("cell_size", 2.0)),
-                        "fill_method": fill,
-                    }, f"Depth-Slice GeoTIFFs — {ch}" + tag))
-
-            elif t == "sensor_slices":
-                color = s.get("color", "viridis") or "viridis"
-                local_norm = bool(s.get("local_norm", False))
-                manual_range = bool(s.get("manual_range", False)) and not local_norm
-                full_sensor_3d = str(Path(self._outputs_root()) / "sensor_3d")
-                for ch in channels:
-                    kw: dict = {
-                        "altitude_step": float(s.get("altitude_step", 5.0)),
-                        "pixels_per_cell": int(s.get("ppc", 4)),
-                        "color_mode": color,
-                        "log_scale": bool(s.get("log_scale", False)),
-                        "local_norm": local_norm,
-                        "_run_glob": str(Path(output_dir) / "sensor_3d" / ch),
-                    }
-                    if manual_range:
-                        # Explicit user range wins over any auto-derived scale.
-                        kw["vmin"] = float(s.get("vmin", 0.0))
-                        kw["vmax"] = float(s.get("vmax", 1.0))
-                    elif scope_id != "full":
-                        # Per-job runs: point the runner at the full-dataset
-                        # sensor_3d tree so it can derive a shared colour range.
-                        kw["_scale_source_glob"] = str(Path(full_sensor_3d) / ch)
-                    plan.append(self._step(t, scope_id, ch, None, kw,
-                                           f"PNG Depth Slices — {ch}" + tag))
-
-            elif t == "job_interp":
-                # One interp.csv per interval of the target job. Works with or
-                # without video (video coverage columns are added when videos
-                # are loaded).  Needs a JOB scope — "Full dataset" has no intervals.
-                if job is None:
-                    if hasattr(self, "_plan_skips"):
-                        self._plan_skips.append(
-                            f"{task.display_label()} — target a Job (Full dataset has no "
-                            "intervals; this task writes one interp.csv per interval)."
-                        )
-                    continue
-                if not job.intervals:
-                    if hasattr(self, "_plan_skips"):
-                        self._plan_skips.append(
-                            f"{task.display_label()} — job '{job.name or job.job_id}' has no intervals."
-                        )
-                    continue
-                ivs = [
-                    (calendar.timegm(iv.start_time.timetuple()),
-                     calendar.timegm(iv.end_time.timetuple()))
-                    for iv in job.intervals
-                ]
-                vids = [
-                    (calendar.timegm(v.start_time.timetuple()),
-                     calendar.timegm(v.end_time.timetuple()),
-                     v.filename)
-                    for v in self.videos
-                ] if (self.videos and s.get("annotate_video", True)) else None
-                plan.append(self._step(t, scope_id, None, "generate_job_interval_interps", {
-                    "interp_path": interp_path,
-                    "output_dir":  output_dir,
-                    "intervals":   ivs,
-                    "videos":      vids,
-                    "job_name":    job.name or f"Job #{job.job_id}",
-                }, f"Job Interval interp.csv set ({len(ivs)} intervals)" + tag))
-
-            elif t == "frame_stats":
-                # Frame source resolved at runtime (depends_on sampling task or
-                # manual dir), same as photogrammetry.
-                plan.append({
-                    "label": "Frame Statistics" + tag,
-                    "product_type": "frame_stats", "scope_id": scope_id,
-                    "channel": None, "method": None, "engine": None,
-                    "depends_on_task_id": task.depends_on,
-                    "kwargs": {
-                        "output_dir":     output_dir,
-                        "frame_dir":      s.get("frame_dir", "").strip(),
-                        "sharpness_min":  float(s.get("sharpness_min", 100.0)),
-                        "brightness_min": float(s.get("brightness_min", 20.0)),
-                        "brightness_max": float(s.get("brightness_max", 235.0)),
-                    },
-                })
-
-            elif t == "photogrammetry":
-                # Frame source: either linked to a sampling task (depends_on) or manual.
-                # We skip the "dir must exist" check here because depends_on dirs are
-                # resolved at runtime by the runner after sampling has produced them.
-                engine = "colmap" if s.get("engine", "Metashape") == "COLMAP" else "metashape"
-                plan.append({
-                    "label": f"Photogrammetry ({s.get('engine', 'Metashape')})" + tag,
-                    "product_type": "photogrammetry", "scope_id": scope_id,
-                    "channel": None, "method": None, "engine": engine,
-                    "depends_on_task_id": task.depends_on,   # None → use frame_dir
-                    "kwargs": {
-                        # output_root + job_id: runner calls prepare_run_dir per segment.
-                        # job_id is the REAL target job's id (0 = full dataset) so the
-                        # photogrammetry tree and the batch project.psx land under the
-                        # right job folder instead of a misleading job_000.
-                        "output_root": str(Path(output_dir) / "photogrammetry"),
-                        "job_id":      job.job_id if job is not None else 0,
-                        # Metashape single-project chunking: max images per chunk.
-                        "chunk_size":  int(s.get("chunk_size", 250)),
-                        # manual fallback dir (empty when using depends_on)
-                        "frame_dir":   s.get("frame_dir", "").strip(),
-                        "nav_csv":     interp_path if s.get("use_nav_reference", True) else None,
-                        # Alignment
-                        "align_accuracy":     s.get("align_accuracy", "High"),
-                        "key_point_limit":    int(s.get("key_point_limit", 40000)),
-                        "tie_point_limit":    int(s.get("tie_point_limit", 10000)),
-                        "generic_preselect":  bool(s.get("generic_preselect", True)),
-                        "reference_preselect": bool(s.get("reference_preselect", True)),
-                        "adaptive_fitting":   bool(s.get("adaptive_fitting", True)),
-                        "reset_cameras":      bool(s.get("reset_cameras", False)),
-                        # Dense cloud
-                        "build_dense":   bool(s.get("build_dense", True)),
-                        "dense_quality": s.get("dense_quality", "Medium"),
-                        "depth_filter":  s.get("depth_filter", "Moderate"),
-                        "reuse_depth":   bool(s.get("reuse_depth", False)),
-                        # Mesh
-                        "build_mesh":         bool(s.get("build_mesh", False)),
-                        "mesh_surface":       s.get("mesh_surface", "Arbitrary"),
-                        "mesh_faces":         s.get("mesh_faces", "Medium"),
-                        "mesh_source":        s.get("mesh_source", "Dense cloud"),
-                        "mesh_vertex_colors": bool(s.get("mesh_vertex_colors", True)),
-                        # Texture
-                        "build_texture":      bool(s.get("build_texture", False)),
-                        "texture_size":       int(s.get("texture_size", 4096)),
-                        "texture_blending":   s.get("texture_blending", "Mosaic"),
-                        "texture_fill_holes": bool(s.get("texture_fill_holes", True)),
-                        # Export & project
-                        "export_dense_ply": bool(s.get("export_dense_ply", True)),
-                        "export_mesh_obj":  bool(s.get("export_mesh_obj", False)),
-                        "save_project":     bool(s.get("save_project", True)),
-                        # Georeference
-                        "use_nav_reference": bool(s.get("use_nav_reference", True)),
-                        "nav_accuracy_h":    float(s.get("nav_accuracy_h", 0.1)),
-                        "nav_accuracy_v":    float(s.get("nav_accuracy_v", 0.5)),
-                        # COLMAP — matching / SfM
-                        "max_features":  int(s.get("max_features", 8192)),
-                        "matcher":       s.get("matcher", "Exhaustive"),
-                        "single_camera": bool(s.get("single_camera", True)),
-                        # COLMAP — products
-                        "run_mvs":                  bool(s.get("run_mvs", True)),
-                        "export_camera_trajectory": bool(s.get("export_camera_trajectory", True)),
-                        "export_undistorted":       bool(s.get("export_undistorted", False)),
-                        "export_depth_maps":        bool(s.get("export_depth_maps", False)),
-                        "build_poisson_mesh":       bool(s.get("build_poisson_mesh", False)),
-                        "build_delaunay_mesh":      bool(s.get("build_delaunay_mesh", False)),
-                        # COLMAP — georeference (always pass interp so it CAN georef)
-                        "georeference": bool(s.get("georeference", True)),
-                        "colmap_nav_csv": interp_path,
-                    },
-                })
-
-            elif t == "qgis_project":
-                plan.append(self._step(t, scope_id, None, "generate_qgis_project", {
-                    "output_dir": output_dir,
-                    "project_name": s.get("project_name", "EPR Survey"),
-                }, "QGIS Project" + tag))
-
-            elif t == "qc_report":
-                plan.append(self._step(t, scope_id, None, "generate_qc_report", {
-                    "interp_path": interp_path,
-                    "output_dir": output_dir,
-                    "sensor_files": self.sensor_files,
-                    "channels": task.channels or None,
-                    "max_gap_s": float(s.get("max_gap_s", 60.0)),
-                }, "Data QC Report" + tag))
-
-            elif t == "sensor_netcdf":
-                for ch in channels:
-                    plan.append(self._step(t, scope_id, ch, "generate_sensor_netcdf", {
-                        "interp_path": interp_path, "output_dir": output_dir, "channel": ch,
-                        "cell_size": float(s.get("cell_size", 1.0)),
-                        "aggregation": s.get("aggregation", "mean"),
-                        "fill_method": self._FILL_3CH.get(s.get("fill", "IDW fill"), "idw"),
-                        "units": self._get_raster_channel_units(ch),
-                    }, f"Sensor NetCDF — {ch}" + tag))
-
-        return plan
 
     @staticmethod
     def _hms(seconds: float) -> str:
@@ -2027,6 +2285,56 @@ class MainWindow(QMainWindow):
         """Persist the stack after any add/edit/remove/reorder (if a workspace exists)."""
         self.workspace_saved = False
 
+    def _create_anomaly_job(self, windows: list[dict], tiers: list[str]) -> "dict | None":
+        """Build a saved job whose intervals are the selected anomaly windows.
+
+        Used by One-Click's "Anomaly windows" target.  Each window contributes
+        its REVIEW window (the anomaly padded by 120 s of context, matching the
+        video review queue).  Returns {"job_id", "name"} or None if nothing
+        usable was produced (a warning is shown in that case).
+        """
+        import anomaly_service as anomaly
+
+        wanted = {t.upper() for t in tiers}
+        selected = [w for w in windows
+                    if str(w.get("confidence_tier", "")).upper() in wanted]
+        specs = anomaly.windows_to_intervals(selected, use_review_window=True)
+        if not specs:
+            QMessageBox.warning(
+                self, "No anomaly intervals",
+                "The selected tiers produced no usable intervals.\n\n"
+                "Build or reload the anomaly catalog on the Anomalies tab first."
+            )
+            return None
+
+        intervals = [
+            SelectedTimeRange(
+                start_time=s["start_dt"], end_time=s["end_dt"],
+                source="threshold", threshold_desc=s["threshold_desc"],
+            )
+            for s in specs
+        ]
+        self.next_job_id += 1
+        tier_label = "+".join(t for t in ("HIGH", "MODERATE", "SCREEN") if t in wanted)
+        job = Job(
+            job_id=self.next_job_id,
+            name=f"Anomalies {tier_label}",
+            intervals=intervals,
+            status="saved",
+            settings_snapshot=self._collect_settings_snapshot(),
+        )
+        self.job_history.append(job)
+        self.log_text.append(
+            f"One-Click: created job '{job.name}' (Job #{job.job_id}) with "
+            f"{len(intervals)} anomaly interval(s) from tiers {tier_label}"
+        )
+        self._refresh_job_history_dropdown()
+        self._refresh_history_overlay()
+        self._refresh_summary()
+        self._refresh_output_source_combo()
+        self._auto_save_workspace()
+        return {"job_id": job.job_id, "name": job.name}
+
     def _open_one_click_dialog(self) -> None:
         """One-Click Pipeline: one dialog → generated task stack → immediate run."""
         if not self.workspace_path:
@@ -2039,18 +2347,34 @@ class MainWindow(QMainWindow):
             return
 
         from one_click_dialog import OneClickPipelineDialog
+        import anomaly_service as anomaly
+
         interp = self._interp_full_path()
+        catalog_windows = anomaly.load_windows(self._anomaly_out_dir())
         dlg = OneClickPipelineDialog(
             jobs=self._stack_available_jobs(),
             channels=self._stack_available_channels(),
             availability=self._stack_data_availability(),
             interp_exists=bool(interp) and Path(interp).exists(),
+            anomaly_info={
+                "tier_counts":    anomaly.tier_counts(catalog_windows),
+                "matlab_reason":  anomaly.matlab_unavailable_reason(),
+                "catalog_exists": bool(catalog_windows),
+            },
             parent=self,
         )
         if not dlg.exec():
             return
 
-        tasks = dlg.build_tasks(self._task_stack)
+        # "Anomaly windows" target: materialise a job from the catalog NOW, so
+        # the generated tasks have a real job to resolve against at plan time.
+        anomaly_job = None
+        if dlg.wants_anomaly_target():
+            anomaly_job = self._create_anomaly_job(catalog_windows, dlg.anomaly_tiers())
+            if anomaly_job is None:
+                return
+
+        tasks = dlg.build_tasks(self._task_stack, anomaly_job=anomaly_job)
         if not tasks:
             QMessageBox.information(self, "Nothing to run", "No tasks were generated.")
             return
@@ -2850,6 +3174,31 @@ class MainWindow(QMainWindow):
             "Yellow = pending job  ·  Blue = manual history  ·  Green = threshold history"
         )
         header_row.addWidget(self.viz_history_mode_button)
+
+        # Anomaly tier colour-coding toggle + legend.  The bands themselves are
+        # pushed by the Anomalies tab; this switch controls their visibility from
+        # the map view so the trackline can be read with or without them.
+        self.viz_anomaly_tier_check = QCheckBox("Anomaly tiers")
+        self.viz_anomaly_tier_check.setChecked(True)
+        self.viz_anomaly_tier_check.setToolTip(
+            "Colour-code the trackline by anomaly confidence tier "
+            "(HIGH / MODERATE / SCREEN) from the loaded anomaly catalog."
+        )
+        self.viz_anomaly_tier_check.stateChanged.connect(
+            lambda _=None: self._anomaly_update_map()
+        )
+        header_row.addWidget(self.viz_anomaly_tier_check)
+
+        self.viz_anomaly_legend = QLabel()
+        self.viz_anomaly_legend.setTextFormat(Qt.RichText)
+        self.viz_anomaly_legend.setStyleSheet("font-size: 10px; padding: 0 6px;")
+        self.viz_anomaly_legend.setText(
+            "<b><span style='color:#c62828'>■</span> HIGH "
+            "<span style='color:#ef7d00'>■</span> MODERATE "
+            "<span style='color:#3d6ea8'>■</span> SCREEN</b>"
+        )
+        header_row.addWidget(self.viz_anomaly_legend)
+
         header_row.addWidget(QLabel("Scale:"))
         self.map_scale_combo = QComboBox()
         self.map_scale_combo.addItems(["° Lat / Lon", "m Meters"])
@@ -5199,6 +5548,23 @@ class MainWindow(QMainWindow):
         self.log_text.append(f"Output failed: {message}")
         QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Output failed", message))
 
+    def _on_sensor_queue_step_done(self, paths: list) -> None:
+        """One per-channel output finished — collect its paths, run the next.
+
+        A bound method (not a lambda) so PySide6 queues it onto the MAIN thread;
+        the continuation creates a QThread and updates widgets, both of which are
+        illegal from the worker thread.  See _run_sensor_queue for the details.
+        """
+        state = getattr(self, "_sensor_queue_state", None)
+        if not state:
+            return
+        state["results"].extend(paths)
+        self._run_sensor_queue(
+            state["task_name"], state["queue"], state["params"], state["results"],
+            state["done_title"], state["done_status"],
+            state["done_msg_fn"], state["per_channel_log_fn"],
+        )
+
     def _run_sensor_queue(
         self,
         task_name: str,
@@ -5211,6 +5577,7 @@ class MainWindow(QMainWindow):
         per_channel_log_fn,
     ) -> None:
         if not queue:
+            self._sensor_queue_state = None
             msg = done_msg_fn(results)
             self.log_text.append(msg)
             self._status_label.setText(done_status)
@@ -5236,19 +5603,25 @@ class MainWindow(QMainWindow):
             if self.output_worker is _worker:
                 self.output_worker = None
 
+        # Continuation state for the next queue step.  Stashed on self rather
+        # than captured in a lambda because a signal connected to a LAMBDA (or
+        # any plain function) runs on the EMITTING thread; only bound methods of
+        # a QObject and real C++ slots are auto-queued to the main thread.  This
+        # continuation creates a QThread parented to this window and mutates
+        # widgets, so running it on the worker thread aborts the process with
+        # "Cannot create children for a parent that is in a different thread".
+        self._sensor_queue_state = {
+            "task_name": task_name, "queue": queue, "params": params,
+            "results": results, "done_title": done_title,
+            "done_status": done_status, "done_msg_fn": done_msg_fn,
+            "per_channel_log_fn": per_channel_log_fn,
+        }
+
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.log.connect(self._append_log)
         worker.error.connect(self._on_output_error)
-        worker.finished.connect(
-            lambda paths: (
-                results.extend(paths),
-                self._run_sensor_queue(
-                    task_name, queue, params, results,
-                    done_title, done_status, done_msg_fn, per_channel_log_fn,
-                ),
-            )
-        )
+        worker.finished.connect(self._on_sensor_queue_step_done)   # bound → main thread
         worker.finished.connect(thread.quit)
         worker.error.connect(thread.quit)
         thread.finished.connect(_cleanup_this_thread)
@@ -5616,6 +5989,17 @@ class MainWindow(QMainWindow):
         elif tab_text == "Jobs":
             self.center_stack.setCurrentIndex(2)
             self._refresh_map()
+        elif tab_text == "Anomalies":
+            # Same map panel as Jobs — the anomaly tier bands are drawn on it.
+            self.center_stack.setCurrentIndex(2)
+            self._refresh_map()
+            # Load any catalog already on disk the first time the tab is opened,
+            # so reopening a workspace shows its anomalies without a re-run.
+            if not self._anomaly_loaded:
+                self._anomaly_loaded = True
+                self._anomaly_reload()
+            else:
+                self._anomaly_update_map()
         elif tab_text == "Manual Intervals":
             self.center_stack.setCurrentIndex(3)
             self._refresh_manual_map()
@@ -6664,11 +7048,24 @@ class MainWindow(QMainWindow):
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
+            from matplotlib.collections import LineCollection
+            from matplotlib.colors import LinearSegmentedColormap, Normalize, LogNorm
+            from matplotlib.cm import ScalarMappable
         except ImportError:
             QMessageBox.critical(self, "Missing dependency",
                                  "matplotlib is required for map export.\n"
                                  "Install it with: pip install matplotlib")
             return
+
+        # Same red → yellow → green → cyan → blue ramp the on-screen trackline
+        # uses (MapWidget._altitude_color), so the export matches the display.
+        cmap = LinearSegmentedColormap.from_list("epr_sensor", [
+            (0.00, (220 / 255,   0 / 255,   0 / 255)),
+            (0.25, (220 / 255, 220 / 255,   0 / 255)),
+            (0.50, (  0 / 255, 200 / 255,   0 / 255)),
+            (0.75, (  0 / 255, 210 / 255, 210 / 255)),
+            (1.00, (  0 / 255,   0 / 255, 210 / 255)),
+        ])
 
         try:
             rdf = self._raster_df
@@ -6764,8 +7161,8 @@ class MainWindow(QMainWindow):
             n = len(rdf)
             ts_range = ""
             if n > 0:
-                t0 = datetime.utcfromtimestamp(float(rdf["unix_time"].iloc[0]))
-                t1 = datetime.utcfromtimestamp(float(rdf["unix_time"].iloc[-1]))
+                t0 = utc_from_timestamp(float(rdf["unix_time"].iloc[0]))
+                t1 = utc_from_timestamp(float(rdf["unix_time"].iloc[-1]))
                 ts_range = f"  |  {t0.strftime('%Y-%m-%d %H:%M')} – {t1.strftime('%H:%M')}"
             ax.set_title(f"Sensor Raster: {sensor_label}{ts_range}", fontsize=12, pad=10)
 
@@ -6816,9 +7213,6 @@ class MainWindow(QMainWindow):
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
-            from matplotlib.collections import LineCollection
-            from matplotlib.colors import LinearSegmentedColormap, Normalize, LogNorm
-            from matplotlib.cm import ScalarMappable
         except ImportError:
             QMessageBox.critical(self, "Missing dependency",
                                  "matplotlib is required for map export.\n"
@@ -6826,14 +7220,9 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            # ---- Build the custom red → yellow → green → cyan → blue colormap ----
-            cmap = LinearSegmentedColormap.from_list("epr_sensor", [
-                (0.00, (220 / 255,   0 / 255,   0 / 255)),
-                (0.25, (220 / 255, 220 / 255,   0 / 255)),
-                (0.50, (  0 / 255, 200 / 255,   0 / 255)),
-                (0.75, (  0 / 255, 210 / 255, 210 / 255)),
-                (1.00, (  0 / 255,   0 / 255, 210 / 255)),
-            ])
+            # This map draws a plain nav trackline plus a frame scatter — no
+            # value-mapped colouring, so no colormap/normaliser is needed here.
+            # (The sensor-coloured export is _raster_export_map.)
 
             # ---- Load GPS trackline ----
             nav_lats = nav_lons = nav_times = np.array([])
@@ -6993,15 +7382,15 @@ class MainWindow(QMainWindow):
 
     def _on_track_pick_point_placed(self, unix_t: float) -> None:
         """Handle the first click in pick mode: update the status label with the start time."""
-        dt_str = datetime.utcfromtimestamp(unix_t).strftime("%H:%M:%S")
+        dt_str = utc_from_timestamp(unix_t).strftime("%H:%M:%S")
         self.viz_pick_status_label.setText(f"Start: {dt_str} — now click the end point on the track.")
         self.viz_pick_status_label.setStyleSheet("font-size: 10px; color: #e67e22; font-weight: bold;")
 
     def _on_track_interval_picked(self, t_start: float, t_end: float) -> None:
         """Handle the completed two-click interval pick: add interval to the pending job."""
         self.viz_pick_interval_button.setChecked(False)
-        start_dt = datetime.utcfromtimestamp(t_start)
-        end_dt   = datetime.utcfromtimestamp(t_end)
+        start_dt = utc_from_timestamp(t_start)
+        end_dt   = utc_from_timestamp(t_end)
         self.pending_job.intervals.append(SelectedTimeRange(start_time=start_dt, end_time=end_dt))
         self._refresh_job_builder_ui()
         self._refresh_summary()
@@ -7708,7 +8097,7 @@ class MainWindow(QMainWindow):
 
     def _on_manual_pick_point_placed(self, unix_t: float) -> None:
         """Update status label when the first pick point is placed."""
-        dt_str = datetime.utcfromtimestamp(unix_t).strftime("%H:%M:%S")
+        dt_str = utc_from_timestamp(unix_t).strftime("%H:%M:%S")
         self.manual_pick_status.setText(
             f"Start: {dt_str} — now click the end point."
         )
@@ -7717,8 +8106,8 @@ class MainWindow(QMainWindow):
     def _on_manual_interval_picked(self, t_start: float, t_end: float) -> None:
         """Handle a completed two-click interval pick on the manual map."""
         self.manual_pick_button.setChecked(False)
-        start_dt = datetime.utcfromtimestamp(t_start)
-        end_dt   = datetime.utcfromtimestamp(t_end)
+        start_dt = utc_from_timestamp(t_start)
+        end_dt   = utc_from_timestamp(t_end)
         interval = SelectedTimeRange(start_time=start_dt, end_time=end_dt, source="manual")
         self._manual_staged.append(interval)
         self._refresh_manual_staged_list()

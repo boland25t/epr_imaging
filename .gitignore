@@ -23,14 +23,26 @@ Thumbs.db
 .claude/
 workspace/
 *workspace*.json
+job_*/
+anomaly_site_catalog/
+BioIntervals/
 
 # --- Generated GrapherMatrix outputs (regenerable; too large / not source) ---
 # Result caches: hundreds of MB each, exceed GitHub's 100 MB limit.
 grapher_matrix_results.mat
 grapher_matrix_results_*.mat
+*_results.mat
 # Assembled report PDFs (large; rebuild with BuildReportPDF.m).
 GrapherMatrix_Report.pdf
 GrapherMatrix_AllPlots.pdf
+# Generated analysis/report trees.
+grapher_matrix_figs/
+archive/
+*.qgs
+# Keep the curated handbook under docs/reports, but ignore generated PDFs
+# everywhere else.
+*.pdf
+!docs/reports/EPR_Imaging_Complete_Software_Documentation.pdf
 # Per-channel classified-event exports (regenerated each run).
 anomaly_events_*.csv
 # Figure PNGs are intentionally KEPT tracked so results are browsable on GitHub.
@@ -45,3 +57,5 @@ interp.csv
 *.csv.lon_zero.bak
 # Generated point-cloud outputs
 *.ply
+# Generated raster/image slices from the legacy 3-D example.
+3dvistool/slices/

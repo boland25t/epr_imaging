@@ -1,4 +1,4 @@
-"""Run this once before building the installer to generate installer\app_icon.ico.
+r"""Run this once before building the installer to generate installer\app_icon.ico.
 
 Usage (from the installer\ folder):
     python create_icon.py

@@ -25,7 +25,8 @@
 from __future__ import annotations
 
 import math                    # math.cos/radians used in equirectangular projection
-from datetime import datetime  # datetime.utcfromtimestamp() for tooltip GPS time display
+from datetime import datetime  # utc_from_timestamp() for tooltip GPS time display
+from timeutil import utc_from_timestamp   # naive-UTC drop-ins for the deprecated datetime APIs
 from typing import Optional    # Optional[X] used for nullable type hints
 
 import numpy as np             # Array math for distance calculations in hover/click handlers
@@ -278,6 +279,12 @@ class MapWidget(QWidget):
         # video coverage: red where a video covers the timestamp, blue where not.
         # Only applies when sensor colouring is OFF.
         self._color_by_video_coverage: bool = False
+
+        # Anomaly bands: (start_unix, end_unix, color_hex, tier) drawn over the
+        # trackline so anomalous stretches are visible by confidence tier.  Kept
+        # separate from _trackline_segment_ranges (job segments) so the two
+        # overlays never clobber each other; drawn under them by Z-order.
+        self._anomaly_ranges: list[tuple[float, float, str, str]] = []
 
         # -----------------------------------------------------------------------
         # State: two-click pick mode
@@ -623,6 +630,23 @@ class MapWidget(QWidget):
         self._trackline_segment_ranges = list(ranges)
         self._redraw()
 
+    def set_anomaly_ranges(
+        self, ranges: list[tuple[float, float, str, str]]
+    ) -> None:
+        """Colour-code the trackline by anomaly confidence tier.
+
+        Each range draws a band over the nav trackline points whose unix_times
+        fall within [start_unix, end_unix].  Bands are drawn in tier order by the
+        caller (SCREEN first, HIGH last) so the most severe tier wins where
+        anomaly windows overlap.
+
+        Args:
+            ranges: List of (start_unix, end_unix, color_hex, tier) tuples.
+                    Pass an empty list to clear the anomaly overlay.
+        """
+        self._anomaly_ranges = list(ranges)
+        self._redraw()
+
     def set_history_ranges(
         self, ranges: list[tuple[float, float, str, str]]
     ) -> None:
@@ -956,6 +980,27 @@ class MapWidget(QWidget):
             )
             self._plot.addItem(self._trackline_item)
 
+        # --- Layer 1a2: Anomaly confidence-tier bands ---
+        # Drawn beneath job segments (Z=0.5 vs 1) so an active job selection stays
+        # readable on top of the anomaly context.
+        if (has_nav
+                and self._anomaly_ranges
+                and len(self._nav_unix_times) == len(self._nav_px) > 0):
+            for start_u, end_u, color, _tier in self._anomaly_ranges:
+                i0 = max(0, int(np.searchsorted(self._nav_unix_times, start_u, side="left")) - 1)
+                i1 = min(len(self._nav_unix_times),
+                         int(np.searchsorted(self._nav_unix_times, end_u, side="right")) + 1)
+                if i1 - i0 >= 2:
+                    item = pg.PlotCurveItem(
+                        x=self._nav_px[i0:i1],
+                        y=self._nav_py[i0:i1],
+                        pen=pg.mkPen(color=color, width=self._nav_trackline_width + 3),
+                        connect="all",
+                        antialias=False,
+                    )
+                    item.setZValue(0.5)
+                    self._plot.addItem(item)
+
         # --- Layer 1b: Segment trackline highlights ---
         # Use searchsorted (nav times are sorted) so frame timestamps that fall
         # *between* GPS samples still produce a visible highlight.  Expand by one
@@ -1191,7 +1236,7 @@ class MapWidget(QWidget):
                 self._tooltip.show()
                 return
 
-            dt_str = datetime.utcfromtimestamp(unix_t).strftime("%Y-%m-%d %H:%M:%S")
+            dt_str = utc_from_timestamp(unix_t).strftime("%Y-%m-%d %H:%M:%S")
             lat    = float(self._nav_lats[nav_idx])
             lon    = float(self._nav_lons[nav_idx])
             lines  = [

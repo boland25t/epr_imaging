@@ -76,7 +76,7 @@ python app.py
 ```
 
 Full two-instance setup (production install + editable dev clone, native
-Windows vs. WSL) is in [`DEV_SETUP.md`](DEV_SETUP.md).
+Windows vs. WSL) is in [`docs/DEV_SETUP.md`](docs/DEV_SETUP.md).
 
 ### Optional photogrammetry engines
 
@@ -84,11 +84,14 @@ Windows vs. WSL) is in [`DEV_SETUP.md`](DEV_SETUP.md).
 - **Metashape Professional** — install it and `pip install` Agisoft's Metashape
   Python 3 module into the venv; then it's detected and driven headlessly.
   (Not importable from WSL unless a Linux Metashape is installed there — see
-  [`DEV_SETUP.md`](DEV_SETUP.md).)
+  [`docs/DEV_SETUP.md`](docs/DEV_SETUP.md).)
 
 ---
 
 ## Docs
 
-- [`DEV_SETUP.md`](DEV_SETUP.md) — dev environments, two-instance model, shipping checklist
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — current system architecture
+- [`docs/DEV_SETUP.md`](docs/DEV_SETUP.md) — dev environments, two-instance model, shipping checklist
+- [`docs/anomaly/`](docs/anomaly/) — anomaly detector design notes
+- [`docs/reports/EPR_Imaging_Complete_Software_Documentation.pdf`](docs/reports/EPR_Imaging_Complete_Software_Documentation.pdf) — complete software handbook
 - [`installer/BUILD.md`](installer/BUILD.md) — building the Windows installer

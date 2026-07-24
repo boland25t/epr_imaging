@@ -31,6 +31,7 @@ import calendar    # calendar.timegm() converts a naive (UTC) timetuple to a Uni
                    # without applying any local-timezone offset — critical for correctness
 from dataclasses import dataclass, field  # dataclass decorator; field() for mutable defaults
 from datetime import datetime              # Used for wall-clock arithmetic and UTC conversions
+from timeutil import utc_from_timestamp, utc_now   # naive-UTC drop-ins for the deprecated datetime APIs
 from pathlib import Path                   # Cross-platform path handling throughout
 from typing import Callable               # Used in the LogFn type alias
 import logging                             # Module-level logger; mirrors progress to the Python log
@@ -1002,8 +1003,8 @@ class PipelineService:
                     j += 1
                 duration = times[j - 1] - times[i] if j > i else 0.0
                 if duration >= min_duration_s:
-                    start_dt = datetime.utcfromtimestamp(float(times[i]))
-                    end_dt   = datetime.utcfromtimestamp(float(times[j - 1]))
+                    start_dt = utc_from_timestamp(float(times[i]))
+                    end_dt   = utc_from_timestamp(float(times[j - 1]))
                     desc_parts = []
                     for c in constraints:
                         lo = f"≥{c['min_val']:.3g}" if c.get("min_val") is not None else ""
@@ -1194,13 +1195,13 @@ class PipelineService:
                 # falls within the requested interval (safeguard against
                 # seeks landing on a slightly different frame due to keyframes).
                 frame_offset_s = frame_idx / video_fps
-                frame_dt       = datetime.utcfromtimestamp(video_start_raw + frame_offset_s)
+                frame_dt       = utc_from_timestamp(video_start_raw + frame_offset_s)
                 if not (interval_start <= frame_dt < interval_end):
                     continue
                 unix_time = video_start_raw + frame_offset_s
 
                 # Build the output filename: [video_stem]_[YYYYMMDDTHHMMSS_mmm].jpg
-                ts_dt = datetime.utcfromtimestamp(unix_time)
+                ts_dt = utc_from_timestamp(unix_time)
                 ts_str = ts_dt.strftime("%Y%m%dT%H%M%S") + f"_{ts_dt.microsecond // 1000:03d}"
                 fname = f"{video.path.stem}_{ts_str}.jpg"
                 fpath = output_dir / fname
@@ -1616,7 +1617,7 @@ class PipelineService:
                 if not ok or frame is None:
                     continue
 
-                ts_dt = datetime.utcfromtimestamp(unix_time)
+                ts_dt = utc_from_timestamp(unix_time)
                 ts_str = ts_dt.strftime("%Y%m%dT%H%M%S") + f"_{ts_dt.microsecond // 1000:03d}"
                 fname = f"{video.path.stem}_{ts_str}.jpg"
                 fpath = output_dir / fname
@@ -2426,6 +2427,6 @@ class PipelineService:
                 interval=interval,
                 output_path=str(output_dir),
                 status=status,
-                processed_at=datetime.utcnow(),
+                processed_at=utc_now(),
             )
             config.segment_completed_callback(record)

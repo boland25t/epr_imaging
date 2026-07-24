@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field  # dataclass decorator + field() for mutable defaults
 from datetime import datetime             # Used to store parsed timestamps as naive UTC datetimes
+from timeutil import utc_now   # naive-UTC drop-ins for the deprecated datetime APIs
 from pathlib import Path                  # Cross-platform file-path handling
 from typing import Any                    # Used in to_dict() return types for JSON-serialisable dicts
 
@@ -480,7 +481,7 @@ class ThresholdConfig:
         return ThresholdConfig(
             constraints=[ThresholdConstraint.from_dict(c) for c in d.get("constraints", [])],
             result_count=int(d.get("result_count", 0)),
-            created_at=datetime.fromisoformat(d["created_at"]) if d.get("created_at") else datetime.utcnow(),
+            created_at=datetime.fromisoformat(d["created_at"]) if d.get("created_at") else utc_now(),
         )
 
 
@@ -584,7 +585,7 @@ class PhotogrammetryRun:
     output_dir:   str                        # run_NNN directory written to disk
     products:     dict[str, str] = field(default_factory=dict)
     status:       str            = "pending" # "pending"|"running"|"complete"|"failed"
-    created_at:   datetime       = field(default_factory=datetime.utcnow)
+    created_at:   datetime       = field(default_factory=utc_now)
     completed_at: datetime | None = None
     error_msg:    str            = ""
 
@@ -614,7 +615,7 @@ class PhotogrammetryRun:
             output_dir=d.get("output_dir", ""),
             products=dict(d.get("products", {})),
             status=d.get("status", "pending"),
-            created_at=datetime.fromisoformat(d["created_at"]) if d.get("created_at") else datetime.utcnow(),
+            created_at=datetime.fromisoformat(d["created_at"]) if d.get("created_at") else utc_now(),
             completed_at=datetime.fromisoformat(d["completed_at"]) if d.get("completed_at") else None,
             error_msg=d.get("error_msg", ""),
         )
@@ -657,10 +658,11 @@ TASK_INFO: dict[str, dict] = {
     "photogrammetry":       {"label": "Photogrammetry",              "requires": ["video"],                "per_channel": False, "category": "Photogrammetry"},
     "qgis_project":         {"label": "QGIS Project (.qgs)",         "requires": ["interp"],               "per_channel": False, "category": "Export"},
     "qc_report":            {"label": "Data QC Report",              "requires": ["interp"],               "per_channel": False, "category": "Export"},
+    "anomaly_detect":       {"label": "Anomaly Detection + Catalog", "requires": ["interp"],               "per_channel": False, "category": "Anomaly"},
 }
 
 # Order the Create-Task menu groups appear in.
-TASK_CATEGORIES: list[str] = ["Prepare", "Sampling", "Outputs", "Photogrammetry", "Export"]
+TASK_CATEGORIES: list[str] = ["Prepare", "Sampling", "Outputs", "Photogrammetry", "Anomaly", "Export"]
 
 
 @dataclass

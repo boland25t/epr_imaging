@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from timeutil import utc_now   # naive-UTC drop-ins for the deprecated datetime APIs
 from pathlib import Path
 from typing import Any
 
@@ -406,7 +407,7 @@ class ConfigService:
                 interval=ConfigService._load_interval(rec["interval"]),
                 output_path=rec.get("output_path", ""),
                 status=rec.get("status", "completed"),
-                processed_at=ConfigService._parse_dt(rec.get("processed_at")) or datetime.utcnow(),
+                processed_at=ConfigService._parse_dt(rec.get("processed_at")) or utc_now(),
                 settings_snapshot=rec.get("settings_snapshot", {}),
             ))
 

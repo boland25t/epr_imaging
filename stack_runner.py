@@ -399,6 +399,9 @@ class StackWorker(QObject):
         if product == "frame_stats":
             return self._run_frame_stats(svc, step)
 
+        if product == "anomaly_detect":
+            return self._run_anomaly_detect(step, kwargs)
+
         if product in ("sensor_slices", "nav_slices"):
             return self._run_slices(svc, step, kwargs)
 
@@ -489,6 +492,90 @@ class StackWorker(QObject):
         svc = PipelineService(log_fn=self._emit)
         svc.run(config)
         return [str(interp)] if (interp is not None and interp.exists()) else []
+
+    def _run_anomaly_detect(self, step: dict, kwargs: dict) -> list[str]:
+        """Run the anomaly DETECTOR (MATLAB) and/or the site CATALOG (Python).
+
+        kwargs:
+          run_detector (bool)  run GrapherMatrix + the two exporters via MATLAB.
+                               Skipped with a clear reason when MATLAB is absent,
+                               so the catalog can still rebuild from existing CSVs.
+          run_catalog  (bool)  build windows/sites/clips + GeoJSON + QGIS + PDF.
+          interp_path  (str)   sensor table to analyse (default workspace interp_full.csv)
+          raw_nav_path (str)   1 Hz nav CSV for window positions (optional)
+          out_dir      (str)   catalog output dir (default <workspace>/anomaly_site_catalog)
+        """
+        import anomaly_service as anomaly
+
+        # Workspace comes from kwargs (the plan supplies it directly for this
+        # task type) or from an attached config, whichever is present.
+        config = step.get("config")
+        ws_raw = kwargs.get("workspace_dir") or (
+            getattr(config, "workspace_directory", "") if config else ""
+        )
+        ws = Path(str(ws_raw)) if ws_raw else None
+        repo = Path(__file__).resolve().parent
+
+        # Prefer an explicit path, else the workspace's interp_full.csv.  When
+        # neither exists, pass None so the builder falls back to its configured
+        # default rather than being pointed at a file that isn't there.
+        interp_path = kwargs.get("interp_path") or ((ws / "interp_full.csv") if ws else None)
+        interp_path = Path(interp_path) if interp_path else None
+        if interp_path is not None and not interp_path.is_file():
+            self._emit(f"      note: {interp_path} not found — using the builder default")
+            interp_path = None
+        raw_nav = kwargs.get("raw_nav_path") or None
+        out_dir = Path(kwargs.get("out_dir") or ((ws / "anomaly_site_catalog") if ws else repo / "anomaly_site_catalog"))
+        do_detector = bool(kwargs.get("run_detector", True))
+        do_catalog  = bool(kwargs.get("run_catalog", True))
+
+        self._emit(f"      interp       : {interp_path}")
+        self._emit(f"      catalog out  : {out_dir}")
+
+        outputs: list[str] = []
+        cancel_cb = lambda: self._abort          # noqa: E731 — honour the stack abort flag
+
+        if do_detector:
+            reason = anomaly.matlab_unavailable_reason()
+            if reason:
+                # Degrade gracefully: say why, then fall through to the catalog.
+                self._emit(f"      DETECTOR SKIPPED — {reason}")
+            else:
+                self._emit("      running MATLAB detector chain (this is the long stage) …")
+                summary = anomaly.run_detector(
+                    repo=repo,
+                    interp_csv=interp_path,
+                    log_fn=self._emit,
+                    file_log_fn=self._file_write,
+                    cancel_cb=cancel_cb,
+                )
+                outputs.extend(summary.get("mat_files", []))
+
+        if self._abort:
+            self._emit("      aborted before catalog stage")
+            return outputs
+
+        if do_catalog:
+            self._emit("      building anomaly site catalog …")
+            summary = anomaly.run_catalog(
+                repo=repo,
+                interp_csv=interp_path,
+                raw_nav_csv=Path(raw_nav) if raw_nav else None,
+                out_dir=out_dir,
+                log_fn=self._emit,
+            )
+            self._emit(
+                f"      {summary['windows']} windows | {summary['high']} HIGH, "
+                f"{summary['moderate']} MODERATE, {summary['screen']} SCREEN "
+                f"across {summary['sites']} sites"
+            )
+            for key in ("report_pdf", "windows_csv", "sites_csv",
+                        "sites_geojson", "clips_csv", "qgis_zip"):
+                path = summary.get(key)
+                if path and Path(path).exists():
+                    outputs.append(str(path))
+
+        return outputs
 
     def _run_sampling(self, step: dict) -> list[str]:
         """Run a frame-extraction pipeline pass from a prebuilt PipelineConfig.

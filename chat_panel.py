@@ -366,7 +366,12 @@ class ChatPanel(QWidget):
         self._worker.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._worker.run)
         self._worker.chunk.connect(self._on_chunk)
-        self._worker.finished.connect(lambda full: self._on_finished(user_text, full))
+        # The pending user message is stashed rather than captured in a lambda:
+        # a signal connected to a LAMBDA runs on the EMITTING (worker) thread,
+        # and _on_finished mutates the chat history and re-enables buttons, which
+        # must happen on the main thread.  A bound method is auto-queued.
+        self._pending_user_text = user_text
+        self._worker.finished.connect(self._on_finished_slot)
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._worker_thread.quit)
         self._worker.error.connect(self._worker_thread.quit)
@@ -387,6 +392,11 @@ class ChatPanel(QWidget):
         else:
             self._streaming_text += text
         self._render_view()
+
+    def _on_finished_slot(self, full_response: str) -> None:
+        """Worker-finished sink (bound method ⇒ runs on the main thread)."""
+        self._on_finished(getattr(self, "_pending_user_text", ""), full_response)
+        self._pending_user_text = ""
 
     def _on_finished(self, user_msg: str, full_response: str) -> None:
         # Commit the turn to conversation history

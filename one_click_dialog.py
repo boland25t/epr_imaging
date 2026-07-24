@@ -2,15 +2,29 @@
 one_click_dialog.py — Guided builder for a complete processing pipeline.
 
 One dialog → a fully wired Task Stack → an immediate run.  The user picks the
-target (a job or the full dataset) and ticks the products they want; the
-dialog generates ordinary Task objects in dependency order:
+target (a job, the full dataset, or the anomaly windows) and ticks the products
+they want; the dialog generates ordinary Task objects in dependency order:
 
-    build_interp → job_interp → sampling → data products → photogrammetry
+    build_interp → anomaly_detect → job_interp → sampling → products → photogrammetry
 
 Photogrammetry is linked to the generated sampling task via depends_on, so the
 extracted frames flow straight into Metashape/COLMAP with no manual paths.
 The generated tasks land in the normal Task Stack and stay individually
 editable — One-Click is a task *generator*, not a separate execution path.
+
+Anomalies appear in two independent places:
+
+  * as a STEP  — an `anomaly_detect` task that (re)runs the MATLAB detector
+    and/or rebuilds the site catalog, report, spreadsheets and QGIS bundle;
+  * as a TARGET — "Anomaly windows", which turns the windows of an ALREADY
+    BUILT catalog into a job right when the stack is generated, so sampling,
+    products and photogrammetry all run on the anomalous stretches.
+
+Those are deliberately separate because `_build_task_plan()` resolves every
+task target BEFORE the stack runs: a task cannot target a job that a
+later-running task in the same stack creates.  So the target list is built from
+the catalog on disk, and a detector step queued in the same run refreshes that
+catalog for NEXT time.
 """
 
 from __future__ import annotations
@@ -67,6 +81,7 @@ class OneClickPipelineDialog(QDialog):
         channels: list[str],            # sensor channels from interp_full.csv
         availability: dict,             # from MainWindow._stack_data_availability
         interp_exists: bool,
+        anomaly_info: Optional[dict] = None,  # {"tier_counts", "matlab_reason", "catalog_exists"}
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -74,6 +89,7 @@ class OneClickPipelineDialog(QDialog):
         self._channels = channels
         self._avail = availability or {}
         self._interp_exists = interp_exists
+        self._anomaly = anomaly_info or {}
 
         # Prototype photogrammetry task: holds the full engine settings edited
         # via the existing TaskConfigDialog ("Configure…" button).  task_id 0 is
@@ -135,6 +151,49 @@ class OneClickPipelineDialog(QDialog):
         tgt_vbox.addWidget(self._job_list)
         self._tgt_jobs.toggled.connect(self._job_list.setEnabled)
         self._job_list.setEnabled(self._tgt_jobs.isChecked())
+
+        # ── Anomaly-window target ─────────────────────────────────────────
+        # Built from the catalog ON DISK at generation time (see module docstring
+        # for why it cannot come from a detector step in this same stack).
+        counts = self._anomaly.get("tier_counts") or {}
+        total = sum(counts.values())
+        self._tgt_anomaly = QRadioButton("Anomaly windows (from the built catalog)")
+        self._tgt_anomaly.setEnabled(total > 0)
+        tgt_vbox.addWidget(self._tgt_anomaly)
+
+        tier_row = QHBoxLayout()
+        tier_row.addSpacing(18)
+        self._anom_tier_checks: dict[str, QCheckBox] = {}
+        for tier, default_on in (("HIGH", True), ("MODERATE", False), ("SCREEN", False)):
+            cb = QCheckBox(f"{tier} ({counts.get(tier, 0)})")
+            cb.setChecked(default_on)
+            cb.setEnabled(total > 0)
+            self._anom_tier_checks[tier] = cb
+            tier_row.addWidget(cb)
+        tier_row.addStretch(1)
+        tgt_vbox.addLayout(tier_row)
+
+        self._anom_target_note = QLabel()
+        self._anom_target_note.setWordWrap(True)
+        self._anom_target_note.setStyleSheet("color: #888; font-size: 10px;")
+        if total > 0:
+            self._anom_target_note.setText(
+                f"{total} catalogued windows. Selected tiers become a new job "
+                "(each window padded by 120 s of review context), which the "
+                "steps below then run on."
+            )
+        else:
+            self._anom_target_note.setText(
+                "No anomaly catalog found. Tick “Run anomaly detection” below to "
+                "build one; it can then be used as a target on the next run."
+            )
+        tgt_vbox.addWidget(self._anom_target_note)
+
+        def _sync_tiers(on: bool) -> None:
+            for cb in self._anom_tier_checks.values():
+                cb.setEnabled(on and total > 0)
+        self._tgt_anomaly.toggled.connect(_sync_tiers)
+        _sync_tiers(self._tgt_anomaly.isChecked())
         vbox.addWidget(tgt_group)
 
         # ── Prepare ───────────────────────────────────────────────────────
@@ -159,6 +218,48 @@ class OneClickPipelineDialog(QDialog):
         self._job_interp_check.setChecked(bool(self._jobs))
         prep_form.addRow("", self._job_interp_check)
         vbox.addWidget(prep_group)
+
+        # ── Anomaly detection ─────────────────────────────────────────────
+        anom_group = QGroupBox("Anomaly detection")
+        anom_form = QFormLayout(anom_group)
+        matlab_reason = self._anomaly.get("matlab_reason")
+
+        self._anom_run_check = QCheckBox(
+            "Run anomaly detection (report, spreadsheets, GeoJSON, QGIS bundle)")
+        self._anom_run_check.setChecked(False)
+        anom_form.addRow("", self._anom_run_check)
+
+        self._anom_detector_check = QCheckBox(
+            "…including the MATLAB detector (long: recomputes the anomaly matrix)")
+        self._anom_detector_check.setChecked(not matlab_reason)
+        self._anom_detector_check.setEnabled(not matlab_reason)
+        if matlab_reason:
+            self._anom_detector_check.setToolTip(matlab_reason)
+        anom_form.addRow("", self._anom_detector_check)
+
+        self._anom_catalog_check = QCheckBox(
+            "…including the site catalog + PDF report")
+        self._anom_catalog_check.setChecked(True)
+        anom_form.addRow("", self._anom_catalog_check)
+
+        anom_note = QLabel(
+            "⚠ " + matlab_reason if matlab_reason else
+            "The catalog stage alone is fast; it reuses the existing detector "
+            "event CSVs. Newly detected windows become available as a TARGET on "
+            "the next One-Click run."
+        )
+        anom_note.setWordWrap(True)
+        anom_note.setStyleSheet(
+            "color: %s; font-size: 10px;" % ("#b26a00" if matlab_reason else "#888")
+        )
+        anom_form.addRow("", anom_note)
+
+        def _sync_anom(on: bool) -> None:
+            self._anom_detector_check.setEnabled(on and not matlab_reason)
+            self._anom_catalog_check.setEnabled(on)
+        self._anom_run_check.toggled.connect(_sync_anom)
+        _sync_anom(self._anom_run_check.isChecked())
+        vbox.addWidget(anom_group)
 
         # ── Sampling ──────────────────────────────────────────────────────
         samp_group = QGroupBox("Sampling (frame extraction)")
@@ -326,10 +427,27 @@ class OneClickPipelineDialog(QDialog):
                     "manual frame directory via 'Configure engine settings…'."
                 )
                 return
+        if self._tgt_anomaly.isChecked() and not self.anomaly_tiers():
+            QMessageBox.warning(
+                self, "No tiers selected",
+                "Targeting anomaly windows needs at least one confidence tier "
+                "(HIGH / MODERATE / SCREEN)."
+            )
+            return
+        if (self._anom_run_check.isChecked()
+                and not (self._anom_detector_check.isChecked()
+                         or self._anom_catalog_check.isChecked())):
+            QMessageBox.warning(
+                self, "Anomaly step does nothing",
+                "Enable the MATLAB detector stage, the catalog stage, or both — "
+                "or untick “Run anomaly detection”."
+            )
+            return
         anything = (self._build_interp_check.isChecked()
                     or self._job_interp_check.isChecked()
                     or self._sampling_check.isChecked()
                     or self._photo_check.isChecked()
+                    or self._anom_run_check.isChecked()
                     or any(cb.isChecked() for cb in self._product_checks.values()))
         if not anything:
             QMessageBox.warning(self, "Nothing selected",
@@ -353,6 +471,19 @@ class OneClickPipelineDialog(QDialog):
                 return {"kind": "jobs", "jobs": jobs}
         return {"kind": "full"}
 
+    # ---- anomaly accessors (read by MainWindow before build_tasks) --------
+
+    def wants_anomaly_target(self) -> bool:
+        """True when the generated tasks should run on the anomaly windows."""
+        return self._tgt_anomaly.isChecked()
+
+    def anomaly_tiers(self) -> list[str]:
+        """Confidence tiers to turn into the anomaly job."""
+        return [t for t, cb in self._anom_tier_checks.items() if cb.isChecked()]
+
+    def wants_anomaly_step(self) -> bool:
+        return self._anom_run_check.isChecked()
+
     def _selected_channels(self) -> list[str]:
         checked = [
             self._channel_list.item(i).text()
@@ -367,9 +498,20 @@ class OneClickPipelineDialog(QDialog):
 
     # ------------------------------------------------------------------
 
-    def build_tasks(self, stack: TaskStack) -> list[Task]:
-        """Generate the wired Task list (ids allocated from `stack`)."""
-        target   = self._target()
+    def build_tasks(self, stack: TaskStack,
+                    anomaly_job: Optional[dict] = None) -> list[Task]:
+        """Generate the wired Task list (ids allocated from `stack`).
+
+        Args:
+            stack: task stack used to allocate ids.
+            anomaly_job: {"job_id", "name"} of the job MainWindow created from
+                the anomaly windows.  Supplied when the user picked the
+                "Anomaly windows" target; every generated task then runs on it.
+        """
+        if anomaly_job:
+            target = {"kind": "jobs", "jobs": [dict(anomaly_job)]}
+        else:
+            target = self._target()
         channels = self._selected_channels()
         tasks: list[Task] = []
 
@@ -378,6 +520,18 @@ class OneClickPipelineDialog(QDialog):
                 task_id=stack.new_id(), task_type="build_interp",
                 target={"kind": "full"},
                 settings={"sample_hz": self._sample_hz.value()},
+            ))
+
+        # Anomaly detection runs early: it needs interp_full.csv and its outputs
+        # (report / spreadsheets / QGIS) are independent of the product steps.
+        if self._anom_run_check.isChecked():
+            tasks.append(Task(
+                task_id=stack.new_id(), task_type="anomaly_detect",
+                target={"kind": "full"},          # workspace-level, never per-job
+                settings={
+                    "run_detector": self._anom_detector_check.isChecked(),
+                    "run_catalog":  self._anom_catalog_check.isChecked(),
+                },
             ))
 
         if self._job_interp_check.isChecked() and target["kind"] == "jobs":

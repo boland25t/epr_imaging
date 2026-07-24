@@ -807,7 +807,9 @@ class PointCloudViewer(QMainWindow):
         self._potree_worker = worker
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.log.connect(lambda m: self.statusBar().showMessage(m))
+        # Bound method, not a lambda: a lambda would run on the WORKER thread and
+        # mutate the status bar from there.
+        worker.log.connect(self._on_potree_log)
         worker.finished.connect(self._on_potree_finished)
         worker.error.connect(self._on_potree_error)
         worker.finished.connect(thread.quit)
@@ -820,6 +822,10 @@ class PointCloudViewer(QMainWindow):
     def _clear_potree_worker(self) -> None:
         self._potree_thread = None
         self._potree_worker = None
+
+    def _on_potree_log(self, message: str) -> None:
+        """Potree conversion progress → status bar (main-thread slot)."""
+        self.statusBar().showMessage(message)
 
     def _on_potree_finished(self, target: str) -> None:
         import webbrowser

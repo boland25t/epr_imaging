@@ -1,12 +1,12 @@
 %% GrapherMatrix.m — 4 baselines x 4 detectors = 16 anomaly-detection strategies
 %
-% Companion to Grapher.m.  Grapher.m runs exactly TWO of these 16 strategies
-% (B1xD1 = its Approach A, B2xD1 = its Approach B); this script generalises the
+% Successor to the original Grapher prototype. That prototype ran exactly TWO
+% of these 16 strategies (B1xD1 and B2xD1); this script generalises the
 % baseline and the detector into swappable pieces and runs the full matrix so we
 % can see WHICH COMBINATIONS FLAG WHICH PARTS OF THE DATA.  There is no ground
 % truth here: the comparison is visual + overlap-based, not scored.
 %
-% Design contract (see GRAPHER_STRATEGY_MATRIX.md):
+% Design contract (see docs/anomaly/GRAPHER_STRATEGY_MATRIX.md):
 %   baseline(x, dt, opts)          -> b, sigma, degraded   (per contiguous segment)
 %   detector(x, b, sigma, dt, opts)-> logical anomaly mask
 % Both run WITHIN each valid segment via runWithinSegments(), which also carries
