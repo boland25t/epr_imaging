@@ -75,6 +75,9 @@ class PlanContext:
     outputs_root: Callable[[], str] = lambda: ""
     filtered_interp_for_job: Callable[[Job], str] = lambda job: ""
     job_output_dirname: Callable[[Job], str] = lambda job: ""
+    # Full product base directory for a job scope.  Owned by MainWindow because
+    # it depends on the workspace layout (legacy flat vs .eprproj bundle).
+    job_output_dir: Optional[Callable[[Job], str]] = None
 
     # Channel discovery (reads interp_full.csv when it exists)
     available_channels: Callable[[], list] = lambda: []
@@ -139,7 +142,12 @@ def scope_full(ctx: PlanContext) -> Scope:
 
 
 def scope_for_job(ctx: PlanContext, job: Job) -> Scope:
-    out_dir = str(Path(ctx.workspace_path) / ctx.job_output_dirname(job) / "outputs")
+    # Prefer the layout-aware resolver; fall back to the legacy flat formula so
+    # older callers/tests that don't supply job_output_dir keep working.
+    if ctx.job_output_dir is not None:
+        out_dir = str(ctx.job_output_dir(job))
+    else:
+        out_dir = str(Path(ctx.workspace_path) / ctx.job_output_dirname(job) / "outputs")
     return Scope(
         f"job_{job.job_id}",
         ctx.filtered_interp_for_job(job),
@@ -401,8 +409,13 @@ def build_plan(ctx: PlanContext, stack: TaskStack) -> PlanResult:
                     "texture_size":       int(s.get("texture_size", 4096)),
                     "texture_blending":   s.get("texture_blending", "Mosaic"),
                     "texture_fill_holes": bool(s.get("texture_fill_holes", True)),
+                    # DEM + orthomosaic (Metashape subprocess worker)
+                    "build_dem":          bool(s.get("build_dem", False)),
+                    "export_dem":         bool(s.get("export_dem", False)),
+                    "build_orthomosaic":  bool(s.get("build_orthomosaic", False)),
+                    "make_report":        bool(s.get("make_report", True)),
                     # Export & project
-                    "export_dense_ply": bool(s.get("export_dense_ply", True)),
+                    "export_dense_ply": bool(s.get("export_dense_ply", False)),  # ARCHIVED: dense PLY export off (dense build kept for mesh/DEM/ortho)
                     "export_mesh_obj":  bool(s.get("export_mesh_obj", False)),
                     "save_project":     bool(s.get("save_project", True)),
                     # Georeference

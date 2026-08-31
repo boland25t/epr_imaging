@@ -771,6 +771,8 @@ class MainWindow(QMainWindow):
         self.save_workspace_action  = file_menu.addAction("Save Workspace",   self._save_workspace)
         self.load_workspace_action  = file_menu.addAction("Load Workspace",   self._load_workspace)
         self.clear_workspace_action = file_menu.addAction("Clear Workspace",  self._clear_workspace)
+        self.migrate_workspace_action = file_menu.addAction(
+            "Migrate to .eprproj Bundle…", self._migrate_workspace_to_bundle)
         file_menu.addSeparator()
         self.save_config_action = file_menu.addAction("Save Config JSON", self._save_configuration)
         file_menu.addSeparator()
@@ -778,6 +780,13 @@ class MainWindow(QMainWindow):
         file_menu.addAction("Export Map…",        self._viz_export_map)
         file_menu.addSeparator()
         file_menu.addAction("Claude API Key…", self._show_api_key_dialog)
+
+        view_menu = menu_bar.addMenu("View")
+        self.product_browser_action = view_menu.addAction(
+            "Product Browser…", self._open_product_browser)
+        self.product_browser_action.setShortcut("Ctrl+B")
+        self.viewer_3d_action = view_menu.addAction("3D Viewer (overlays)…",
+                                                    self._open_3d_viewer)
 
         # Keep a no-op run_action attribute so existing code that references it
         # (e.g., _set_processing_enabled) doesn't crash.  It is never displayed.
@@ -1890,6 +1899,7 @@ class MainWindow(QMainWindow):
             outputs_root=self._outputs_root,
             filtered_interp_for_job=self._get_filtered_interp_for_job,
             job_output_dirname=self._job_output_dirname,
+            job_output_dir=self._job_products_dir,
             available_channels=self._stack_available_channels,
             build_interp_config=self._build_interp_config,
             build_sampling_config=self._build_sampling_config,
@@ -2194,7 +2204,9 @@ class MainWindow(QMainWindow):
             sample_images=False,
             selected_steps=["build_full_interp"],
             full_interp_sample_hz=float(task.settings.get("sample_hz", 1.0)),
-            workspace_directory=self.workspace_path,
+            # interp_full.csv is written into this dir; the resolver puts it at the
+            # workspace root (legacy) or inputs/ (.eprproj bundle).
+            workspace_directory=str(self._resolver().interp_full().parent),
         )
 
     def _build_sampling_config(self, task: "Task", job: "Job | None" = None,
@@ -2228,12 +2240,10 @@ class MainWindow(QMainWindow):
         # batch scopes don't collide.
         if job is not None:
             intervals = list(job.intervals)
-            out_name  = f"sampling_{task.task_id}_{self._job_output_dirname(job)}"
         else:
             starts = [v.start_time for v in self.videos]
             ends   = [v.end_time for v in self.videos]
             intervals = [SelectedTimeRange(start_time=min(starts), end_time=max(ends), source="stack_full")]
-            out_name  = f"sampling_{task.task_id}_full"
 
         if not intervals:
             if job is not None:
@@ -2250,7 +2260,7 @@ class MainWindow(QMainWindow):
         if s.get("annotate"):
             steps.append("annotate_frames")
 
-        out_dir = str(Path(self.workspace_path) / out_name)
+        out_dir = str(self._resolver().sampling_dir(task.task_id, job))
         return PipelineConfig(
             video_directory=Path(video_dir),
             output_directory=Path(out_dir),
@@ -2465,7 +2475,8 @@ class MainWindow(QMainWindow):
 
         from stack_runner import StackWorker
         thread = QThread(self)
-        worker = StackWorker(plan, log_file=log_file, skip_existing=skip_existing)
+        worker = StackWorker(plan, log_file=log_file, skip_existing=skip_existing,
+                             workspace_dir=self.workspace_path or None)
         self.stack_worker_thread = thread
         self.stack_worker        = worker
         worker.moveToThread(thread)
@@ -2821,6 +2832,7 @@ class MainWindow(QMainWindow):
         )
         s3d_layout.addRow(self.sensor_3d_generate_btn)
         layout.addWidget(s3d_group)
+        s3d_group.setVisible(False)   # ARCHIVED: sensor 3D point cloud (models.ARCHIVED_TASK_TYPES)
 
         # 3D Raster Slices — target-based; cell/agg/fill come from the selected 3D run
         s_slices_group = QGroupBox(
@@ -2927,6 +2939,7 @@ class MainWindow(QMainWindow):
         self.sensor_slices_generate_btn.setStyleSheet("font-weight: bold; padding: 6px;")
         s_slices_layout.addRow(self.sensor_slices_generate_btn)
         layout.addWidget(s_slices_group)
+        s_slices_group.setVisible(False)   # ARCHIVED: PNG depth slices (child of sensor_3d)
 
         # Depth-slice GeoTIFFs — geo-referenced plan-view rasters per depth band
         s_geo_slices_group = QGroupBox(
@@ -4778,6 +4791,75 @@ class MainWindow(QMainWindow):
             import traceback
             self.log_text.append(f"Could not restore last session: {exc}\n{traceback.format_exc()}")
 
+    def _create_bundle_skeleton(self, ws_dir, display_name: str = "") -> None:
+        """Create a new .eprproj bundle: skeleton dirs + a project.json marker."""
+        import json
+        from layout import WorkspaceLayout
+        from timeutil import utc_now
+        lo = WorkspaceLayout(ws_dir)
+        lo.inputs_dir(create=True)
+        lo.runs_dir(create=True)
+        lo.logs_dir(create=True)
+        (Path(ws_dir) / "jobs").mkdir(parents=True, exist_ok=True)
+        (Path(ws_dir) / "survey").mkdir(parents=True, exist_ok=True)
+        lo.project_json.write_text(json.dumps({
+            "schema": "eprproj",
+            "display_name": display_name or Path(ws_dir).stem,
+            "created_at": utc_now().isoformat(timespec="seconds"),
+        }, indent=1), encoding="utf-8")
+
+    def _migrate_workspace_to_bundle(self) -> None:
+        """Opt-in: copy the current legacy workspace into a new .eprproj bundle.
+
+        Non-destructive (copy-only) and shown to the user for confirmation before
+        anything is written — the original workspace is never touched."""
+        ws = (self.workspace_path or "").strip()
+        if not ws:
+            QMessageBox.information(self, "No workspace", "Load a workspace first.")
+            return
+        from workspace_paths import is_bundle
+        if is_bundle(ws):
+            QMessageBox.information(
+                self, "Already a bundle",
+                "This workspace is already an .eprproj bundle — nothing to migrate.")
+            return
+        import workspace_migrate as wm
+        target = wm.default_bundle_path(ws)
+        try:
+            plan = wm.build_migration_plan(ws, target)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Migration plan failed", str(exc))
+            return
+        if not plan:
+            QMessageBox.information(self, "Nothing to migrate",
+                                    "No recognizable products or inputs were found.")
+            return
+        summary = wm.summarize_plan(plan)
+        box = QMessageBox(self)
+        box.setWindowTitle("Migrate to .eprproj bundle")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Copy this workspace into a new bundle?\n\n{target}")
+        box.setInformativeText(
+            "Your existing workspace is NOT modified — this only copies its "
+            "products and inputs into the new layout.")
+        box.setDetailedText(summary)
+        box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        box.button(QMessageBox.Ok).setText("Copy to bundle")
+        if box.exec() != QMessageBox.Ok:
+            return
+        try:
+            result = wm.execute_plan(plan, project_json=wm.build_project_json(ws))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Migration failed", str(exc))
+            return
+        errs = result.get("errors") or []
+        msg = (f"Copied {result.get('copied', 0)} item(s) "
+               f"({result.get('bytes', 0) / 1e6:.1f} MB) into:\n{target}")
+        if errs:
+            msg += f"\n\n{len(errs)} item(s) could not be copied:\n" + "\n".join(str(e) for e in errs[:5])
+        QMessageBox.information(self, "Migration complete", msg)
+        self.log_text.append(f"Workspace migrated to bundle: {target}")
+
     def _save_workspace(self) -> None:
         """Save session state to the workspace directory.
 
@@ -4799,22 +4881,23 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Workspace save failed", str(exc))
             return
 
-        # No workspace yet — ask for a name and parent location.
-        import re as _re
+        # No workspace yet — ask for a name and parent location.  New workspaces
+        # are created as .eprproj bundles (the professional layout); existing
+        # plain-directory workspaces keep loading in legacy mode untouched.
         name, ok = QInputDialog.getText(
-            self, "Create Workspace", "Workspace folder name:", text="workspace"
+            self, "Create Workspace", "Workspace name:", text="workspace"
         )
         if not ok:
             return
-        name = _re.sub(r"[^\w\-]", "_", name.strip()).strip("_") or "workspace"
-        parent = QFileDialog.getExistingDirectory(self, "Select location for workspace folder")
+        parent = QFileDialog.getExistingDirectory(self, "Select location for workspace")
         if not parent:
             return
-        ws_dir = Path(parent) / name
+        from workspace_paths import default_bundle_dir
+        ws_dir = default_bundle_dir(name or "workspace", parent)
         try:
-            ws_dir.mkdir(parents=True, exist_ok=True)
+            self._create_bundle_skeleton(ws_dir, display_name=name)
         except Exception as exc:
-            QMessageBox.critical(self, "Workspace creation failed", f"Could not create folder:\n{exc}")
+            QMessageBox.critical(self, "Workspace creation failed", f"Could not create bundle:\n{exc}")
             return
         self.workspace_path = str(ws_dir)
         self._copy_inputs_to_workspace()
@@ -5227,15 +5310,27 @@ class MainWindow(QMainWindow):
     # Outputs tab helpers
     # -----------------------------------------------------------------------
 
+    def _resolver(self):
+        """PathResolver for the current workspace — the single seam that maps a
+        scope to a directory for either the legacy flat layout or a new .eprproj
+        bundle.  Legacy paths are reproduced byte-for-byte, so existing
+        workspaces are unaffected."""
+        from workspace_paths import PathResolver
+        return PathResolver(self.workspace_path)
+
     def _interp_full_path(self) -> str:
         """Return the expected path of interp_full.csv in the current workspace."""
         if not self.workspace_path:
             return ""
-        return str(Path(self.workspace_path) / "interp_full.csv")
+        return str(self._resolver().interp_full())
 
     def _outputs_root(self) -> str:
-        """Return the outputs directory inside the current workspace."""
-        return str(Path(self.workspace_path) / "outputs") if self.workspace_path else ""
+        """Return the survey (full-dataset) products directory in the workspace."""
+        return str(self._resolver().survey_products()) if self.workspace_path else ""
+
+    def _job_products_dir(self, job) -> str:
+        """Product base directory for a job's scope (resolver-routed)."""
+        return str(self._resolver().job_products(job)) if self.workspace_path else ""
 
     def _refresh_output_source_combo(self) -> None:
         """Repopulate the output source combo.
@@ -5354,9 +5449,9 @@ class MainWindow(QMainWindow):
         if not job.intervals:
             return interp_full
 
-        job_dir = Path(self.workspace_path) / self._job_output_dirname(job)
+        out_path  = self._resolver().job_filtered_interp(job)
+        job_dir = out_path.parent
         job_dir.mkdir(parents=True, exist_ok=True)
-        out_path  = job_dir / "filtered_interp.csv"
         meta_path = job_dir / "filtered_interp.meta.json"
         fingerprint = self._job_intervals_fingerprint(job)
 
@@ -5894,6 +5989,47 @@ class MainWindow(QMainWindow):
             "generate_qgis_project",
             project_name=self.qgis_project_name_edit.text().strip() or "EPR Survey",
         )
+
+    def _open_product_browser(self) -> None:
+        """Open the single-click Product Browser for the current workspace."""
+        ws = (self.workspace_path or "").strip()
+        if not ws:
+            QMessageBox.information(
+                self, "No workspace",
+                "Load or save a workspace first — the Product Browser lists the "
+                "products that belong to a dive's workspace.")
+            return
+        import product_browser
+        # Reuse a single browser instance; refresh it if already open.
+        existing = getattr(self, "_product_browser", None)
+        if existing is not None:
+            try:
+                existing._ws = ws
+                existing.reload()
+                existing.show(); existing.raise_(); existing.activateWindow()
+                return
+            except RuntimeError:
+                self._product_browser = None      # was closed/destroyed
+        self._product_browser = product_browser.open_product_browser(
+            self, ws, viewer_opener=self._open_ply_in_viewer)
+
+    def _open_3d_viewer(self) -> None:
+        """Open the 3D viewer; if the workspace has an interp_full.csv, offer to
+        drop the nav trackline in so the window isn't empty."""
+        from viewer_widget import get_viewer, viewer_available
+        if not viewer_available():
+            QMessageBox.information(
+                self, "Viewer not available",
+                "PyVista is not installed.\n\nInstall with:\n  pip install pyvista pyvistaqt")
+            return
+        viewer = get_viewer(parent=self)
+        viewer.show(); viewer.raise_()
+        interp = self._interp_full_path()
+        if interp and Path(interp).is_file() and not viewer._layers:
+            try:
+                viewer.add_trackline(interp, channel=None)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _open_ply_in_viewer(self, ply_path: str) -> None:
         """Open a PLY file in the singleton 3D viewer window."""

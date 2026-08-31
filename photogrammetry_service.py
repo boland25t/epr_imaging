@@ -33,6 +33,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -156,63 +157,82 @@ def detect_engines() -> dict[str, str | None]:
     }
 
 
-def _detect_metashape() -> str | None:
-    """Return a Metashape executable path if the Python module is importable.
+def metashape_driver() -> str | None:
+    """How Metashape can be driven here: "inprocess", "subprocess", or None.
 
-    The headless pipeline (run_metashape) drives Metashape through its Python
-    module, so the engine is only considered "available" when `import Metashape`
-    succeeds *in this interpreter*.  A Windows-only Metashape install is NOT
-    importable from a WSL/Linux Python — see metashape_unavailable_reason().
+    "inprocess"  — ``import Metashape`` works in this interpreter.
+    "subprocess" — the module can't be imported (e.g. the app runs under WSL)
+                   but a Windows metashape.exe is present, so the batch pipeline
+                   drives it via ``metashape.exe -r metashape_worker.py``.
+    None         — no usable Metashape at all.
     """
     try:
         import Metashape  # noqa: F401
-        return _find_metashape_exe()
+        return "inprocess"
     except ImportError:
-        return None
+        pass
+    return "subprocess" if _find_windows_metashape_exe() else None
+
+
+def _detect_metashape() -> str | None:
+    """Return a Metashape executable path when the engine is usable by ANY means.
+
+    Usable means either the Python module is importable in this interpreter, or
+    (the common WSL case) a Windows metashape.exe exists and the batch pipeline
+    can drive it as a subprocess.  See metashape_driver().
+    """
+    driver = metashape_driver()
+    if driver == "inprocess":
+        return _find_metashape_exe()
+    if driver == "subprocess":
+        return _find_windows_metashape_exe()
+    return None
 
 
 def metashape_unavailable_reason() -> str | None:
     """Explain why the Metashape engine is unavailable, or None if it's usable.
 
-    Distinguishes the common WSL pitfall (Metashape installed on the Windows
-    host but not importable from the Linux Python running this app) from a
-    plain "not installed" so the UI can give actionable guidance.
+    Returns None whenever Metashape can be driven either in-process OR via the
+    Windows-exe subprocess path (which works from WSL).  Only returns a message
+    when neither is possible.
     """
-    try:
-        import Metashape  # noqa: F401
-        return None  # importable → available
-    except ImportError:
-        pass
-    win_exe = _find_windows_metashape_exe()
-    if _is_wsl() and win_exe:
-        return (
-            "Metashape is installed on the Windows host but cannot be imported "
-            "from the Linux (WSL) Python running this app. The headless pipeline "
-            "needs the Metashape Python module in *this* interpreter. Run the app "
-            "on Windows (where the installer targets it), or install Metashape for "
-            "Linux inside WSL. COLMAP works either way."
-        )
+    if metashape_driver() is not None:
+        return None
     return (
-        "Metashape Python module not found. Install Metashape Professional and "
-        "its Python module, or use the COLMAP engine instead."
+        "No Metashape found. Install Agisoft Metashape Professional (the app can "
+        "drive a Windows install from WSL via metashape.exe), or use the COLMAP "
+        "engine instead."
     )
 
 
 def _find_windows_metashape_exe() -> str | None:
-    """Locate a Windows Metashape.exe, including via /mnt/c when under WSL."""
-    bases = [
-        r"C:\Program Files\Agisoft\Metashape Professional",
-        r"C:\Program Files (x86)\Agisoft\Metashape Professional",
+    """Locate a Windows Metashape.exe, including via /mnt/c when under WSL.
+
+    Agisoft has shipped the folder under several names over the years
+    ("Metashape Professional", "Metashape Pro", "Metashape").  Rather than
+    hardcode one, glob every "Agisoft\\*" directory under each Program Files
+    root and look for metashape.exe (case-insensitive) inside it.  This is what
+    fixed the WSL install here, which lives in "Agisoft\\Metashape Pro".
+    """
+    program_dirs = [
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
     ]
-    roots = [Path(b) for b in bases]
+    roots = [Path(p) for p in program_dirs]
     if _is_wsl():
-        # Translate C:\... → /mnt/c/... so we can see the Windows install.
-        roots += [Path("/mnt/c/Program Files/Agisoft/Metashape Professional"),
-                  Path("/mnt/c/Program Files (x86)/Agisoft/Metashape Professional")]
+        roots += [Path("/mnt/c/Program Files"), Path("/mnt/c/Program Files (x86)")]
+
     for root in roots:
-        exe = root / "Metashape.exe"
-        if exe.exists():
-            return str(exe)
+        agisoft = root / "Agisoft"
+        if not agisoft.is_dir():
+            continue
+        for sub in sorted(agisoft.iterdir()):
+            if not sub.is_dir():
+                continue
+            for name in ("metashape.exe", "Metashape.exe"):
+                exe = sub / name
+                if exe.exists():
+                    return str(exe)
     return None
 
 
@@ -416,7 +436,7 @@ def run_metashape(
     texture_blending: str = "Mosaic",
     texture_fill_holes: bool = True,
     # Export
-    export_dense_ply: bool = True,
+    export_dense_ply: bool = False,   # ARCHIVED deliverable; dense build stays on
     export_mesh_obj: bool = False,
     # Georeference
     nav_csv: Optional[str] = None,
@@ -709,7 +729,213 @@ def _process_metashape_chunk(Metashape, doc, chunk, run_dir, *, api, major,
     return products
 
 
-def run_metashape_batch(
+def _to_windows_path(p) -> str:
+    """Translate a path to the form a native Windows Metashape process needs.
+
+    Under WSL, ``wslpath -w`` maps /home/... → \\\\wsl.localhost\\<distro>\\home\\...
+    and /mnt/c/... → C:\\...  Off WSL the path is already native.
+    """
+    import subprocess as _sp
+    s = str(p)
+    if not _is_wsl():
+        return s
+    try:
+        return _sp.check_output(["wslpath", "-w", s], text=True).strip()
+    except Exception:                                          # noqa: BLE001
+        # Fallback for /mnt/<drive>/... → <DRIVE>:\...
+        if s.startswith("/mnt/") and len(s) > 6 and s[6] == "/":
+            return s[5].upper() + ":" + s[6:].replace("/", "\\")
+        return s
+
+
+def _win_temp_dir() -> "Path":
+    """A writable directory on the Windows filesystem for the worker script and
+    params — Metashape reads its ``-r`` script far more reliably from a real
+    Windows path than from a \\\\wsl.localhost UNC path."""
+    base = Path("/mnt/c/Users/Public/epr_metashape")
+    if _is_wsl() and Path("/mnt/c/Users/Public").is_dir():
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    tmp = Path(tempfile.gettempdir()) / "epr_metashape"
+    tmp.mkdir(parents=True, exist_ok=True)
+    return tmp
+
+
+def _run_metashape_batch_subprocess(exe, project_psx, frame_sets, *,
+                                    log_fn=None, file_log_fn=None, **opts):
+    """Drive Metashape via ``metashape.exe -r metashape_worker.py params.json``.
+
+    Builds a params file (all paths translated to Windows form), launches the
+    worker in Metashape's own interpreter, streams its stdout to the app log,
+    then reads back the result JSON.  Returns {run_dir: [product paths]}.
+    """
+    import subprocess
+    import uuid
+
+    def log(msg):
+        if log_fn:
+            log_fn(msg)
+        if file_log_fn:
+            file_log_fn(msg)
+
+    worker_src = Path(__file__).resolve().parent / "metashape_worker.py"
+    win_dir = _win_temp_dir()
+    tag = uuid.uuid4().hex[:8]
+    # Copy the worker next to the params so both live on the Windows filesystem.
+    worker_dst = win_dir / "metashape_worker.py"
+    shutil.copyfile(worker_src, worker_dst)
+    params_path = win_dir / f"params_{tag}.json"
+    result_path = win_dir / f"result_{tag}.json"
+    log_path    = win_dir / f"worker_{tag}.log"
+
+    # Map option kwargs (defaults mirror the in-process signature) into the flat
+    # options block the worker understands.
+    def o(k, d):
+        return opts.get(k, d)
+
+    options = {
+        "align_accuracy": o("align_accuracy", "High"),
+        "key_point_limit": int(o("key_point_limit", 40000)),
+        "tie_point_limit": int(o("tie_point_limit", 10000)),
+        "generic_preselect": bool(o("generic_preselect", True)),
+        "adaptive_fitting": bool(o("adaptive_fitting", True)),
+        "build_dense": bool(o("build_dense", True)),
+        "dense_quality": o("dense_quality", "Medium"),
+        "depth_filter": o("depth_filter", "Moderate"),
+        "export_dense_ply": bool(o("export_dense_ply", False)),
+        "build_mesh": bool(o("build_mesh", False)),
+        "mesh_surface": o("mesh_surface", "Arbitrary"),
+        "mesh_faces": o("mesh_faces", "Medium"),
+        "mesh_source": o("mesh_source", "Dense cloud"),
+        "mesh_vertex_colors": bool(o("mesh_vertex_colors", True)),
+        "build_texture": bool(o("build_texture", False)),
+        "texture_size": int(o("texture_size", 4096)),
+        "texture_blending": o("texture_blending", "Mosaic"),
+        "texture_fill_holes": bool(o("texture_fill_holes", True)),
+        "export_mesh_obj": bool(o("export_mesh_obj", False)),
+        # DEM / orthomosaic (new products — off unless asked)
+        "build_dem": bool(o("build_dem", o("build_orthomosaic", False))),
+        "export_dem": bool(o("export_dem", False)),
+        "build_orthomosaic": bool(o("build_orthomosaic", False)),
+        # georeference
+        "use_nav_reference": bool(o("use_nav_reference", True)),
+        "nav_accuracy_h": float(o("nav_accuracy_h", 0.1)),
+        "nav_accuracy_v": float(o("nav_accuracy_v", 0.5)),
+        "make_report": bool(o("make_report", o("save_project", True))),
+        "save_project": bool(o("save_project", True)),
+    }
+
+    chunks = []
+    run_dir_by_win = {}
+    for photos, run_dir, nav_csv, label in frame_sets:
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        win_run = _to_windows_path(run_dir)
+        run_dir_by_win[win_run] = run_dir
+        chunks.append({
+            "label": label,
+            "run_dir": win_run,
+            "photos": [_to_windows_path(p) for p in photos],
+            "nav_csv": _to_windows_path(nav_csv) if nav_csv else None,
+        })
+
+    Path(project_psx).parent.mkdir(parents=True, exist_ok=True)
+    params = {
+        "project_psx": _to_windows_path(project_psx),
+        "log_path": _to_windows_path(log_path),
+        "result_path": _to_windows_path(result_path),
+        "options": options,
+        "chunks": chunks,
+    }
+    params_path.write_text(json.dumps(params, indent=1), encoding="utf-8")
+    if result_path.exists():
+        result_path.unlink()
+
+    cmd = [str(exe), "-r", _to_windows_path(worker_dst), _to_windows_path(params_path)]
+    log(f"  $ metashape.exe -r metashape_worker.py params_{tag}.json")
+    log(f"  driving Metashape as a subprocess ({len(chunks)} chunk(s))")
+
+    t0 = time.time()
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+    except OSError as e:
+        raise RuntimeError(f"Failed to launch Metashape: {e}") from e
+
+    emitted = 0
+    for raw in proc.stdout:
+        line = raw.rstrip("\n")
+        if not line.strip():
+            continue
+        if file_log_fn:
+            file_log_fn(f"    {line}")
+        # Keep the GUI log readable: forward worker/progress lines, cap the rest.
+        if line.startswith("[worker]") or emitted < 400:
+            if log_fn:
+                log_fn(f"    {line}")
+            emitted += 1
+    proc.wait()
+    log(f"  Metashape subprocess finished in {time.time() - t0:.0f}s (exit {proc.returncode})")
+
+    if not result_path.exists():
+        raise RuntimeError(
+            "Metashape produced no result file — the subprocess likely failed to "
+            f"start the script. Check {log_path}. Exit code {proc.returncode}.")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    if not result.get("ok"):
+        raise RuntimeError(f"Metashape pipeline failed: {result.get('error', 'unknown')}")
+
+    # Translate product paths back to WSL and group by run_dir.
+    out: dict[str, list[str]] = {}
+    for ch in result.get("chunks", []):
+        wsl_run = run_dir_by_win.get(ch.get("run_dir"), ch.get("run_dir"))
+        paths = []
+        for _key, winpath in (ch.get("products") or {}).items():
+            paths.append(_from_windows_path(winpath))
+        out[wsl_run] = paths
+        log(f"  chunk '{ch.get('label')}' — {ch.get('cameras_aligned')}/"
+            f"{ch.get('cameras_total')} cameras aligned, {len(paths)} product(s)")
+        if ch.get("error"):
+            log(f"    chunk error: {ch['error']}")
+    return out
+
+
+def _from_windows_path(p: str) -> str:
+    """Translate a Windows path the worker wrote back into a WSL path."""
+    s = str(p)
+    if not _is_wsl():
+        return s
+    try:
+        import subprocess as _sp
+        return _sp.check_output(["wslpath", "-u", s], text=True).strip()
+    except Exception:                                          # noqa: BLE001
+        return s
+
+
+def run_metashape_batch(project_psx, frame_sets, **opts):
+    """Batch photogrammetry dispatcher: ONE project, many chunks.
+
+    Chooses HOW to drive Metashape:
+      * in-process  — when ``import Metashape`` works in this interpreter
+                      (native Windows/Linux with the module installed);
+      * subprocess  — otherwise, when a Windows metashape.exe is found (the
+                      common WSL case: the module can't be imported here, but
+                      the exe runs the pipeline in its own interpreter via
+                      ``metashape.exe -r metashape_worker.py``).
+
+    Both paths honour the same options and return {run_dir: [product paths]}.
+    """
+    try:
+        import Metashape  # noqa: F401
+    except ImportError:
+        exe = _find_windows_metashape_exe()
+        if not exe:
+            raise RuntimeError(metashape_unavailable_reason() or
+                               "Metashape is not available.")
+        return _run_metashape_batch_subprocess(exe, project_psx, frame_sets, **opts)
+    return _run_metashape_batch_inproc(project_psx, frame_sets, **opts)
+
+
+def _run_metashape_batch_inproc(
     project_psx,
     frame_sets,                       # list of (frame_dir, run_dir, nav_csv)
     *,
@@ -733,7 +959,7 @@ def run_metashape_batch(
     texture_size: int = 4096,
     texture_blending: str = "Mosaic",
     texture_fill_holes: bool = True,
-    export_dense_ply: bool = True,
+    export_dense_ply: bool = False,   # ARCHIVED deliverable; dense build stays on
     export_mesh_obj: bool = False,
     use_nav_reference: bool = True,
     nav_accuracy_h: float = 0.1,
@@ -741,6 +967,10 @@ def run_metashape_batch(
     save_project: bool = True,
     log_fn: Optional[Callable[[str], None]] = None,
     file_log_fn: Optional[Callable[[str], None]] = None,
+    **_unused,   # DEM/orthomosaic flags are handled by the subprocess worker;
+                 # absorbed here so the dispatcher can forward one option set to
+                 # either backend without TypeError. (The in-process path does
+                 # not yet build ortho/DEM — those run via metashape_worker.py.)
 ) -> dict[str, list[str]]:
     """Batch photogrammetry: ONE Metashape project, many chunks.
 

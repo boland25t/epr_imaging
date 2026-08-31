@@ -685,6 +685,20 @@ class TaskConfigDialog(QDialog):
         _sync_texture()
         meta_vbox.addWidget(tex_group)
 
+        # -- Raster products --------------------------------------------------
+        raster_group = QGroupBox("Raster products (Metashape)")
+        raster_form  = QFormLayout(raster_group)
+        w["build_orthomosaic"] = self._check(
+            "Build orthomosaic (raster GeoTIFF)", bool(s.get("build_orthomosaic", False)))
+        raster_form.addRow("", w["build_orthomosaic"])
+        w["build_dem"] = self._check(
+            "Build DEM (digital elevation model)", bool(s.get("build_dem", False)))
+        raster_form.addRow("", w["build_dem"])
+        w["export_dem"] = self._check(
+            "Export DEM as GeoTIFF", bool(s.get("export_dem", False)))
+        raster_form.addRow("", w["export_dem"])
+        meta_vbox.addWidget(raster_group)
+
         # -- Export & Project -------------------------------------------------
         exp_group = QGroupBox("Export & Project")
         exp_form  = QFormLayout(exp_group)
@@ -952,6 +966,11 @@ class TaskConfigDialog(QDialog):
             s["texture_size"]       = int(w["texture_size"].currentText())
             s["texture_blending"]   = w["texture_blending"].currentText()
             s["texture_fill_holes"] = w["texture_fill_holes"].isChecked()
+
+            # Raster products
+            s["build_orthomosaic"] = w["build_orthomosaic"].isChecked()
+            s["build_dem"]         = w["build_dem"].isChecked()
+            s["export_dem"]        = w["export_dem"].isChecked()
 
             # Export & project
             s["export_dense_ply"] = w["export_dense_ply"].isChecked()

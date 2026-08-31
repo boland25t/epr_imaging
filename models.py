@@ -664,6 +664,17 @@ TASK_INFO: dict[str, dict] = {
 # Order the Create-Task menu groups appear in.
 TASK_CATEGORIES: list[str] = ["Prepare", "Sampling", "Outputs", "Photogrammetry", "Anomaly", "Export"]
 
+# Task types that are ARCHIVED — kept in TASK_INFO (so old saved stacks still
+# resolve their labels without KeyError) but hidden from the Create-Task menu
+# and One-Click so they can no longer be created.
+#
+# 3D point-cloud products are archived per project direction: the volumetric
+# sensor point cloud (sensor_3d) and its child PNG depth-slices (sensor_slices,
+# which read sensor_3d's voxel grid).  KEPT: nav_3d tracklines + colour coding,
+# the depth_slice_geotiffs raster product (independent of point clouds), and the
+# photogrammetry mesh/DEM/orthomosaic.  Reverting is one line: empty this set.
+ARCHIVED_TASK_TYPES: set[str] = {"sensor_3d", "sensor_slices"}
+
 
 @dataclass
 class Task:

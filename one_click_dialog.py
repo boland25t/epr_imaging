@@ -59,13 +59,14 @@ from task_config_dialog import TaskConfigDialog
 
 # Product task types offered in the "Data products" section, in generation
 # order.  (label, task_type, per_channel) — labels mirror TASK_INFO.
+# NOTE: sensor_3d (volumetric point cloud) and sensor_slices (its PNG child) are
+# archived — see models.ARCHIVED_TASK_TYPES — so they are omitted here.  The
+# depth_slice_geotiffs raster is the independent depth-band product that remains.
 _PRODUCT_TYPES: list[tuple[str, str]] = [
     ("nav_3d",               "Nav Trackline PLY"),
     ("nav_2d",               "Nav Depth GeoTIFF"),
-    ("sensor_3d",            "Sensor 3D PLY (per channel)"),
     ("sensor_2d",            "Sensor 2D GeoTIFF (per channel)"),
     ("depth_slice_geotiffs", "Depth-Slice GeoTIFFs (per channel)"),
-    ("sensor_slices",        "PNG Depth Slices (per channel)"),
     ("sensor_netcdf",        "Sensor NetCDF (CF, per channel)"),
     ("qc_report",            "Data QC Report"),
     ("qgis_project",         "QGIS Project (.qgs)"),
@@ -315,7 +316,7 @@ class OneClickPipelineDialog(QDialog):
             self._product_checks[task_type] = cb
             prod_vbox.addWidget(cb)
         # Sensible defaults: the core products on, exports off.
-        for tt in ("nav_3d", "sensor_3d", "sensor_2d"):
+        for tt in ("nav_3d", "sensor_2d"):
             if self._product_checks[tt].isEnabled():
                 self._product_checks[tt].setChecked(True)
 

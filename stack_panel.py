@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 import preset_service
-from models import Task, TaskStack, TASK_INFO, TASK_CATEGORIES
+from models import Task, TaskStack, TASK_INFO, TASK_CATEGORIES, ARCHIVED_TASK_TYPES
 from task_config_dialog import TaskConfigDialog
 
 
@@ -207,7 +207,9 @@ class StackPanel(QWidget):
         avail = self._availability_provider() or {}
         menu = QMenu(self)
         for category in TASK_CATEGORIES:
-            types = [tt for tt, info in TASK_INFO.items() if info.get("category") == category]
+            types = [tt for tt, info in TASK_INFO.items()
+                     if info.get("category") == category
+                     and tt not in ARCHIVED_TASK_TYPES]   # hide archived (point-cloud) types
             if not types:
                 continue
             menu.addSection(category)

@@ -152,6 +152,7 @@ class Layer:
         self.downsampled  = False   # True when shown < full
         self.force_full   = False   # user asked to render every point
         self.point_size   = 2.0     # render size for point-cloud layers (px)
+        self.line_width   = 4        # render width for polyline layers (tracklines)
         self.log_scale    = False   # log colour mapping for scalar fields (e.g. CO2)
 
     def display_name(self) -> str:
@@ -305,6 +306,18 @@ class PointCloudViewer(QMainWindow):
         add_btn = QPushButton("Add Layer…")
         add_btn.clicked.connect(self._add_layer_dialog)
         tb.addWidget(add_btn)
+
+        track_btn = QPushButton("Add Trackline…")
+        track_btn.setToolTip("Overlay the nav path (interp_full.csv), optionally "
+                             "coloured by a sensor channel.")
+        track_btn.clicked.connect(self._add_trackline_dialog)
+        tb.addWidget(track_btn)
+
+        drape_btn = QPushButton("Drape Ortho on DEM…")
+        drape_btn.setToolTip("Paint an orthomosaic GeoTIFF onto its DEM as a "
+                             "3D terrain surface.")
+        drape_btn.clicked.connect(self._add_drape_dialog)
+        tb.addWidget(drape_btn)
 
         tb.addSeparator()
 
@@ -469,6 +482,107 @@ class PointCloudViewer(QMainWindow):
         self.show()
         self.raise_()
 
+    def add_mesh_layer(self, mesh, key: str, name: str, *, color_rgb: bool = False,
+                       opacity: float = 1.0, point_size: float = 3.0,
+                       line_width: int = 4) -> None:
+        """Add a programmatically-built mesh (trackline, draped surface) as a layer.
+
+        Unlike load_file (which reads a path), this takes a ready pyvista mesh and
+        a synthetic ``key`` used as its actor id / dedup handle.  Re-adding the same
+        key replaces the existing layer, so refreshing an overlay is idempotent.
+        """
+        if not PYVISTA_OK or mesh is None:
+            return
+        for existing in [l for l in self._layers if l.path == key]:
+            self.remove_layer(existing)
+        layer = Layer(key, name)
+        layer.color_rgb   = color_rgb
+        layer.opacity     = opacity
+        layer.point_size  = point_size
+        layer.line_width  = line_width
+        layer.mesh        = mesh
+        layer.full_points = self._point_count(mesh)
+        layer.shown_points = layer.full_points
+        self._render_layer(layer)
+        self._layers.append(layer)
+        self._add_list_row(layer)
+        self.statusBar().showMessage(f"Added: {name}")
+        self.show()
+        self.raise_()
+
+    def add_trackline(self, interp_csv: str, channel: Optional[str] = None) -> None:
+        """Add the nav trackline (optionally coloured by a sensor channel)."""
+        if not PYVISTA_OK:
+            return
+        import overlay_builders as ob
+        try:
+            data = ob.load_trackline(interp_csv, channel)
+            mesh = ob.make_trackline_mesh(data)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Trackline", f"Could not build trackline:\n{exc}")
+            return
+        name = "Trackline" + (f" · {channel}" if data.get("scalar_name") else "")
+        self.add_mesh_layer(mesh, key=f"trackline::{channel or 'nav'}", name=name,
+                            color_rgb=False)
+        if data.get("dropped"):
+            self.statusBar().showMessage(
+                f"{name}: {data['n']:,} points ({data['dropped']:,} rows dropped)")
+
+    def add_draped_surface(self, dem_tif: str, ortho_tif: str) -> None:
+        """Add a DEM surface painted with its orthomosaic (per-vertex RGB)."""
+        if not PYVISTA_OK:
+            return
+        import overlay_builders as ob
+        try:
+            data = ob.load_draped_grid(dem_tif, ortho_tif)
+            mesh = ob.make_draped_mesh(data)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Draped surface",
+                                f"Could not build draped surface:\n{exc}")
+            return
+        self.add_mesh_layer(mesh, key=f"drape::{Path(dem_tif).stem}",
+                            name=f"Ortho on DEM · {Path(dem_tif).stem}",
+                            color_rgb=True, opacity=1.0)
+
+    def _add_trackline_dialog(self) -> None:
+        """Toolbar action: pick an interp CSV + channel, then add the trackline."""
+        csv, _ = QFileDialog.getOpenFileName(
+            self, "Select interp_full.csv (nav + sensors)", "",
+            "CSV files (*.csv);;All files (*)")
+        if not csv:
+            return
+        channel = None
+        try:
+            import pandas as pd
+            cols = list(pd.read_csv(csv, nrows=0).columns)
+            skip = {"unix_time", "lat", "lon", "easting", "northing", "depth",
+                    "water_depth", "alt", "heading", "pitch", "roll", "utm_zone",
+                    "frame_filename"}
+            channels = [c for c in cols if c not in skip]
+            if channels:
+                from PySide6.QtWidgets import QInputDialog
+                items = ["(none — solid line)"] + channels
+                choice, ok = QInputDialog.getItem(
+                    self, "Colour trackline by", "Sensor channel:", items, 0, False)
+                if ok and choice and not choice.startswith("("):
+                    channel = choice
+        except Exception:  # noqa: BLE001
+            pass
+        self.add_trackline(csv, channel)
+
+    def _add_drape_dialog(self) -> None:
+        """Toolbar action: pick a DEM then an orthomosaic, then drape them."""
+        dem, _ = QFileDialog.getOpenFileName(
+            self, "Select DEM GeoTIFF", "", "GeoTIFF (*.tif *.tiff);;All files (*)")
+        if not dem:
+            return
+        ortho, _ = QFileDialog.getOpenFileName(
+            self, "Select orthomosaic GeoTIFF", str(Path(dem).parent),
+            "GeoTIFF (*.tif *.tiff);;All files (*)")
+        if not ortho:
+            return
+        self.add_draped_surface(dem, ortho)
+
     def reload_layer_full(self, layer: Layer) -> None:
         """Re-render a layer at full resolution (every point)."""
         if not PYVISTA_OK:
@@ -606,10 +720,21 @@ class PointCloudViewer(QMainWindow):
             if layer.log_scale:
                 kwargs["log_scale"] = True
 
-        # Point clouds: small, flat points (not spheres) so a dense overlaid
-        # cloud reads as a translucent haze you can see through, not a wall.
+        # Choose a render style by geometry: surfaces (faces) render solid; a
+        # polyline (lines, no faces — a trackline) renders as a fat tube; a point
+        # cloud renders as small flat points so a dense overlay reads as a
+        # translucent haze rather than a wall.
         n_faces = getattr(mesh, "n_faces", 0) or 0
-        if not (isinstance(mesh, pv.PolyData) and n_faces > 0):
+        n_lines = getattr(mesh, "n_lines", 0) or 0
+        is_surface = isinstance(mesh, pv.PolyData) and n_faces > 0
+        is_line = isinstance(mesh, pv.PolyData) and n_lines > 0 and n_faces == 0
+        if is_line:
+            kwargs["line_width"] = layer.line_width
+            try:
+                kwargs["render_lines_as_tubes"] = True
+            except Exception:
+                pass
+        elif not is_surface:
             kwargs["point_size"] = layer.point_size
             kwargs["render_points_as_spheres"] = False
             kwargs["style"] = "points"

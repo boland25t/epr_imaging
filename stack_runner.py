@@ -62,10 +62,16 @@ class StackWorker(QObject):
     error         = Signal(str)
 
     def __init__(self, plan: list[dict], log_file: Optional[str] = None,
-                 skip_existing: bool = False) -> None:
+                 skip_existing: bool = False, workspace_dir: Optional[str] = None) -> None:
         super().__init__()
         self._plan = plan
         self._skip_existing = skip_existing
+        # Workspace root — enables per-run provenance manifests + the dedup
+        # registry (runs/registry.json).  When absent, provenance is silently
+        # skipped so headless/older callers still run.
+        self._workspace_dir = workspace_dir
+        self._registry = None
+        self._execution_id = None
         # (scope_id, product_type, channel) -> run_dir created this execution
         self._created_runs: dict[tuple, str] = {}
         # (task_id, scope_id) -> output dirs produced by that sampling task+scope.
@@ -153,6 +159,7 @@ class StackWorker(QObject):
 
             self._log_event(f"═══ Stack run started — {total} step(s) queued ═══")
             self._log_environment_header()
+            self._init_provenance()
 
             for i, step in enumerate(self._plan, start=1):
                 if self._abort:
@@ -178,6 +185,19 @@ class StackWorker(QObject):
                                    "paths": [], "duration_s": 0.0})
                     continue
 
+                # Metadata-driven dedup: an identical prior run (same settings,
+                # inputs, engine, scope, channel) whose products still exist.
+                dup = self._registry_duplicate(step) if self._skip_existing else None
+                if dup is not None:
+                    skipped += 1
+                    self._log_event(
+                        f"⊘ [{i}/{total}] SKIPPED (identical run {dup.get('run_id')} "
+                        f"from {dup.get('finished_at','?')}) — {label}")
+                    report.append({"index": idx, "label": label, "status": "skipped",
+                                   "paths": [], "duration_s": 0.0,
+                                   "deduped_from": dup.get("run_id")})
+                    continue
+
                 try:
                     paths = self._run_step(svc, step)
                     dt = time.time() - t_step
@@ -196,6 +216,7 @@ class StackWorker(QObject):
                     self.step_finished.emit(label, paths)
                     report.append({"index": idx, "label": label, "status": "completed",
                                    "paths": list(paths), "duration_s": round(dt, 1)})
+                    self._record_run_manifest(step, "completed", paths, t_step, dt)
                 except Exception as exc:  # noqa: BLE001 — one failed product must
                     failed += 1            # not abort the rest of the stack
                     dt = time.time() - t_step
@@ -204,6 +225,7 @@ class StackWorker(QObject):
                     report.append({"index": idx, "label": label, "status": "failed",
                                    "paths": [], "error": str(exc),
                                    "duration_s": round(dt, 1)})
+                    self._record_run_manifest(step, "failed", [], t_step, dt, error=str(exc))
 
             self._log_event(
                 f"═══ Stack run finished in {time.time() - t_run:.1f} s — "
@@ -220,6 +242,7 @@ class StackWorker(QObject):
             self._file_write(f"FATAL: {exc}")
             self.error.emit(str(exc))
         finally:
+            self._save_registry()
             if self._log_fh is not None:
                 try:
                     self._log_fh.flush()
@@ -227,6 +250,157 @@ class StackWorker(QObject):
                 except Exception:  # noqa: BLE001
                     pass
                 self._log_fh = None
+
+    # -----------------------------------------------------------------------
+    # Provenance — per-run manifests + the dedup registry (additive; a failure
+    # here must never disturb the run, so everything is wrapped defensively)
+    # -----------------------------------------------------------------------
+    def _init_provenance(self) -> None:
+        if not self._workspace_dir:
+            return
+        try:
+            import manifest
+            from layout import WorkspaceLayout
+            lo = WorkspaceLayout(self._workspace_dir)
+            # Old-layout workspaces keep runs/ at the root too; harmless either way.
+            self._registry = manifest.Registry(
+                Path(self._workspace_dir) / "runs" / "registry.json")
+            self._execution_id = manifest.new_execution_id()
+            self._layout = lo
+        except Exception as exc:  # noqa: BLE001
+            self._file_write(f"provenance init skipped: {exc}")
+            self._registry = None
+
+    def _compute_signature(self, step: dict):
+        """The dedup signature for a step, plus (product, scope, channel, engine,
+        input_hash).  Computed the same way whether we're recording a finished run
+        or checking up-front whether it's a duplicate.  Returns None on failure so
+        provenance never breaks the run."""
+        try:
+            import manifest
+            kwargs = step.get("kwargs", {}) or {}
+            product = step.get("product_type", "step")
+            scope_id = step.get("scope_id", "full")
+            channel = step.get("channel")
+            input_hash = self._input_fingerprint(product, kwargs, None)
+            engine_key = self._engine_key(step)
+            sig = manifest.run_signature(product, scope_id, kwargs, input_hash,
+                                         engine_key, channel)
+            return {"signature": sig, "product": product, "scope_id": scope_id,
+                    "channel": channel, "engine": engine_key, "input_hash": input_hash}
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _registry_duplicate(self, step: dict):
+        """A prior completed run with the SAME signature whose outputs still
+        exist on disk — i.e. re-running would reproduce identical products.
+
+        This is the metadata-driven dedup: unlike ``_already_done`` (fixed-path
+        existence only), it accounts for settings, inputs (by content), engine,
+        scope, and channel, so it can safely dedup VERSIONED products too."""
+        if self._registry is None:
+            return None
+        info = self._compute_signature(step)
+        if not info:
+            return None
+        entry = self._registry.lookup(info["signature"])
+        if entry and self._registry.outputs_exist(entry):
+            return entry
+        return None
+
+    def _record_run_manifest(self, step: dict, status: str, paths: list,
+                             t_step: float, dt: float, error: str = None) -> None:
+        if self._registry is None:
+            return
+        try:
+            import manifest
+            from datetime import datetime
+
+            kwargs = step.get("kwargs", {}) or {}
+            info = self._compute_signature(step)
+            if info is None:
+                return
+            product = info["product"]
+            scope_id = info["scope_id"]
+            channel = info["channel"]
+            input_hash = info["input_hash"]
+            engine_key = info["engine"]
+            sig = info["signature"]
+            run_id = manifest.new_run_id(sig)
+            started_iso = datetime.fromtimestamp(t_step).isoformat(timespec="seconds")
+            finished_iso = datetime.now().isoformat(timespec="seconds")
+
+            rec = manifest.RunRecord(
+                run_id=run_id, signature=sig, task_type=product, scope_id=scope_id,
+                channel=channel, status=status, execution_id=self._execution_id,
+                target={"scope_id": scope_id}, engine=engine_key,
+                inputs={"fingerprint": input_hash},
+                settings=manifest.settings_for_signature(kwargs),
+                started_at=started_iso, finished_at=finished_iso,
+                duration_s=round(dt, 2), error=error,
+                outputs=manifest.describe_outputs([str(p) for p in paths]),
+                log={"path": str(self._log_file) if self._log_file else None},
+            )
+            run_dir = self._run_dir_for(paths)
+            manifest_path = manifest.write_manifest(run_dir, rec) if run_dir else None
+            self._registry.record(rec, manifest_path or "", run_dir or "")
+        except Exception as exc:  # noqa: BLE001 — never break the run for provenance
+            self._file_write(f"manifest write skipped for {step.get('label')}: {exc}")
+
+    def _input_fingerprint(self, product: str, kwargs: dict, paths: list) -> str:
+        import manifest
+        try:
+            if product in ("photogrammetry", "frame_stats"):
+                frame_dir = kwargs.get("frame_dir") or ""
+                if frame_dir and Path(frame_dir).is_dir():
+                    frames = [str(p) for p in Path(frame_dir).glob("*.jpg")]
+                    if frames:
+                        return manifest.frame_set_hash(frames)
+                return manifest.sha256_text(product + "|frames")
+            interp = kwargs.get("interp_path")
+            if interp and Path(interp).is_file():
+                cache = Path(self._workspace_dir) / "runs" / "interp_hash_cache.json"
+                return manifest.file_content_hash_cached(interp, cache)
+        except Exception:  # noqa: BLE001
+            pass
+        return manifest.sha256_text("no-input")
+
+    def _engine_key(self, step: dict) -> str:
+        eng = step.get("engine")
+        if not eng:
+            return ""
+        try:
+            import photogrammetry_service as ps
+            if eng == "metashape":
+                v = ps.metashape_driver() or "?"
+                return f"metashape ({v})"
+            return str(eng)
+        except Exception:  # noqa: BLE001
+            return str(eng)
+
+    @staticmethod
+    def _run_dir_for(paths: list):
+        """The run directory a step's outputs live in (their common parent)."""
+        import os
+        real = [str(p) for p in paths if p]
+        if not real:
+            return None
+        if len(real) == 1:
+            p = Path(real[0])
+            return p if p.is_dir() else p.parent
+        try:
+            return Path(os.path.commonpath(real))
+        except ValueError:
+            return Path(real[0]).parent
+
+    def _save_registry(self) -> None:
+        if self._registry is not None:
+            try:
+                self._registry.save()
+                self._emit(f"[{self._ts()}] provenance: registry updated "
+                           f"({len(self._registry.runs)} run(s) recorded)")
+            except Exception as exc:  # noqa: BLE001
+                self._file_write(f"registry save skipped: {exc}")
 
     # -----------------------------------------------------------------------
     # Logging helpers
@@ -519,13 +693,24 @@ class StackWorker(QObject):
         # Prefer an explicit path, else the workspace's interp_full.csv.  When
         # neither exists, pass None so the builder falls back to its configured
         # default rather than being pointed at a file that isn't there.
-        interp_path = kwargs.get("interp_path") or ((ws / "interp_full.csv") if ws else None)
+        # Layout-aware defaults for the master interp + catalog dir (bundle vs flat).
+        _res = None
+        if self._workspace_dir:
+            try:
+                from workspace_paths import PathResolver
+                _res = PathResolver(self._workspace_dir)
+            except Exception:  # noqa: BLE001
+                _res = None
+        interp_default = str(_res.interp_full()) if _res else ((ws / "interp_full.csv") if ws else None)
+        interp_path = kwargs.get("interp_path") or interp_default
         interp_path = Path(interp_path) if interp_path else None
         if interp_path is not None and not interp_path.is_file():
             self._emit(f"      note: {interp_path} not found — using the builder default")
             interp_path = None
         raw_nav = kwargs.get("raw_nav_path") or None
-        out_dir = Path(kwargs.get("out_dir") or ((ws / "anomaly_site_catalog") if ws else repo / "anomaly_site_catalog"))
+        anomaly_default = (str(_res.anomaly_dir()) if _res
+                           else ((ws / "anomaly_site_catalog") if ws else repo / "anomaly_site_catalog"))
+        out_dir = Path(kwargs.get("out_dir") or anomaly_default)
         do_detector = bool(kwargs.get("run_detector", True))
         do_catalog  = bool(kwargs.get("run_catalog", True))
 
@@ -823,6 +1008,11 @@ class StackWorker(QObject):
             texture_fill_holes=bool(kwargs.get("texture_fill_holes", True)),
             export_dense_ply=bool(kwargs.get("export_dense_ply", True)),
             export_mesh_obj=bool(kwargs.get("export_mesh_obj", False)),
+            # DEM + orthomosaic (handled by the Metashape subprocess worker)
+            build_dem=bool(kwargs.get("build_dem", False)),
+            export_dem=bool(kwargs.get("export_dem", False)),
+            build_orthomosaic=bool(kwargs.get("build_orthomosaic", False)),
+            make_report=bool(kwargs.get("make_report", True)),
             use_nav_reference=bool(kwargs.get("use_nav_reference", True)),
             nav_accuracy_h=float(kwargs.get("nav_accuracy_h", 0.1)),
             nav_accuracy_v=float(kwargs.get("nav_accuracy_v", 0.5)),
@@ -847,6 +1037,8 @@ class StackWorker(QObject):
         "mesh_textured_obj":     "Textured mesh (OBJ)",
         "texture_png":           "Texture (PNG)",
         "cameras_json":          "Camera poses (JSON)",
+        "orthomosaic_tif":       "Orthomosaic (GeoTIFF)",
+        "dem_tif":               "DEM (GeoTIFF)",
         "georef_txt":            "Georeference geo.txt",
         "undistorted_dir":       "Undistorted frames (dir)",
         "depth_maps_dir":        "Depth maps (dir)",
