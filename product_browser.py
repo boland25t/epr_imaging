@@ -22,9 +22,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+# Legacy per-job directory: job_<NNN>_<name> (name optional).
+_LEGACY_JOB_RE = re.compile(r"^job_(\d+)(?:_.*)?$")
 
 # ---------------------------------------------------------------------------
 # What counts as a product, and how we bucket it
@@ -43,15 +47,24 @@ _EXT_KIND = {
 }
 
 # Product file extensions the filesystem fallback will surface.  Deliberately
-# excludes .jpg — extracted frames are jpg and number in the thousands; they are
-# inputs, not products, and must never be walked as products.
-_SCAN_EXTS = {".tif", ".tiff", ".png", ".obj", ".ply", ".stl", ".glb",
+# excludes raster IMAGE formats (.jpg = extracted frames; .png = archived depth
+# slices — thousands of each, and not products in the redesigned world where
+# rasters are GeoTIFF).  A PNG a run explicitly records still shows: registry
+# products are not filtered by extension, only this bare-file scan is.
+_SCAN_EXTS = {".tif", ".tiff", ".obj", ".ply", ".stl", ".glb",
               ".csv", ".nc", ".pdf", ".html", ".psx"}
 
 # Directory names never descended into during the fallback scan: frame stores,
-# raw inputs, caches, and Metashape's internal per-chunk scratch.
-_SCAN_PRUNE_DIRS = {"frames", "segments", "chunks", "inputs", "cache",
-                    "logs", "archive", ".git", "__pycache__"}
+# raw inputs, caches, and Metashape's internal per-chunk scratch.  These are
+# extraction/working data, not products.
+_SCAN_PRUNE_DIRS = {"frames", "frames_annotated", "frames_clahe", "segments",
+                    "sensors", "chunks", "inputs", "cache", "logs", "archive",
+                    ".git", "__pycache__", ".claude"}
+
+# Directory NAME PREFIXES pruned too — the legacy frame-extraction stores
+# (sampling_<taskid>_… and segment_<NNN>_…) hold thousands of frame images that
+# must never be surfaced as products.
+_SCAN_PRUNE_PREFIXES = ("sampling_", "segment_")
 
 # Roots under a workspace where products actually live.  Scanning is confined to
 # these so a workspace that sits next to a 114 GB data folder is never traversed.
@@ -193,7 +206,10 @@ def _scan_products(workspace: Path, seen: set[str]) -> list[ProductItem]:
                 dirnames[:] = []
                 continue
             visited_dirs.add(dirpath)
-            dirnames[:] = [d for d in dirnames if d.lower() not in _SCAN_PRUNE_DIRS]
+            dirnames[:] = [
+                d for d in dirnames
+                if d.lower() not in _SCAN_PRUNE_DIRS
+                and not d.lower().startswith(_SCAN_PRUNE_PREFIXES)]
             for fn in filenames:
                 ext = Path(fn).suffix.lower()
                 if ext not in _SCAN_EXTS:
@@ -208,7 +224,8 @@ def _scan_products(workspace: Path, seen: set[str]) -> list[ProductItem]:
                     size = fp.stat().st_size
                 except OSError:
                     size = None
-                # Infer scope from a jobs/job_00N path segment if present.
+                # Infer scope from the path: the new-layout jobs/job_00N segment,
+                # the survey/ scope, or a legacy job_<NNN>_<name> directory.
                 scope = None
                 parts = fp.parts
                 for i, seg in enumerate(parts):
@@ -217,6 +234,9 @@ def _scan_products(workspace: Path, seen: set[str]) -> list[ProductItem]:
                         break
                     if seg == "survey":
                         scope = "survey"
+                    m = _LEGACY_JOB_RE.match(seg)
+                    if m:
+                        scope = f"job_{int(m.group(1)):03d}"
                 items.append(ProductItem(
                     path=str(fp), kind=_kind_for(str(fp), None),
                     scope_id=scope, size=size, source="scan",

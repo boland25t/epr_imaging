@@ -163,3 +163,28 @@ def test_run_history_all_statuses_newest_first(tmp_path):
 
 def test_run_history_empty_without_registry(tmp_path):
     assert pb.read_run_history(tmp_path) == []
+
+
+def test_scan_excludes_png_slices_and_frame_dirs(tmp_path):
+    # Archived PNG depth-slices and annotated/clahe frame images must not appear.
+    for sub in ("sensor_3d/co2/run_001/slices/run_001", "sensor_slices/co2/run_001",
+                "sampling_1_job_002/segment_001_x_y/frames_annotated"):
+        d = tmp_path / "outputs" / sub
+        d.mkdir(parents=True)
+        (d / "slice.png").write_bytes(b"\x89PNG")
+    # a real GeoTIFF product alongside
+    (tmp_path / "outputs" / "sensor_2d").mkdir(parents=True)
+    (tmp_path / "outputs" / "sensor_2d" / "co2.tif").write_bytes(b"II*\0")
+    items = pb.discover_products(tmp_path)
+    names = {it.name for it in items}
+    assert "co2.tif" in names
+    assert not any(n.endswith(".png") for n in names)     # no slice/frame PNGs
+
+
+def test_scan_attributes_legacy_job_scope(tmp_path):
+    d = tmp_path / "job_023_FullTest1" / "outputs" / "sensor_2d"
+    d.mkdir(parents=True)
+    (d / "co2.tif").write_bytes(b"II*\0")
+    items = pb.discover_products(tmp_path)
+    it = next(i for i in items if i.name == "co2.tif")
+    assert it.scope_id == "job_023" and it.scope_label == "Job 023"
