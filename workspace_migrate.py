@@ -53,8 +53,9 @@ _JOB_DIR_RE = re.compile(r"^job_(\d+)(?:_.*)?$")
 _SAMPLING_JOB_RE = re.compile(r"^sampling_.+?_job_(\d+)(?:_.*)?$")
 # Full-dataset extracted frames:  sampling_<taskid>_full
 _SAMPLING_FULL_RE = re.compile(r"^sampling_.+?_full$")
-# A job_NNN path segment, for reading the id back out of a destination path.
-_JOB_SEG_RE = re.compile(r"^job_(\d+)$")
+# A jobs/ destination segment — job_NNN or the de-collided job_NNN_<slug> — for
+# reading the id back out of a destination path in the summary.
+_JOB_SEG_RE = re.compile(r"^job_(\d+)(?:_.*)?$")
 
 # Top-level bundle directories, used to recover the bundle root from a plan's
 # destination paths (execute_plan only receives the plan, not the root).
@@ -87,25 +88,59 @@ class MoveOp:
 # --------------------------------------------------------------------------
 # plan building (pure — reads the old workspace, writes nothing)
 # --------------------------------------------------------------------------
-def build_migration_plan(old_ws: str, new_bundle: str) -> list[MoveOp]:
+def _job_dest_segments(old: Path) -> dict[str, str]:
+    """Map each legacy ``job_<NNN>[_name]`` directory NAME → its destination
+    segment under ``jobs/``.
+
+    A numeric id used by exactly one legacy dir migrates to the clean
+    ``job_NNN``.  When the OLD naming reused an id across several dirs (the
+    ``_v3/_v5/_v6`` cruft — e.g. three ``job_023_*`` folders), they would all
+    collapse onto ``jobs/job_023`` and overwrite each other; so colliding ids are
+    disambiguated by appending the folder's name slug (``job_023_fulltest1`` …),
+    keeping every job's data separate.
+    """
+    by_id: dict[int, list[str]] = {}
+    for entry in old.iterdir():
+        m = _JOB_DIR_RE.match(entry.name)
+        if m and entry.is_dir():
+            by_id.setdefault(int(m.group(1)), []).append(entry.name)
+    segments: dict[str, str] = {}
+    for job_id, names in by_id.items():
+        collide = len(names) > 1
+        for name in names:
+            if collide:
+                segments[name] = f"job_{job_id:03d}_{layout.slugify(name)}"
+            else:
+                segments[name] = f"job_{job_id:03d}"
+    return segments
+
+
+def build_migration_plan(old_ws: str, new_bundle: str,
+                         skip_frames: bool = True) -> list[MoveOp]:
     """Enumerate every copy needed to migrate ``old_ws`` into ``new_bundle``.
 
     Pure: it only READS ``old_ws`` to list its contents and returns a
     deterministically ordered list of :class:`MoveOp`.  It performs no writes and
     creates no directories — ``execute_plan`` does that.
 
-    Mapping (all destinations minted via ``WorkspaceLayout``):
+    ``skip_frames`` (default True) omits the extracted-frame stores — the
+    ``sampling_*`` directories and any bare ``segment_*`` dirs inside a legacy job
+    folder.  Those hold the bulk of a workspace's bytes (tens of GB of JPGs) and
+    are fully regenerable from the source video, so copying them into the bundle
+    is rarely wanted.  Products, interp, filtered interp, meshes and rasters are
+    always migrated.
+
+    Mapping (product/interp destinations minted via ``WorkspaceLayout``; colliding
+    legacy job ids are de-collided, see :func:`_job_dest_segments`):
 
       * ``interp_full.csv``            → ``inputs/interp_full.csv``
       * ``outputs/<sub>``              → ``survey/<sub>``
-      * ``job_NNN*/outputs/<sub>``     → ``jobs/job_NNN/products/<sub>``
-      * ``job_NNN*/filtered_interp.csv`` → ``jobs/job_NNN/filtered_interp.csv``
-      * ``sampling_*_job_NNN*/<seg>``  → ``jobs/job_NNN/frames/run_001/segments/<seg>``
-      * ``sampling_*_full/<seg>``      → ``survey/frames/run_001/segments/<seg>``
+      * ``job_NNN*/outputs/<sub>``     → ``jobs/<job seg>/products/<sub>``
+      * ``job_NNN*/filtered_interp.csv`` → ``jobs/<job seg>/filtered_interp.csv``
+      * ``sampling_*``                 → skipped (frames) unless skip_frames=False
       * ``anomaly_site_catalog/<sub>`` → ``survey/anomaly/<sub>``
       * ``logs/<sub>``                 → ``logs/<sub>``
-      * ``workspace.json``             → consumed into ``project.json`` (see
-        :func:`build_project_json`), not copied verbatim.
+      * ``workspace.json``             → consumed into ``project.json``
       * anything else                  → ``archive/imported/<original rel path>``
     """
     old = Path(old_ws)
@@ -114,6 +149,8 @@ def build_migration_plan(old_ws: str, new_bundle: str) -> list[MoveOp]:
 
     if not old.is_dir():
         return ops
+
+    job_segments = _job_dest_segments(old)
 
     for entry in sorted(old.iterdir(), key=lambda p: p.name):
         name = entry.name
@@ -135,15 +172,20 @@ def build_migration_plan(old_ws: str, new_bundle: str) -> list[MoveOp]:
             ops += _map_children(entry, lo.logs_dir())
 
         elif _SAMPLING_FULL_RE.match(name) and entry.is_dir():
+            if skip_frames:
+                continue
             dst = lo.products_dir("survey") / "frames" / "run_001" / "segments"
             ops += _map_children(entry, dst)
 
         elif (m := _SAMPLING_JOB_RE.match(name)) and entry.is_dir():
+            if skip_frames:
+                continue
             job_id = int(m.group(1))
             ops += _map_children(entry, lo.frames_run_dir(job_id, run_id=1))
 
-        elif (m := _JOB_DIR_RE.match(name)) and entry.is_dir():
-            ops += _map_job_dir(entry, old, lo, int(m.group(1)))
+        elif _JOB_DIR_RE.match(name) and entry.is_dir():
+            seg = job_segments.get(name, name)
+            ops += _map_job_dir(entry, old, lo, seg, skip_frames)
 
         else:
             # Unrecognized — never dropped; parked under archive/imported/
@@ -167,19 +209,25 @@ def _map_children(src_dir: Path, dst_dir: Path) -> list[MoveOp]:
     return ops
 
 
+# Bare frame-store dir names that can appear directly inside a legacy job dir.
+_FRAME_DIR_RE = re.compile(r"^(segment_\d+|frames|frames_annotated|frames_clahe|sensors)")
+
+
 def _map_job_dir(job_dir: Path, old_ws: Path, lo: WorkspaceLayout,
-                 job_id: int) -> list[MoveOp]:
-    """Map the contents of one ``job_NNN*`` directory into ``jobs/job_NNN/``."""
+                 seg: str, skip_frames: bool) -> list[MoveOp]:
+    """Map one ``job_NNN*`` directory into ``jobs/<seg>/`` (seg de-collided)."""
+    job_base = lo.root / "jobs" / seg
     ops: list[MoveOp] = []
     for child in sorted(job_dir.iterdir(), key=lambda p: p.name):
         name = child.name
         if name == "outputs" and child.is_dir():
-            ops += _map_children(child, lo.products_dir(job_id))
+            ops += _map_children(child, job_base / "products")
         elif name == _FILTERED_INTERP and child.is_file():
-            ops.append(MoveOp(str(child), str(lo.job_filtered_interp(job_id)), "file"))
+            ops.append(MoveOp(str(child), str(job_base / _FILTERED_INTERP), "file"))
         elif name == _FILTERED_META and child.is_file():
-            dst = lo.job_dir(job_id) / _FILTERED_META
-            ops.append(MoveOp(str(child), str(dst), "file"))
+            ops.append(MoveOp(str(child), str(job_base / _FILTERED_META), "file"))
+        elif skip_frames and child.is_dir() and _FRAME_DIR_RE.match(name):
+            continue                          # regenerable frames — don't copy
         else:
             ops += _map_unrecognized(child, old_ws, lo)
     return ops

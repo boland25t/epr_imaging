@@ -73,14 +73,9 @@ def test_plan_destinations(old_ws, tmp_path):
     assert dsts[str(old_ws / "job_002_downdive" / "filtered_interp.csv.meta.json")] == \
         str(lo.job_dir(2) / "filtered_interp.csv.meta.json")
 
-    # per-job frames under jobs/job_002/frames/run_001/segments/
-    assert dsts[str(old_ws / "sampling_5_job_002_downdive" / "segment_001_x_y")] == \
-        str(lo.frames_run_dir(2, run_id=1) / "segment_001_x_y")
-
-    # full-dataset frames under survey/frames/run_001/segments/
-    assert dsts[str(old_ws / "sampling_9_full" / "segment_001_a_b")] == \
-        str(lo.products_dir("survey") / "frames" / "run_001" / "segments"
-            / "segment_001_a_b")
+    # frames are SKIPPED by default (regenerable) — no sampling_* op present
+    assert str(old_ws / "sampling_5_job_002_downdive" / "segment_001_x_y") not in dsts
+    assert str(old_ws / "sampling_9_full" / "segment_001_a_b") not in dsts
 
     # anomaly catalog → survey/anomaly/
     assert dsts[str(old_ws / "anomaly_site_catalog" / "site.csv")] == \
@@ -127,7 +122,8 @@ def test_plan_is_deterministic(old_ws, tmp_path):
 def test_execute_copies_everything_non_destructively(old_ws, tmp_path):
     bundle = tmp_path / "out.eprproj"
     lo = WorkspaceLayout(bundle)
-    plan = wm.build_migration_plan(str(old_ws), str(bundle))
+    # skip_frames=False so this exercises the full copy, frames included.
+    plan = wm.build_migration_plan(str(old_ws), str(bundle), skip_frames=False)
     pj = wm.build_project_json(str(old_ws))
 
     result = wm.execute_plan(plan, pj)
@@ -198,9 +194,42 @@ def test_default_bundle_path_slugifies(tmp_path):
     assert Path(out).parent == tmp_path
 
 
+def test_frames_skipped_by_default_migrated_on_request(old_ws, tmp_path):
+    bundle = tmp_path / "out.eprproj"
+    lo = WorkspaceLayout(bundle)
+    # default: no sampling frame ops at all
+    default_plan = wm.build_migration_plan(str(old_ws), str(bundle))
+    assert not any("sampling_" in op.src for op in default_plan)
+    # opt-in: frames appear, mapped under the job/survey frames run
+    full_plan = wm.build_migration_plan(str(old_ws), str(bundle), skip_frames=False)
+    dsts = {op.src: op.dst for op in full_plan}
+    assert dsts[str(old_ws / "sampling_5_job_002_downdive" / "segment_001_x_y")] == \
+        str(lo.frames_run_dir(2, run_id=1) / "segment_001_x_y")
+
+
+def test_reused_job_ids_are_decollided(tmp_path):
+    ws = tmp_path / "graveyard"
+    # three job dirs reuse id 23; one uses id 5 uniquely
+    for d in ("job_023_AltThresholdTest1", "job_023_FullTest1", "job_023_FullTest2",
+              "job_005_J1756Job2"):
+        _write(ws / d / "filtered_interp.csv")
+    bundle = tmp_path / "out.eprproj"
+    plan = wm.build_migration_plan(str(ws), str(bundle))
+    dsts = {op.src: op.dst for op in plan}
+    # unique id keeps the clean job_005
+    assert dsts[str(ws / "job_005_J1756Job2" / "filtered_interp.csv")].endswith(
+        "jobs/job_005/filtered_interp.csv")
+    # collided id 23 → disambiguated by name slug, no two the same
+    collided = {dsts[str(ws / d / "filtered_interp.csv")]
+                for d in ("job_023_AltThresholdTest1", "job_023_FullTest1", "job_023_FullTest2")}
+    assert len(collided) == 3                       # nothing overwrites anything
+    assert any("job_023_fulltest1" in p for p in collided)
+    assert any("job_023_altthresholdtest1" in p for p in collided)
+
+
 def test_summarize_plan_groups_by_area(old_ws, tmp_path):
     bundle = tmp_path / "out.eprproj"
-    plan = wm.build_migration_plan(str(old_ws), str(bundle))
+    plan = wm.build_migration_plan(str(old_ws), str(bundle), skip_frames=False)
     text = wm.summarize_plan(plan)
     assert "Inputs: interp_full.csv" in text
     assert "Survey products:" in text
