@@ -188,3 +188,21 @@ def test_scan_attributes_legacy_job_scope(tmp_path):
     items = pb.discover_products(tmp_path)
     it = next(i for i in items if i.name == "co2.tif")
     assert it.scope_id == "job_023" and it.scope_label == "Job 023"
+
+
+def test_scan_excludes_metashape_project_internals(tmp_path):
+    # A Metashape project keeps its tiled ortho/DEM pyramid + depth maps inside
+    # "<name>.files/"; only the EXPORTED products (outside .files/) are real.
+    proj = tmp_path / "survey" / "photogrammetry" / "run_001"
+    internals = proj / "project.files" / "0" / "0" / "orthomosaic"
+    internals.mkdir(parents=True)
+    for r in range(3):
+        (internals / f"tile-0-{r}.tif").write_bytes(b"II*\0")   # engine internals
+    # the real exported products alongside the .psx
+    (proj / "orthomosaic.tif").write_bytes(b"II*\0")
+    (proj / "dem.tif").write_bytes(b"II*\0")
+    (proj / "mesh.obj").write_text("v 0 0 0\n")
+    items = pb.discover_products(tmp_path)
+    names = {it.name for it in items}
+    assert {"orthomosaic.tif", "dem.tif", "mesh.obj"} <= names
+    assert not any(n.startswith("tile-") for n in names)       # no internals

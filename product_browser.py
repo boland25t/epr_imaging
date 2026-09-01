@@ -66,6 +66,12 @@ _SCAN_PRUNE_DIRS = {"frames", "frames_annotated", "frames_clahe", "segments",
 # must never be surfaced as products.
 _SCAN_PRUNE_PREFIXES = ("sampling_", "segment_")
 
+# Directory NAME SUFFIXES pruned — a Metashape project keeps its internals in
+# "<name>.files/" (depth maps, the tiled ortho/DEM pyramid: tile-*.tif). Those
+# are engine-internal storage, not products — only the EXPORTED orthomosaic.tif /
+# dem.tif / mesh.obj (which live outside .files/) are real products.
+_SCAN_PRUNE_SUFFIXES = (".files",)
+
 # Roots under a workspace where products actually live.  Scanning is confined to
 # these so a workspace that sits next to a 114 GB data folder is never traversed.
 _PRODUCT_ROOTS = ("outputs", "products", "jobs", "survey", "photogrammetry")
@@ -209,7 +215,8 @@ def _scan_products(workspace: Path, seen: set[str]) -> list[ProductItem]:
             dirnames[:] = [
                 d for d in dirnames
                 if d.lower() not in _SCAN_PRUNE_DIRS
-                and not d.lower().startswith(_SCAN_PRUNE_PREFIXES)]
+                and not d.lower().startswith(_SCAN_PRUNE_PREFIXES)
+                and not d.lower().endswith(_SCAN_PRUNE_SUFFIXES)]
             for fn in filenames:
                 ext = Path(fn).suffix.lower()
                 if ext not in _SCAN_EXTS:
