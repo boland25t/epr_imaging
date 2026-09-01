@@ -130,3 +130,44 @@ def test_description_mentions_requirements_and_task():
 def test_description_for_root_and_aggregate():
     assert "root" in ptw.node_description(pg.get_node("video")).lower()
     assert "aggregate" in ptw.node_description(pg.get_node("report")).lower()
+
+
+def test_description_notes_chunked():
+    # v2: the photogrammetry branch is chunked; the description should say so.
+    assert "chunk" in ptw.node_description(pg.get_node("mesh")).lower()
+    assert "chunk" not in ptw.node_description(pg.get_node("trackline")).lower()
+
+
+# --------------------------------------------------------------------------
+# scope axis helpers (v2)
+# --------------------------------------------------------------------------
+def test_scope_display_label():
+    assert ptw.scope_display_label("survey") == ptw.SURVEY_LABEL
+    assert ptw.scope_display_label("full") == ptw.SURVEY_LABEL
+    assert ptw.scope_display_label(None) == ptw.SURVEY_LABEL
+    assert ptw.scope_display_label("job_2") == "Job 2"
+    assert ptw.scope_display_label("job_007") == "Job 7"
+    assert ptw.scope_display_label("north_ridge") == "north ridge"
+
+
+def test_registry_scopes_excludes_survey_and_dedupes():
+    reg = _reg([
+        _run("sensor_2d", scope_id="full"),
+        _run("sensor_2d", scope_id="job_2"),
+        _run("nav_3d", scope_id="job_2"),
+        _run("photogrammetry", scope_id="job_5"),
+        _run("sensor_2d", scope_id="survey"),
+    ])
+    # survey/full excluded; job_2 appears once; first-seen order preserved.
+    assert ptw.registry_scopes(reg) == ["job_2", "job_5"]
+
+
+def test_produced_is_per_scope():
+    reg = _reg([
+        _run("sensor_2d", scope_id="full"),      # survey
+        _run("photogrammetry", scope_id="job_2"),
+    ])
+    survey = ptw.produced_node_ids(reg, "survey")
+    job2 = ptw.produced_node_ids(reg, "job_2")
+    assert "sensor_raster" in survey and "mesh" not in survey
+    assert "mesh" in job2 and "sensor_raster" not in job2

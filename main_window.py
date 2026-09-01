@@ -1924,25 +1924,32 @@ class MainWindow(QMainWindow):
         if pt is not None:
             pt.set_workspace(self.workspace_path, self._imported_data_roots(), "full")
 
-    def _on_products_build_requested(self, node_ids: list) -> None:
-        """Placeholder: log the composed build order.  The full plan_service
-        composition (turning node ids into a Task stack) is a follow-up; the
-        signal already carries the real expand_targets output."""
+    def _on_products_build_requested(self, plans: list) -> None:
+        """Placeholder: log the composed per-scope build order.  The full
+        plan_service composition (turning node ids into a Task stack) is a
+        follow-up; the signal already carries the real per-scope expand_targets
+        output — a list of {scope_id, node_ids}."""
         from product_graph import get_node
-        if not node_ids:
+        from product_tree_widget import scope_display_label
+        if not plans:
             self.log_text.append("Product Tree: nothing to build (all produced).")
             return
-        labels = " → ".join(get_node(n).label for n in node_ids)
-        self.log_text.append(
-            f"Product Tree: build requested — {len(node_ids)} step(s): {labels}")
-        self.log_text.append(f"    node ids: {node_ids}")
+        for plan in plans:
+            sid = plan.get("scope_id")
+            node_ids = plan.get("node_ids", [])
+            labels = " → ".join(get_node(n).label for n in node_ids)
+            self.log_text.append(
+                f"Product Tree [{scope_display_label(sid)}]: build requested — "
+                f"{len(node_ids)} step(s): {labels}")
+            self.log_text.append(f"    scope={sid} node ids: {node_ids}")
 
-    def _on_products_run_requested(self, node_id: str) -> None:
+    def _on_products_run_requested(self, node_id: str, scope_id: str) -> None:
         """Placeholder: log a single-node run request from a node's info panel."""
         from product_graph import get_node
+        from product_tree_widget import scope_display_label
         self.log_text.append(
             f"Product Tree: new run requested for '{get_node(node_id).label}' "
-            f"({node_id}).")
+            f"({node_id}) under {scope_display_label(scope_id)}.")
 
     def _find_job(self, job_id: int) -> "Job | None":
         import plan_service
