@@ -1382,16 +1382,19 @@ class MainWindow(QMainWindow):
     # ---- Anomalies tab handlers -------------------------------------------
 
     def _anomaly_out_dir(self) -> Path:
-        """Catalog output directory for the current workspace."""
+        """Catalog output directory for the current workspace (resolver-routed:
+        survey/anomaly in a bundle, anomaly_site_catalog in legacy)."""
         ws = (self.workspace_path or "").strip()
-        base = Path(ws) if ws else Path(__file__).resolve().parent
-        return base / "anomaly_site_catalog"
+        if ws:
+            return self._resolver().anomaly_dir()
+        return Path(__file__).resolve().parent / "anomaly_site_catalog"
 
     def _anomaly_interp_path(self) -> Path:
-        """interp_full.csv for the current workspace."""
+        """interp_full.csv for the current workspace (resolver-routed)."""
         ws = (self.workspace_path or "").strip()
-        base = Path(ws) if ws else Path(__file__).resolve().parent
-        return base / "interp_full.csv"
+        if ws:
+            return self._resolver().interp_full()
+        return Path(__file__).resolve().parent / "interp_full.csv"
 
     def _anomaly_run(self) -> None:
         """Kick off the detector and/or catalog in a background thread."""
@@ -4005,7 +4008,7 @@ class MainWindow(QMainWindow):
                 "Save the workspace first (toolbar → Save Workspace).\n"
                 "The job output directory is derived from the workspace location."
             )
-        output_dir = str(Path(self.workspace_path) / self._job_output_dirname())
+        output_dir = str(self._resolver().job_dir(self.pending_job))
 
         # Threshold values come from state (not UI widgets); sensor thresholds disabled.
         self.sensor_thresholds = {}
@@ -4042,7 +4045,9 @@ class MainWindow(QMainWindow):
             clahe_tile_grid_size=int(self.clahe_tile_size_spin.value()),
             annotation_config=self.annotation_config,
             full_interp_sample_hz=float(self.full_interp_hz_spin.value()),
-            workspace_directory=self.workspace_path,
+            # interp_full.csv is written here; resolver puts it at inputs/ in a
+            # bundle, workspace root in legacy — matching where readers look.
+            workspace_directory=str(self._resolver().interp_full().parent),
         )
         if selected_steps is not None:
             config.selected_steps = selected_steps
@@ -5413,7 +5418,7 @@ class MainWindow(QMainWindow):
             )
             if job is None or not job.intervals:
                 return self._interp_full_path(), self._outputs_root()
-            output_dir  = str(Path(self.workspace_path) / self._job_output_dirname(job) / "outputs")
+            output_dir  = self._job_products_dir(job)
             interp_path = self._get_filtered_interp_for_job(job)
             return interp_path, output_dir
         return self._interp_full_path(), self._outputs_root()
