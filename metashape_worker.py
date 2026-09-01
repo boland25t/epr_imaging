@@ -198,6 +198,14 @@ def _seed_reference(chunk, nav_csv, acc_h, acc_v):
             latc = cols.get("lat") or cols.get("latitude")
             lonc = cols.get("lon") or cols.get("longitude")
             altc = cols.get("alt") or cols.get("altitude") or cols.get("depth")
+            # Altitude ABOVE THE SEAFLOOR (height, ~metres) — this is the camera's
+            # CAPTURE DISTANCE, which Metashape needs to build depth maps for
+            # oblique cameras.  We use it as the vertical reference instead of
+            # absolute depth (~2500 m below surface): with -depth the camera and
+            # the seafloor are both at ~-2500 so there's no working-distance signal
+            # and the huge absolute Z hurts precision — exactly the "oblique camera
+            # angles without capture distance" warning.  Falls back to -depth.
+            altbc = cols.get("alt") or cols.get("altitude")
             headc = cols.get("heading") or cols.get("yaw")
             pitchc = cols.get("pitch")
             rollc = cols.get("roll")
@@ -224,8 +232,11 @@ def _seed_reference(chunk, nav_csv, acc_h, acc_v):
                 try:
                     t = dt.replace(tzinfo=timezone.utc).timestamp()
                     if use_utm:
-                        # x=easting, y=northing, z=-depth (below sea level negative)
-                        x = float(r[eastc]); y = float(r[northc]); z = -float(r[depthc])
+                        # x=easting, y=northing (UTM metres); z = altitude above the
+                        # seafloor (capture distance) when available, else -depth.
+                        x = float(r[eastc]); y = float(r[northc])
+                        z = (float(r[altbc]) if altbc and r.get(altbc) not in (None, "")
+                             else -float(r[depthc]))
                         if epsg is None and zonec and r.get(zonec):
                             epsg = _utm_epsg(r[zonec])
                     else:
