@@ -694,6 +694,7 @@ class MainWindow(QMainWindow):
         self._jobs_tab_widget    = self._build_jobs_tab()
         self.controls_tabs.addTab(self._jobs_tab_widget,                 "Jobs")
         self.controls_tabs.addTab(self._build_anomaly_tab(),             "Anomalies")
+        self.controls_tabs.addTab(self._build_products_tab(),            "Products")
         # Outputs is fully superseded by the Task Stack dock.  Its widget is
         # still constructed (the sampling / output / photogrammetry machinery
         # reads its controls) but kept off the tab bar.  The ref is held on self
@@ -1878,6 +1879,71 @@ class MainWindow(QMainWindow):
             "video":  bool(self.videos),
         }
 
+    # ------------------------------------------------------------------
+    # Product Tree (redesign centrepiece) — a checkable dependency tree that
+    # composes the task stack.  Graph logic lives in product_graph.py; the
+    # widget only renders + calls it.
+    # ------------------------------------------------------------------
+    def _imported_data_roots(self) -> set[str]:
+        """Which of video / nav / sensors this workspace has, for availability.
+
+        video  ← a video directory is set.
+        nav / sensors ← their inputs are configured OR interp_full.csv exists on
+        disk.  The interp table is the MERGED product of nav + sensors, so its
+        presence satisfies both roots — the real J1756 workspace has interp_full
+        present while navigation_file / sensor_files are empty (they were consumed
+        into the interp), and the video branch must still gate on video.
+        """
+        interp = self._interp_full_path()
+        interp_exists = bool(interp) and Path(interp).exists()
+        roots: set[str] = set()
+        if self.video_directory or self.videos:
+            roots.add("video")
+        if self.navigation_file is not None or interp_exists:
+            roots.add("nav")
+        if self.sensor_files or interp_exists:
+            roots.add("sensors")
+        return roots
+
+    def _build_products_tab(self) -> QWidget:
+        from product_tree_widget import ProductTreeWidget
+        self._product_tree = ProductTreeWidget(
+            workspace_dir=self.workspace_path,
+            imported=self._imported_data_roots(),
+            scope_id="full",
+        )
+        self._product_tree.buildRequested.connect(self._on_products_build_requested)
+        self._product_tree.runRequested.connect(self._on_products_run_requested)
+        return self._product_tree
+
+    def _refresh_product_tree(self) -> None:
+        """Re-point the Product Tree at the current workspace + imported data and
+        re-read the registry.  Bound slot: safe to call from main-thread handlers
+        (workspace load, stack-finished) per the threading rule."""
+        pt = getattr(self, "_product_tree", None)
+        if pt is not None:
+            pt.set_workspace(self.workspace_path, self._imported_data_roots(), "full")
+
+    def _on_products_build_requested(self, node_ids: list) -> None:
+        """Placeholder: log the composed build order.  The full plan_service
+        composition (turning node ids into a Task stack) is a follow-up; the
+        signal already carries the real expand_targets output."""
+        from product_graph import get_node
+        if not node_ids:
+            self.log_text.append("Product Tree: nothing to build (all produced).")
+            return
+        labels = " → ".join(get_node(n).label for n in node_ids)
+        self.log_text.append(
+            f"Product Tree: build requested — {len(node_ids)} step(s): {labels}")
+        self.log_text.append(f"    node ids: {node_ids}")
+
+    def _on_products_run_requested(self, node_id: str) -> None:
+        """Placeholder: log a single-node run request from a node's info panel."""
+        from product_graph import get_node
+        self.log_text.append(
+            f"Product Tree: new run requested for '{get_node(node_id).label}' "
+            f"({node_id}).")
+
     def _find_job(self, job_id: int) -> "Job | None":
         import plan_service
         return plan_service.find_job(self._plan_context(), job_id)
@@ -2581,6 +2647,7 @@ class MainWindow(QMainWindow):
             self._stack_panel.set_failed_count(f)
 
         self._workspace_panel.refresh()
+        self._refresh_product_tree()
         QTimer.singleShot(0, lambda: QMessageBox.information(self, "Stack complete", msg))
 
     def _on_stack_error(self, message: str) -> None:
@@ -5317,6 +5384,7 @@ class MainWindow(QMainWindow):
         self._refresh_history_overlay()
         self._refresh_output_source_combo()
         self._refresh_outputs_status()
+        self._refresh_product_tree()
 
     # -----------------------------------------------------------------------
     # Outputs tab helpers

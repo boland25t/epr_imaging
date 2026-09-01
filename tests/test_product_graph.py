@@ -197,3 +197,15 @@ def test_node_status_badges():
     assert pg.node_status("trackline", produced, available) == "available"
     # not available (needs video)
     assert pg.node_status("sampling", produced, available) == "unavailable"
+
+
+def test_chunked_scope_relation():
+    import product_graph as pg
+    # photogrammetry branch fans into per-chunk scopes
+    assert pg.chunked_nodes() == {"sampling", "alignment", "dense", "mesh", "orthomosaic", "dem"}
+    assert pg.is_chunked("mesh") and pg.is_chunked("alignment")
+    # nav/sensor products are produced once per scope (survey/dive-wide default)
+    for nid in ("interp", "trackline", "sensor_raster", "anomaly", "netcdf", "report"):
+        assert not pg.is_chunked(nid), nid
+    # data roots are never chunked
+    assert not any(pg.is_chunked(r) for r in ("video", "nav", "sensors"))

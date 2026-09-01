@@ -98,7 +98,16 @@ class Node:
     is_root: bool = False
     is_intermediate: bool = False
     is_archived: bool = False
+    chunked: bool = False
     params: dict = field(default_factory=dict)
+
+    # chunked: this node's SCOPE-RELATION.  True for the photogrammetry branch,
+    # which fans a scope into many per-chunk scopes (each video segment → its own
+    # alignment/mesh/ortho/dem, each individually inspectable + re-runnable).
+    # False (default) = the node is produced once per scope (dive-wide "survey" by
+    # default, or once per user-named interval scope) — the nav/sensor products.
+    # A run's identity is (node × scope); this flag tells the tree whether a scope
+    # branch shows one leaf for the node or a fan of chunk leaves under it.
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +134,7 @@ _NODES: list[Node] = [
     Node(
         id="sampling", label="Sampling (frame extraction)",
         requires=("video",), needs_data=frozenset({"video"}),
-        task_type="sampling", is_intermediate=True,
+        task_type="sampling", is_intermediate=True, chunked=True,
         params={
             # Real schema is refined in plan_service.build_sampling_config.
             "frames_per_chunk": {"type": "int",   "default": 300,  "label": "Frames per chunk"},
@@ -140,7 +149,7 @@ _NODES: list[Node] = [
         # product consumes this without re-solving it — never repeat this step.
         id="alignment", label="Alignment (sparse + camera poses)",
         requires=("sampling",),
-        task_type="photogrammetry", is_intermediate=True,
+        task_type="photogrammetry", is_intermediate=True, chunked=True,
         params={
             "engine":         {"type": "choice", "default": "Metashape",
                                "label": "Engine", "choices": ["Metashape", "COLMAP"]},
@@ -155,7 +164,7 @@ _NODES: list[Node] = [
     Node(
         id="dense", label="Dense point cloud",
         requires=("alignment",),
-        task_type="photogrammetry", is_archived=True,
+        task_type="photogrammetry", is_archived=True, chunked=True,
         params={
             "build_dense":   {"type": "bool", "default": True, "label": "Build dense cloud"},
             "dense_quality": {"type": "choice", "default": "Medium",
@@ -166,7 +175,7 @@ _NODES: list[Node] = [
     Node(
         id="mesh", label="Textured mesh",
         requires=("alignment",),
-        task_type="photogrammetry",
+        task_type="photogrammetry", chunked=True,
         params={
             "build_model":   {"type": "bool", "default": True, "label": "Build model (mesh)"},
             "mesh_faces":    {"type": "choice", "default": "Medium",
@@ -177,7 +186,7 @@ _NODES: list[Node] = [
     Node(
         id="orthomosaic", label="Orthomosaic",
         requires=("alignment",),
-        task_type="photogrammetry",
+        task_type="photogrammetry", chunked=True,
         params={
             "build_orthomosaic": {"type": "bool", "default": True, "label": "Build orthomosaic"},
         },
@@ -185,7 +194,7 @@ _NODES: list[Node] = [
     Node(
         id="dem", label="Digital elevation model",
         requires=("alignment",),
-        task_type="photogrammetry",
+        task_type="photogrammetry", chunked=True,
         params={
             "build_dem":  {"type": "bool", "default": True,  "label": "Build DEM"},
             "export_dem": {"type": "bool", "default": True,  "label": "Export DEM GeoTIFF"},
@@ -273,6 +282,20 @@ def get_node(node_id: str) -> Node:
 def data_root_nodes() -> list[Node]:
     """The three importable data-root nodes."""
     return [n for n in _NODES if n.is_root]
+
+
+def is_chunked(node_id: str) -> bool:
+    """True if this node fans a scope into per-chunk scopes (photogrammetry).
+
+    The tree renders a chunked node under a scope branch as a FAN of per-chunk
+    leaves (chunk_01 … chunk_N, each independently produced/re-runnable); a
+    non-chunked node renders as a single leaf produced once per scope."""
+    return PRODUCT_GRAPH[node_id].chunked
+
+
+def chunked_nodes() -> set[str]:
+    """Ids of nodes that fan into per-chunk scopes (the photogrammetry branch)."""
+    return {n.id for n in _NODES if n.chunked}
 
 
 # ---------------------------------------------------------------------------
