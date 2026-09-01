@@ -718,6 +718,11 @@ class MainWindow(QMainWindow):
         # it spans the whole central area).
         self.center_stack.addWidget(self._build_products_canvas_tab())        # 6 — tech tree
         self._product_canvas_index = self.center_stack.count() - 1
+        # New PRIMARY view (design "B"): the three-pane IDE-style workbench, added
+        # alongside the existing tabs + full-screen tech tree so the two can be
+        # compared.  Toggled full-area from the View menu, like the tech tree.
+        self.center_stack.addWidget(self._build_workbench_tab())              # 7 — workbench
+        self._workbench_index = self.center_stack.count() - 1
         splitter.addWidget(self.center_stack)
         splitter.addWidget(self._build_summary_panel())
 
@@ -794,6 +799,12 @@ class MainWindow(QMainWindow):
             "Product Tree (full screen)", self._toggle_product_tree_fullscreen)
         self.product_tree_action.setCheckable(True)
         self.product_tree_action.setShortcut("Ctrl+T")
+        # New primary three-pane workbench (design "B"), shown full-area beside the
+        # existing views for comparison.
+        self.workbench_action = view_menu.addAction(
+            "Workbench (B layout)", self._toggle_workbench)
+        self.workbench_action.setCheckable(True)
+        self.workbench_action.setShortcut("Ctrl+W")
 
         # Keep a no-op run_action attribute so existing code that references it
         # (e.g., _set_processing_enabled) doesn't crash.  It is never displayed.
@@ -1954,6 +1965,58 @@ class MainWindow(QMainWindow):
         if pc is not None:
             pc.set_workspace(self.workspace_path, self._imported_data_roots(), "full")
 
+    def _build_workbench_tab(self) -> QWidget:
+        """The NEW primary three-pane workbench (design "B") — NAVIGATOR | EDITOR |
+        INSPECTOR — wired to the SAME imported-set logic and the SAME build/run/
+        export signal contract as the other product views.
+
+        Editor swap-in pages: the app's existing timeline/trackline panel ("intervals")
+        and map/3D panel ("map") are single instances already owned by center_stack,
+        so they cannot be reparented into the workbench's editor stack without pulling
+        them out of the main layout.  The addEditorPage() hooks are left in place for a
+        follow-up that gives the workbench its own panel instances; for now the
+        workbench editor stays on its default tech-tree surface."""
+        from workbench import Workbench
+        self._workbench = Workbench(
+            workspace_dir=self.workspace_path,
+            imported=self._imported_data_roots(),
+            scope_id="survey",
+        )
+        self._workbench.buildRequested.connect(self._on_products_build_requested)
+        self._workbench.runRequested.connect(self._on_products_run_requested)
+        return self._workbench
+
+    def _refresh_workbench(self) -> None:
+        """Re-point the workbench at the current workspace + imported data and
+        re-read the registry.  Bound slot, same main-thread refresh path as the
+        tech tree."""
+        wb = getattr(self, "_workbench", None)
+        if wb is not None:
+            wb.set_workspace(self.workspace_path, self._imported_data_roots(),
+                             "survey")
+
+    def _toggle_workbench(self, checked: bool | None = None) -> None:
+        """Show the three-pane workbench full-area (hiding the left controls tabs,
+        like the tech-tree toggle), or restore the normal layout.  Bound slot —
+        safe to trigger from the View menu action."""
+        if checked is None:
+            checked = self.workbench_action.isChecked()
+        if self.workbench_action.isChecked() != checked:
+            self.workbench_action.setChecked(checked)
+        if checked:
+            # Only one full-area overlay at a time: drop the tech-tree toggle.
+            if getattr(self, "product_tree_action", None) is not None \
+                    and self.product_tree_action.isChecked():
+                self.product_tree_action.setChecked(False)
+            self.controls_tabs.hide()
+            idx = getattr(self, "_workbench_index", None)
+            if idx is not None:
+                self.center_stack.setCurrentIndex(idx)
+            self._refresh_workbench()
+        else:
+            self.controls_tabs.show()
+            self._update_center_panel()
+
     def _toggle_product_tree_fullscreen(self, checked: bool | None = None) -> None:
         """Show the product tech tree full-size in the centre pane, or restore
         the normal three-panel layout.
@@ -1969,6 +2032,10 @@ class MainWindow(QMainWindow):
         if self.product_tree_action.isChecked() != checked:
             self.product_tree_action.setChecked(checked)
         if checked:
+            # Only one full-area overlay at a time: drop the workbench toggle.
+            if getattr(self, "workbench_action", None) is not None \
+                    and self.workbench_action.isChecked():
+                self.workbench_action.setChecked(False)
             self.controls_tabs.hide()
             idx = getattr(self, "_product_canvas_index", None)
             if idx is not None:
@@ -5446,6 +5513,7 @@ class MainWindow(QMainWindow):
         self._refresh_output_source_combo()
         self._refresh_outputs_status()
         self._refresh_product_tree()
+        self._refresh_workbench()
 
     # -----------------------------------------------------------------------
     # Outputs tab helpers
@@ -6248,8 +6316,15 @@ class MainWindow(QMainWindow):
         Jobs tab                → map panel    (index 2, triggers map refresh).
         Any other tab           → timeline     (index 0).
         """
-        # While the tech tree owns the whole centre pane, don't let a refresh
-        # (which calls this) yank the centre stack back to a tab-driven panel.
+        # While a full-area overlay (tech tree or workbench) owns the whole centre
+        # pane, don't let a refresh (which calls this) yank the centre stack back
+        # to a tab-driven panel.
+        wb_act = getattr(self, "workbench_action", None)
+        if wb_act is not None and wb_act.isChecked():
+            idx = getattr(self, "_workbench_index", None)
+            if idx is not None:
+                self.center_stack.setCurrentIndex(idx)
+            return
         act = getattr(self, "product_tree_action", None)
         if act is not None and act.isChecked():
             idx = getattr(self, "_product_canvas_index", None)
