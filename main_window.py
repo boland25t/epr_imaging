@@ -695,6 +695,8 @@ class MainWindow(QMainWindow):
         self.controls_tabs.addTab(self._jobs_tab_widget,                 "Jobs")
         self.controls_tabs.addTab(self._build_anomaly_tab(),             "Anomalies")
         self.controls_tabs.addTab(self._build_products_tab(),            "Products")
+        # The tech-tree canvas is no longer a width-capped side tab; it is now a
+        # full-size page in the centre stack (see below) shown via the View menu.
         # Outputs is fully superseded by the Task Stack dock.  Its widget is
         # still constructed (the sampling / output / photogrammetry machinery
         # reads its controls) but kept off the tab bar.  The ref is held on self
@@ -711,6 +713,11 @@ class MainWindow(QMainWindow):
         self.center_stack.addWidget(self._build_manual_map_panel())           # 3
         self.center_stack.addWidget(self._build_threshold_graph_panel())      # 4
         self.center_stack.addWidget(QWidget())                                # 5 — blank
+        # Product tech tree — promoted from a cramped side tab to a full-size
+        # centre page.  The View menu action toggles it (hiding controls_tabs so
+        # it spans the whole central area).
+        self.center_stack.addWidget(self._build_products_canvas_tab())        # 6 — tech tree
+        self._product_canvas_index = self.center_stack.count() - 1
         splitter.addWidget(self.center_stack)
         splitter.addWidget(self._build_summary_panel())
 
@@ -719,7 +726,11 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([580, 520, 400])
 
-        # Task-stack dock — bottom-LEFT (the primary orchestration surface).
+        # Task-Stack panel — RETIRED from the visible UI (the tech tree will
+        # drive the stack).  The panel object and its signal wiring are kept
+        # intact and referenced on self so the execution engine (self._task_stack,
+        # StackWorker, _run_stack / _rerun_failed and every self._stack_panel.*
+        # call) stays fully callable; it is simply no longer docked or shown.
         from stack_panel import StackPanel
         self._stack_panel = StackPanel(self._task_stack)
         self._stack_panel.set_providers(
@@ -731,25 +742,15 @@ class MainWindow(QMainWindow):
         self._stack_panel.rerun_failed_requested.connect(self._rerun_failed)
         self._stack_panel.tasks_changed.connect(self._on_tasks_changed)
         self._stack_panel.one_click_requested.connect(self._open_one_click_dialog)
-        stack_dock = QDockWidget("Task Stack", self)
-        stack_dock.setObjectName("StackDock")
-        stack_dock.setWidget(self._stack_panel)
-        stack_dock.setMinimumWidth(320)
-        self.addDockWidget(Qt.BottomDockWidgetArea, stack_dock)
 
-        # File tree / Workspace dock — bottom-RIGHT.
+        # File tree / Workspace panel — RETIRED from the visible UI.  Kept alive
+        # and wired so every existing self._workspace_panel.* call still works;
+        # simply no longer docked or shown.
         self._workspace_panel = WorkspacePanel()
         self._workspace_panel.run_selected.connect(self._on_3d_run_selected)
         self._workspace_panel.make_slices_requested.connect(self._on_make_slices_requested)
         self._workspace_panel.open_in_viewer_requested.connect(self._open_ply_in_viewer)
         self._workspace_panel.open_in_metashape_requested.connect(self._open_in_metashape_gui)
-        workspace_dock = QDockWidget("Workspace", self)
-        workspace_dock.setObjectName("WorkspaceDock")
-        workspace_dock.setWidget(self._workspace_panel)
-        workspace_dock.setMinimumWidth(280)
-        self.addDockWidget(Qt.BottomDockWidgetArea, workspace_dock)
-        # Place the file tree to the RIGHT of the task stack.
-        self.splitDockWidget(stack_dock, workspace_dock, Qt.Horizontal)
 
         # Claude AI assistant panel — right-side dock
         self._chat_panel = ChatPanel(context_fn=self._build_claude_context)
@@ -786,6 +787,13 @@ class MainWindow(QMainWindow):
         self.product_browser_action.setShortcut("Ctrl+B")
         self.viewer_3d_action = view_menu.addAction("3D Viewer (overlays)…",
                                                     self._open_3d_viewer)
+        view_menu.addSeparator()
+        # Full-size product tech tree: switch the centre pane to the canvas and
+        # collapse the left controls tabs so the tree spans the whole area.
+        self.product_tree_action = view_menu.addAction(
+            "Product Tree (full screen)", self._toggle_product_tree_fullscreen)
+        self.product_tree_action.setCheckable(True)
+        self.product_tree_action.setShortcut("Ctrl+T")
 
         # Keep a no-op run_action attribute so existing code that references it
         # (e.g., _set_processing_enabled) doesn't crash.  It is never displayed.
@@ -1923,6 +1931,52 @@ class MainWindow(QMainWindow):
         pt = getattr(self, "_product_tree", None)
         if pt is not None:
             pt.set_workspace(self.workspace_path, self._imported_data_roots(), "full")
+        self._refresh_product_canvas()
+
+    def _build_products_canvas_tab(self) -> QWidget:
+        """The PROTOTYPE tech-tree canvas view of the product graph — a parallel
+        alternative to the QTreeWidget Products tab, wired to the SAME imported-set
+        logic and the SAME build/run/export signal contract."""
+        from product_tree_canvas import ProductTreeCanvas
+        self._product_canvas = ProductTreeCanvas(
+            workspace_dir=self.workspace_path,
+            imported=self._imported_data_roots(),
+            scope_id="full",
+        )
+        self._product_canvas.buildRequested.connect(self._on_products_build_requested)
+        self._product_canvas.runRequested.connect(self._on_products_run_requested)
+        return self._product_canvas
+
+    def _refresh_product_canvas(self) -> None:
+        """Re-point the tech-tree canvas at the current workspace + imported data.
+        Bound slot, called from the same main-thread refresh path as the tree."""
+        pc = getattr(self, "_product_canvas", None)
+        if pc is not None:
+            pc.set_workspace(self.workspace_path, self._imported_data_roots(), "full")
+
+    def _toggle_product_tree_fullscreen(self, checked: bool | None = None) -> None:
+        """Show the product tech tree full-size in the centre pane, or restore
+        the normal three-panel layout.
+
+        When on, the left controls tabs are hidden and the centre stack switches
+        to the tech-tree canvas page so it spans the whole central area; when
+        off, the controls tabs return and the centre panel is restored to match
+        the active tab.  Bound slot — safe to trigger from the View menu action.
+        """
+        if checked is None:
+            checked = self.product_tree_action.isChecked()
+        # Keep the menu check state in sync when called programmatically.
+        if self.product_tree_action.isChecked() != checked:
+            self.product_tree_action.setChecked(checked)
+        if checked:
+            self.controls_tabs.hide()
+            idx = getattr(self, "_product_canvas_index", None)
+            if idx is not None:
+                self.center_stack.setCurrentIndex(idx)
+            self._refresh_product_canvas()
+        else:
+            self.controls_tabs.show()
+            self._update_center_panel()
 
     def _on_products_build_requested(self, plans: list) -> None:
         """Placeholder: log the composed per-scope build order.  The full
@@ -6194,6 +6248,14 @@ class MainWindow(QMainWindow):
         Jobs tab                → map panel    (index 2, triggers map refresh).
         Any other tab           → timeline     (index 0).
         """
+        # While the tech tree owns the whole centre pane, don't let a refresh
+        # (which calls this) yank the centre stack back to a tab-driven panel.
+        act = getattr(self, "product_tree_action", None)
+        if act is not None and act.isChecked():
+            idx = getattr(self, "_product_canvas_index", None)
+            if idx is not None:
+                self.center_stack.setCurrentIndex(idx)
+            return
         if index is None:
             index = self.controls_tabs.currentIndex()
         tab_text = self.controls_tabs.tabText(index)

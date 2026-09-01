@@ -150,6 +150,21 @@ def _call(fn, **kw):
 # --------------------------------------------------------------------------
 # georeference: seed camera locations from an interp.csv (timestamp_iso → cam)
 # --------------------------------------------------------------------------
+def _utm_epsg(zone_str):
+    """EPSG code for a UTM zone string like '13P' / '13N' / '13'.
+
+    UTM latitude bands N..X are northern hemisphere (326xx), C..M southern
+    (327xx).  Defaults to zone 13 North if unparseable."""
+    import re
+    m = re.match(r"\s*(\d{1,2})\s*([A-Za-z]?)", str(zone_str))
+    if not m:
+        return 32613
+    zone = int(m.group(1))
+    band = (m.group(2) or "N").upper()
+    north = band >= "N"
+    return (32600 if north else 32700) + zone
+
+
 def _seed_reference(chunk, nav_csv, acc_h, acc_v):
     """Best-effort: give each camera a lat/lon/alt from the nav CSV.
 
@@ -171,25 +186,52 @@ def _seed_reference(chunk, nav_csv, acc_h, acc_v):
         return None
 
     rows = []
+    use_utm = False
+    epsg = None
     try:
         with open(nav_csv, "r", newline="") as fh:
             rd = csv.DictReader(fh)
             cols = {c.lower(): c for c in (rd.fieldnames or [])}
             tcol = cols.get("timestamp_iso") or cols.get("timestamp")
+            eastc = cols.get("easting"); northc = cols.get("northing"); depthc = cols.get("depth")
+            zonec = cols.get("utm_zone")
             latc = cols.get("lat") or cols.get("latitude")
             lonc = cols.get("lon") or cols.get("longitude")
             altc = cols.get("alt") or cols.get("altitude") or cols.get("depth")
-            if not (tcol and latc and lonc):
-                log("nav csv lacks timestamp/lat/lon columns — skipping georeference")
+            headc = cols.get("heading") or cols.get("yaw")
+            pitchc = cols.get("pitch")
+            rollc = cols.get("roll")
+            # Prefer UTM easting/northing/depth (all metres) so the model is
+            # georeferenced in the SAME frame as the sensor rasters/trackline and
+            # Metashape gets consistent metric references.  Seeding lat/lon
+            # (degrees) with a ~2500 m depth as altitude mixes units and both
+            # mislocates AND distorts the reconstruction — the bug this fixes.
+            use_utm = bool(eastc and northc and depthc)
+            if not tcol or not (use_utm or (latc and lonc)):
+                log("nav csv lacks usable georef columns — skipping georeference")
                 return 0
+            has_orient = bool(headc and pitchc and rollc)
+
+            def _num(r, c):
+                try:
+                    return float(r[c]) if c and r.get(c) not in (None, "") else None
+                except (ValueError, TypeError):
+                    return None
             for r in rd:
                 dt = parse_iso(r.get(tcol))
                 if dt is None:
                     continue
                 try:
-                    rows.append((dt.replace(tzinfo=timezone.utc).timestamp(),
-                                 float(r[latc]), float(r[lonc]),
-                                 float(r[altc]) if altc and r.get(altc) not in (None, "") else 0.0))
+                    t = dt.replace(tzinfo=timezone.utc).timestamp()
+                    if use_utm:
+                        # x=easting, y=northing, z=-depth (below sea level negative)
+                        x = float(r[eastc]); y = float(r[northc]); z = -float(r[depthc])
+                        if epsg is None and zonec and r.get(zonec):
+                            epsg = _utm_epsg(r[zonec])
+                    else:
+                        x = float(r[lonc]); y = float(r[latc])
+                        z = float(r[altc]) if altc and r.get(altc) not in (None, "") else 0.0
+                    rows.append((t, x, y, z, _num(r, headc), _num(r, pitchc), _num(r, rollc)))
                 except (ValueError, TypeError):
                     continue
     except OSError as e:
@@ -200,9 +242,19 @@ def _seed_reference(chunk, nav_csv, acc_h, acc_v):
     rows.sort()
     times = [r[0] for r in rows]
 
+    # Set the chunk coordinate system: UTM (metres) when we have easting/northing,
+    # else WGS84.  Camera references + all exported products land in this frame.
+    crs_code = "EPSG::%d" % (epsg or 32613) if use_utm else "EPSG::4326"
+    try:
+        chunk.crs = Metashape.CoordinateSystem(crs_code)
+    except Exception:                                           # noqa: BLE001
+        pass
+    log("georeference frame: %s (%s)" % (crs_code, "UTM metres" if use_utm else "WGS84 lat/lon"))
+
     import bisect
     frame_rx = re.compile(r"(\d{8}T\d{6})")
     seeded = 0
+    oriented = 0
     for cam in chunk.cameras:
         m = list(frame_rx.finditer(cam.label))
         if not m:
@@ -215,18 +267,34 @@ def _seed_reference(chunk, nav_csv, acc_h, acc_v):
         i = bisect.bisect_left(times, t)
         i = min(range(max(0, i - 1), min(len(rows), i + 1)),
                 key=lambda k: abs(times[k] - t))
-        _, lat, lon, alt = rows[i]
-        cam.reference.location = Metashape.Vector([lon, lat, alt])
+        _, x, y, z, heading, pitch, roll = rows[i]
+        # x,y,z already in the chunk CRS axis order (UTM: easting/northing/-depth;
+        # WGS84: lon/lat/alt) so the same vector serves both frames.
+        cam.reference.location = Metashape.Vector([x, y, z])
         cam.reference.accuracy = Metashape.Vector([acc_h, acc_h, acc_v])
         cam.reference.enabled = True
+        # Orientation prior (heading/pitch/roll → Metashape yaw/pitch/roll), seeded
+        # LOOSELY: a large rotation accuracy makes it a gentle nudge, so if the
+        # vehicle→camera convention is off it can't dominate the image-based
+        # solution, but when it's right it helps constrain a low-parallax scene.
+        if has_orient and None not in (heading, pitch, roll):
+            try:
+                cam.reference.rotation = Metashape.Vector([heading, pitch, roll])
+                cam.reference.rotation_accuracy = Metashape.Vector([30.0, 30.0, 30.0])
+                cam.reference.rotation_enabled = True
+                oriented += 1
+            except Exception:                                   # noqa: BLE001
+                pass
         seeded += 1
     if seeded:
-        chunk.crs = Metashape.CoordinateSystem("EPSG::4326")
+        # CRS already set above (UTM or WGS84); just refresh the transform so the
+        # solved cameras are placed into that georeferenced frame.
         try:
             chunk.updateTransform()
         except Exception:                                       # noqa: BLE001
             pass
-    log("georeference: seeded %d/%d cameras" % (seeded, len(chunk.cameras)))
+    log("georeference: seeded %d/%d cameras (%d with orientation)"
+        % (seeded, len(chunk.cameras), oriented))
     return seeded
 
 
@@ -243,21 +311,68 @@ def process_chunk(chunk, spec, opt):
     log("add %d photos" % len(spec["photos"]))
     chunk.addPhotos(spec["photos"])
 
-    log("matchPhotos + alignCameras (accuracy=%s)" % opt["align_accuracy"])
-    _call(chunk.matchPhotos,
-          downscale={"Highest": 0, "High": 1, "Medium": 2, "Low": 4,
-                     "Lowest": 8}.get(opt["align_accuracy"], 1),
-          generic_preselection=opt["generic_preselect"],
-          reference_preselection=False,
-          keypoint_limit=opt["key_point_limit"],
-          tiepoint_limit=opt["tie_point_limit"])
+    # ---- image quality gate (Metashape's own grading) ----
+    # analyzeImages() scores each photo 0-1 on the sharpness of its sharpest
+    # region; Agisoft recommends disabling anything below ~0.5.  For underwater
+    # footage (motion blur, backscatter, turbidity) this removes garbage frames
+    # that otherwise poison feature matching.  Disabled cameras are skipped by
+    # matchPhotos/alignCameras.  Threshold 0 disables the gate.
+    q_thresh = float(opt.get("quality_threshold", 0.5))
+    if q_thresh > 0:
+        try:
+            analyze = getattr(chunk, "analyzeImages", None) or getattr(chunk, "estimateImageQuality")
+            analyze()  # 2.x: analyzeImages(); 1.x: estimateImageQuality()
+            scores, dropped = [], 0
+            for cam in chunk.cameras:
+                try:
+                    q = float(cam.meta["Image/Quality"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                scores.append(q)
+                if q < q_thresh:
+                    cam.enabled = False
+                    dropped += 1
+            if scores:
+                import statistics
+                log("image quality: min=%.2f med=%.2f max=%.2f — dropped %d/%d below %.2f"
+                    % (min(scores), statistics.median(scores), max(scores),
+                       dropped, len(scores), q_thresh))
+        except Exception as e:                                  # noqa: BLE001
+            log("image-quality gate skipped: %r" % e)
+
+    # Seed nav reference (camera locations + orientation) BEFORE matching, so
+    # REFERENCE PRESELECTION can use it — Metashape then only matches images that
+    # are spatially near each other per the nav, which is the primary payoff of
+    # importing navigation.  It is ON automatically whenever a nav reference is
+    # supplied.  (Georeferencing of the solved cameras is finalised after align.)
+    use_ref = bool(spec.get("nav_csv") and opt["use_nav_reference"])
+    if use_ref:
+        _seed_reference(chunk, spec["nav_csv"], opt["nav_accuracy_h"], opt["nav_accuracy_v"])
+
+    log("matchPhotos + alignCameras (accuracy=%s, reference_preselection=%s)"
+        % (opt["align_accuracy"], use_ref))
+    match_kw = dict(
+        downscale={"Highest": 0, "High": 1, "Medium": 2, "Low": 4,
+                   "Lowest": 8}.get(opt["align_accuracy"], 1),
+        generic_preselection=opt["generic_preselect"],
+        reference_preselection=use_ref,
+        keypoint_limit=opt["key_point_limit"],
+        tiepoint_limit=opt["tie_point_limit"])
+    if use_ref:
+        try:
+            match_kw["reference_preselection_mode"] = Metashape.ReferencePreselectionSource
+        except AttributeError:
+            pass  # older API: reference_preselection=True alone uses source coords
+    _call(chunk.matchPhotos, **match_kw)
     _call(chunk.alignCameras, adaptive_fitting=opt["adaptive_fitting"])
 
     aligned = sum(1 for c in chunk.cameras if c.transform is not None)
     log("aligned %d/%d cameras" % (aligned, len(chunk.cameras)))
-
-    if spec.get("nav_csv") and opt["use_nav_reference"]:
-        _seed_reference(chunk, spec["nav_csv"], opt["nav_accuracy_h"], opt["nav_accuracy_v"])
+    if use_ref:
+        try:
+            chunk.updateTransform()   # georeference the solved cameras
+        except Exception:             # noqa: BLE001
+            pass
 
     if aligned >= 2:
         try:
@@ -319,10 +434,13 @@ def process_chunk(chunk, spec, opt):
                 chunk.exportRaster(j("dem.tif"), source_data=Metashape.ElevationData)
                 products["dem_tif"] = j("dem.tif")
             if opt["build_orthomosaic"] and chunk.elevation is not None:
-                surf_for_ortho = (Metashape.ModelData if have_mesh
-                                  else Metashape.ElevationData)
+                # Orthomosaic is a true orthorectified projection onto the DEM by
+                # default — NOT draped on the mesh (a noisy mesh warps the ortho).
+                # Set ortho_surface="Mesh" to override where the mesh is trusted.
+                want_mesh_ortho = (opt.get("ortho_surface", "DEM") == "Mesh") and have_mesh
+                surf_for_ortho = Metashape.ModelData if want_mesh_ortho else Metashape.ElevationData
                 log("buildOrthomosaic (surface=%s)"
-                    % ("mesh" if have_mesh else "DEM"))
+                    % ("mesh" if want_mesh_ortho else "DEM"))
                 _call(chunk.buildOrthomosaic, surface_data=surf_for_ortho,
                       blending_mode=_blending(opt["texture_blending"]),
                       fill_holes=True, progress=_progress("buildOrthomosaic"))

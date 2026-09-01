@@ -794,6 +794,7 @@ def _run_metashape_batch_subprocess(exe, project_psx, frame_sets, *,
         return opts.get(k, d)
 
     options = {
+        "quality_threshold": float(o("quality_threshold", 0.5)),
         "align_accuracy": o("align_accuracy", "High"),
         "key_point_limit": int(o("key_point_limit", 40000)),
         "tie_point_limit": int(o("tie_point_limit", 10000)),
@@ -807,6 +808,7 @@ def _run_metashape_batch_subprocess(exe, project_psx, frame_sets, *,
         "mesh_surface": o("mesh_surface", "Arbitrary"),
         "mesh_faces": o("mesh_faces", "Medium"),
         "mesh_source": o("mesh_source", "Dense cloud"),
+        "ortho_surface": o("ortho_surface", "DEM"),
         "mesh_vertex_colors": bool(o("mesh_vertex_colors", True)),
         "build_texture": bool(o("build_texture", False)),
         "texture_size": int(o("texture_size", 4096)),
