@@ -115,6 +115,29 @@ def _blending(name):
             "Disabled": Metashape.DisabledBlending}.get(name, Metashape.MosaicBlending)
 
 
+def _progress(stage):
+    """A Metashape progress callback that logs '<stage> NN%' — throttled to at
+    most one line per +5% or per 10s so long stages (depth maps, dense, mesh,
+    DEM, ortho) stream live progress to the app UI instead of going silent.
+
+    Metashape calls the callback with a float 0..100 very frequently; without the
+    throttle it would flood the log."""
+    import time
+    state = {"pct": -100.0, "t": 0.0}
+
+    def cb(pct):
+        try:
+            pct = float(pct)
+        except (TypeError, ValueError):
+            return
+        now = time.time()
+        if pct - state["pct"] >= 5.0 or now - state["t"] >= 10.0 or pct >= 100.0:
+            log("%s %.0f%%" % (stage, pct))
+            state["pct"] = pct
+            state["t"] = now
+    return cb
+
+
 def _call(fn, **kw):
     """Call a Metashape stage, dropping progress= if the build rejects it."""
     try:
@@ -250,8 +273,9 @@ def process_chunk(chunk, spec, opt):
         log("buildDepthMaps + buildPointCloud (quality=%s)" % opt["dense_quality"])
         _call(chunk.buildDepthMaps, downscale={"Ultra High": 1, "High": 2, "Medium": 4,
               "Low": 8, "Lowest": 16}.get(opt["dense_quality"], 4),
-              filter_mode=_depth_filter(opt["depth_filter"]))
-        _call(chunk.buildPointCloud)
+              filter_mode=_depth_filter(opt["depth_filter"]),
+              progress=_progress("buildDepthMaps"))
+        _call(chunk.buildPointCloud, progress=_progress("buildPointCloud"))
         have_dense = chunk.point_cloud is not None
         if have_dense and opt["export_dense_ply"]:
             chunk.exportPointCloud(j("dense.ply"), source_data=Metashape.PointCloudData)
@@ -264,19 +288,20 @@ def process_chunk(chunk, spec, opt):
                else Metashape.PointCloudData)
         if src == Metashape.PointCloudData and not have_dense:
             log("mesh wants dense cloud but none built — building point cloud first")
-            _call(chunk.buildDepthMaps, downscale=4)
-            _call(chunk.buildPointCloud)
+            _call(chunk.buildDepthMaps, downscale=4, progress=_progress("buildDepthMaps"))
+            _call(chunk.buildPointCloud, progress=_progress("buildPointCloud"))
         log("buildModel (surface=%s, faces=%s, source=%s)"
             % (opt["mesh_surface"], opt["mesh_faces"], opt["mesh_source"]))
         _call(chunk.buildModel, surface_type=_surface(opt["mesh_surface"]),
               face_count=_faces(opt["mesh_faces"]), source_data=src,
-              vertex_colors=opt["mesh_vertex_colors"])
+              vertex_colors=opt["mesh_vertex_colors"], progress=_progress("buildModel"))
         have_mesh = chunk.model is not None
         if have_mesh:
             if opt["build_texture"]:
-                _call(chunk.buildUV)
+                _call(chunk.buildUV, progress=_progress("buildUV"))
                 _call(chunk.buildTexture, blending_mode=_blending(opt["texture_blending"]),
-                      texture_size=opt["texture_size"], fill_holes=opt["texture_fill_holes"])
+                      texture_size=opt["texture_size"], fill_holes=opt["texture_fill_holes"],
+                      progress=_progress("buildTexture"))
                 chunk.exportModel(j("mesh_textured.obj"), save_texture=True)
                 products["mesh_textured_obj"] = j("mesh_textured.obj")
             if opt["export_mesh_obj"]:
@@ -289,7 +314,7 @@ def process_chunk(chunk, spec, opt):
             surface = (Metashape.DataSource.PointCloudData if have_dense
                        else Metashape.DataSource.TiePointsData)
             log("buildDem")
-            _call(chunk.buildDem, source_data=surface)
+            _call(chunk.buildDem, source_data=surface, progress=_progress("buildDem"))
             if chunk.elevation is not None and opt["export_dem"]:
                 chunk.exportRaster(j("dem.tif"), source_data=Metashape.ElevationData)
                 products["dem_tif"] = j("dem.tif")
@@ -300,7 +325,7 @@ def process_chunk(chunk, spec, opt):
                     % ("mesh" if have_mesh else "DEM"))
                 _call(chunk.buildOrthomosaic, surface_data=surf_for_ortho,
                       blending_mode=_blending(opt["texture_blending"]),
-                      fill_holes=True)
+                      fill_holes=True, progress=_progress("buildOrthomosaic"))
                 if chunk.orthomosaic is not None:
                     chunk.exportRaster(j("orthomosaic.tif"),
                                        source_data=Metashape.OrthomosaicData)
