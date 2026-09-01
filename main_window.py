@@ -196,13 +196,11 @@ class WorkspaceStartupDialog(QDialog):
         self.choice = choice
         self.accept()
 
-    def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key_Escape:
-            return  # Block Escape
-        super().keyPressEvent(event)
-
-    def closeEvent(self, event) -> None:
-        event.ignore()  # Block the window-close button
+    # Escape and the window-close button are ALLOWED (they reject the dialog,
+    # leaving self.choice == None).  The caller treats a None choice as "quit the
+    # app" — previously both were blocked, which made the startup dialog
+    # impossible to close and could wedge the app with no way to exit if the
+    # dialog ever rendered invisibly/unclickably (a WSLg failure mode).
 
 
 # ===========================================================================
@@ -4766,6 +4764,15 @@ class MainWindow(QMainWindow):
                 self._load_workspace()
             elif dlg.choice == WorkspaceStartupDialog.NEW:
                 self._save_workspace()
+            else:
+                # Dialog closed/escaped without a choice → the user wants out.
+                # Quit cleanly instead of re-spawning the dialog forever (the old
+                # behaviour, which could wedge the app if the dialog was
+                # unclickable).  Deferred quit so we unwind this callback first.
+                self.workspace_saved = True   # suppress any close-time save prompt
+                QTimer.singleShot(0, QApplication.instance().quit)
+                self.close()
+                return
 
     def _restore_last_session(self) -> None:
         """Load the last-session workspace on startup if one exists.
