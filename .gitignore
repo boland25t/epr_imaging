@@ -59,3 +59,6 @@ interp.csv
 *.ply
 # Generated raster/image slices from the legacy 3-D example.
 3dvistool/slices/
+.biigle.env
+.biigle.local.env
+biigle_api_key

@@ -109,6 +109,14 @@ def _faces(name):
             "High": Metashape.HighFaceCount}.get(name, Metashape.MediumFaceCount)
 
 
+def _interpolation(name):
+    # Disabled leaves data-gaps (e.g. the nadir hole over a hover) as honest
+    # holes instead of stretching triangles across them into "curtains".
+    return {"Enabled": Metashape.EnabledInterpolation,
+            "Disabled": Metashape.DisabledInterpolation,
+            "Extrapolated": Metashape.Extrapolated}.get(name, Metashape.EnabledInterpolation)
+
+
 def _blending(name):
     return {"Mosaic": Metashape.MosaicBlending, "Average": Metashape.AverageBlending,
             "Max": Metashape.MaxBlending, "Min": Metashape.MinBlending,
@@ -232,11 +240,15 @@ def _seed_reference(chunk, nav_csv, acc_h, acc_v):
                 try:
                     t = dt.replace(tzinfo=timezone.utc).timestamp()
                     if use_utm:
-                        # x=easting, y=northing (UTM metres); z = altitude above the
-                        # seafloor (capture distance) when available, else -depth.
+                        # x=easting, y=northing (UTM metres); z = -pressure depth.
+                        # Depth is the vehicle's ABSOLUTE vertical position from a
+                        # pressure sensor — a stable vertical datum.  The seafloor
+                        # triangulates ~altitude below the seeded cameras, so the
+                        # working distance still emerges from geometry.  (Seeding Z
+                        # from altitude-above-seafloor instead ill-conditions near-
+                        # stationary hover clusters and tilts the whole model.)
                         x = float(r[eastc]); y = float(r[northc])
-                        z = (float(r[altbc]) if altbc and r.get(altbc) not in (None, "")
-                             else -float(r[depthc]))
+                        z = -float(r[depthc])
                         if epsg is None and zonec and r.get(zonec):
                             epsg = _utm_epsg(r[zonec])
                     else:
@@ -401,8 +413,18 @@ def process_chunk(chunk, spec, opt):
               "Low": 8, "Lowest": 16}.get(opt["dense_quality"], 4),
               filter_mode=_depth_filter(opt["depth_filter"]),
               progress=_progress("buildDepthMaps"))
-        _call(chunk.buildPointCloud, progress=_progress("buildPointCloud"))
+        # Build with per-point confidence (when supported) so we can filter noise.
+        try:
+            chunk.buildPointCloud(point_confidence=True,
+                                  progress=_progress("buildPointCloud"))
+        except TypeError:
+            _call(chunk.buildPointCloud, progress=_progress("buildPointCloud"))
         have_dense = chunk.point_cloud is not None
+
+        # Confidence is computed above (point_confidence=True) so the user can
+        # Filter-by-Confidence in the Metashape GUI to strip water-column noise.
+        # Point count is controlled by dense quality + confidence, NOT by
+        # degrading quality to Low (which produces stretched depth-map artifacts).
         if have_dense and opt["export_dense_ply"]:
             chunk.exportPointCloud(j("dense.ply"), source_data=Metashape.PointCloudData)
             products["dense_ply"] = j("dense.ply")
@@ -420,6 +442,7 @@ def process_chunk(chunk, spec, opt):
             % (opt["mesh_surface"], opt["mesh_faces"], opt["mesh_source"]))
         _call(chunk.buildModel, surface_type=_surface(opt["mesh_surface"]),
               face_count=_faces(opt["mesh_faces"]), source_data=src,
+              interpolation=_interpolation(opt.get("mesh_interpolation", "Enabled")),
               vertex_colors=opt["mesh_vertex_colors"], progress=_progress("buildModel"))
         have_mesh = chunk.model is not None
         if have_mesh:
@@ -503,6 +526,20 @@ def main():
         opt = params["options"]
         t0 = time.time()
         log("Metashape %s — %d chunk(s)" % (Metashape.app.version, len(params["chunks"])))
+
+        # Prefer discrete GPUs only: integrated GPUs (Intel) allocate OpenCL
+        # buffers from host RAM and can abort a chunk with CL_OUT_OF_HOST_MEMORY.
+        try:
+            gpus = Metashape.app.enumGPUDevices()
+            mask = 0
+            for i, g in enumerate(gpus):
+                if "intel" not in str(g.get("name", "")).lower():
+                    mask |= 1 << i
+            if mask and mask != Metashape.app.gpu_mask:
+                Metashape.app.gpu_mask = mask
+                log("gpu_mask set to %d (discrete only, of %d device(s))" % (mask, len(gpus)))
+        except Exception as e:  # noqa: BLE001 — never fail the run over GPU selection
+            log("gpu_mask selection skipped: %r" % (e,))
 
         doc = Metashape.Document()
         doc.save(params["project_psx"])         # create the .psx up front

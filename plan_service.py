@@ -404,6 +404,7 @@ def build_plan(ctx: PlanContext, stack: TaskStack) -> PlanResult:
                     "mesh_faces":         s.get("mesh_faces", "Medium"),
                     "mesh_source":        s.get("mesh_source", "Dense cloud"),
                     "mesh_vertex_colors": bool(s.get("mesh_vertex_colors", True)),
+                    "mesh_interpolation": s.get("mesh_interpolation", "Enabled"),
                     # Texture
                     "build_texture":      bool(s.get("build_texture", False)),
                     "texture_size":       int(s.get("texture_size", 4096)),
@@ -413,6 +414,7 @@ def build_plan(ctx: PlanContext, stack: TaskStack) -> PlanResult:
                     "build_dem":          bool(s.get("build_dem", False)),
                     "export_dem":         bool(s.get("export_dem", False)),
                     "build_orthomosaic":  bool(s.get("build_orthomosaic", False)),
+                    "ortho_surface":      s.get("ortho_surface", "DEM"),
                     "make_report":        bool(s.get("make_report", True)),
                     # Export & project
                     "export_dense_ply": bool(s.get("export_dense_ply", False)),  # ARCHIVED: dense PLY export off (dense build kept for mesh/DEM/ortho)

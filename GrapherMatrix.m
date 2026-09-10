@@ -156,6 +156,34 @@ runConfigs = struct( ...
 
 %% Load once — masking/segments are rebuilt per run config
 data = readtable(filename);
+
+% Resolve each channel's column to whatever the interp actually calls it.  The
+% app's interp may name sensor channels e.g. "CO2 Concentration" (MATLAB
+% sanitises the space away to CO2Concentration).  Match by exact name first,
+% then by normalised prefix (lowercase, alphanumerics only) so "CO2" resolves to
+% "CO2Concentration" while staying robust to other dives' sensor naming.
+vn__   = data.Properties.VariableNames;
+norm__ = @(s) regexprep(lower(char(s)), '[^a-z0-9]', '');
+for k = 1:size(channelSpec, 1)
+    col = char(channelSpec{k,2});
+    if ~ismember(col, vn__)
+        tgt = norm__(col); hit = '';
+        for j = 1:numel(vn__)
+            nv = norm__(vn__{j});
+            if strcmp(nv, tgt) || startsWith(nv, tgt)
+                hit = vn__{j}; break;
+            end
+        end
+        if ~isempty(hit)
+            fprintf("Channel '%s' resolved to column '%s'.\n", channelSpec{k,1}, hit);
+            channelSpec{k,2} = hit;
+        else
+            fprintf("Channel '%s' column '%s' not found in interp - skipped.\n", ...
+                    channelSpec{k,1}, col);
+        end
+    end
+end
+
 time_channel = datetime(data.timestamp_iso, "InputFormat", "yyyy-MM-dd'T'HH:mm:ss");
 time_channel = time_channel(:);
 

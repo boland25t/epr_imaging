@@ -22,8 +22,8 @@ methodTokens = ["_D1_","_D2_","_D3_","_D4_"];
 minFrac = 0.25;
 
 for ci = 1:numel(configs)
-    A = load(fullfile(repo,matNames(ci)),"results","runChannels","time_channel");
-    outdir = fullfile(repo,"grapher_matrix_figs",configs(ci));
+    A = load(fullfile(pwd,matNames(ci)),"results","runChannels","time_channel");
+    outdir = fullfile(pwd,"grapher_matrix_figs",configs(ci));
     for ch = reshape(A.runChannels,1,[])
         R = A.results.(ch).fine;
         keys = string(fieldnames(R));

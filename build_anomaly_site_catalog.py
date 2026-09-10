@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import zipfile
 from pathlib import Path
 
@@ -208,40 +209,43 @@ def load_events(interp: pd.DataFrame) -> pd.DataFrame:
             frame["channel"] = channel
             rows.append(frame)
     rows.append(direct_ch4_peak_events(interp))
-    mat = loadmat(TS_RESULTS)
-    detector_masks = np.asarray(mat["detectorMasksS"]).astype(bool)
-    salinity_methods = ("D1_height", "D2_mass", "D3_peak", "D4_local")
-    for method, mask in zip(salinity_methods, detector_masks.T):
-        event_rows = []
-        for start, end in contiguous_intervals(mask, interp["time"]):
-            event_rows.append({
-                "start_time": start, "end_time": end,
-                "duration_s": int((end - start).total_seconds()) + 1,
-                "method": method, "consensus": 1,
-                "max_consensus_fraction": 1.0, "method_threshold": 1,
-                "class": "CTD1-SALINITY-DETECTOR", "peak_z": np.nan,
-                "mass": np.nan, "config": "ctd1_reference", "channel": "salinity",
-            })
-        if event_rows:
-            rows.append(pd.DataFrame(event_rows))
-    # T-S curve departures are independent physical-property evidence. Bridge
-    # only short gaps and require 10 seconds so isolated residuals do not
-    # repaint the track as a broad salinity anomaly.
-    curve = pd.Series(np.asarray(mat["curveAnom"]).ravel().astype(bool))
-    curve = curve.rolling(6, center=True, min_periods=1).max().astype(bool).to_numpy()
-    curve_rows = []
-    for start, end in contiguous_intervals(curve, interp["time"]):
-        duration = int((end - start).total_seconds()) + 1
-        if duration >= 10:
-            curve_rows.append({
-                "start_time": start, "end_time": end, "duration_s": duration,
-                "method": "TS_curve", "consensus": 1,
-                "max_consensus_fraction": 1.0, "method_threshold": 1,
-                "class": "CTD1-TS-CURVE", "peak_z": np.nan, "mass": np.nan,
-                "config": "ctd1_reference", "channel": "salinity",
-            })
-    if curve_rows:
-        rows.append(pd.DataFrame(curve_rows))
+    # CTD1 salinity-detector + T-S-curve events come from the TS-analysis .mat;
+    # only include them when that optional input is present (see run()).
+    if TS_RESULTS.is_file():
+        mat = loadmat(TS_RESULTS)
+        detector_masks = np.asarray(mat["detectorMasksS"]).astype(bool)
+        salinity_methods = ("D1_height", "D2_mass", "D3_peak", "D4_local")
+        for method, mask in zip(salinity_methods, detector_masks.T):
+            event_rows = []
+            for start, end in contiguous_intervals(mask, interp["time"]):
+                event_rows.append({
+                    "start_time": start, "end_time": end,
+                    "duration_s": int((end - start).total_seconds()) + 1,
+                    "method": method, "consensus": 1,
+                    "max_consensus_fraction": 1.0, "method_threshold": 1,
+                    "class": "CTD1-SALINITY-DETECTOR", "peak_z": np.nan,
+                    "mass": np.nan, "config": "ctd1_reference", "channel": "salinity",
+                })
+            if event_rows:
+                rows.append(pd.DataFrame(event_rows))
+        # T-S curve departures are independent physical-property evidence. Bridge
+        # only short gaps and require 10 seconds so isolated residuals do not
+        # repaint the track as a broad salinity anomaly.
+        curve = pd.Series(np.asarray(mat["curveAnom"]).ravel().astype(bool))
+        curve = curve.rolling(6, center=True, min_periods=1).max().astype(bool).to_numpy()
+        curve_rows = []
+        for start, end in contiguous_intervals(curve, interp["time"]):
+            duration = int((end - start).total_seconds()) + 1
+            if duration >= 10:
+                curve_rows.append({
+                    "start_time": start, "end_time": end, "duration_s": duration,
+                    "method": "TS_curve", "consensus": 1,
+                    "max_consensus_fraction": 1.0, "method_threshold": 1,
+                    "class": "CTD1-TS-CURVE", "peak_z": np.nan, "mass": np.nan,
+                    "config": "ctd1_reference", "channel": "salinity",
+                })
+        if curve_rows:
+            rows.append(pd.DataFrame(curve_rows))
     events = pd.concat(rows, ignore_index=True)
     events["start_time"] = pd.to_datetime(events["start_time"], utc=True)
     events["end_time"] = pd.to_datetime(events["end_time"], utc=True)
@@ -251,11 +255,27 @@ def load_events(interp: pd.DataFrame) -> pd.DataFrame:
     return events.sort_values(["start_time", "end_time"])
 
 
+def _alias_columns(cols) -> dict:
+    """Map an interp table's channel columns to the canonical short names the
+    catalog expects (CO2/CH4/O2/Temperature/Salinity).  The app's bundle interp
+    may name them e.g. "CO2 Concentration"; match by normalised prefix so the
+    catalog is robust to sensor-naming across dives."""
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", str(s).lower())
+    ren = {}
+    for c in cols:
+        n = norm(c)
+        for key, canon in (("co2", "CO2"), ("ch4", "CH4"), ("o2", "O2"),
+                           ("temperature", "Temperature"), ("salinity", "Salinity")):
+            if n == key or n.startswith(key):
+                ren[c] = canon
+                break
+    return ren
+
+
 def load_navigation() -> tuple[pd.DataFrame, pd.DataFrame]:
-    interp = pd.read_csv(
-        INTERP,
-        usecols=["timestamp_iso", "alt", "water_depth", "CO2", "CH4", "O2", "Temperature", "Salinity"],
-    )
+    interp = pd.read_csv(INTERP).rename(columns=_alias_columns(pd.read_csv(INTERP, nrows=0).columns))
+    keep = ["timestamp_iso", "alt", "water_depth", "CO2", "CH4", "O2", "Temperature", "Salinity"]
+    interp = interp[[c for c in keep if c in interp.columns]].copy()
     interp["time"] = pd.to_datetime(interp.pop("timestamp_iso"), utc=True)
     interp = interp.sort_values("time").reset_index(drop=True)
 
@@ -719,7 +739,8 @@ def write_qgis_layer(windows: pd.DataFrame, nav: pd.DataFrame) -> None:
         "metadata": {
             "crs": "EPSG:4326",
             "geometry": "LineString",
-            "source_navigation": str(RAW_NAV.relative_to(REPO)),
+            "source_navigation": (str(RAW_NAV.relative_to(REPO))
+                                   if REPO in RAW_NAV.parents else RAW_NAV.name),
             "event_boundary": "fine detector families; D3 direct or >=2 methods; >=2 configs",
             "feature_count": len(features),
         },
@@ -1634,7 +1655,8 @@ def build_report(
         stacked_sensor_page(pdf, windows, interp)
         individual_sensor_pages(pdf, windows, interp)
         detector_method_pages(pdf, events, interp)
-        ts_analysis_pages(pdf)
+        if TS_RESULTS.is_file():          # TS/CTD1 figures only exist when that analysis ran
+            ts_analysis_pages(pdf)
         trackline_page(pdf, windows, nav)
 
         fig, ax = plt.subplots(figsize=(11, 8.5))
@@ -1812,7 +1834,8 @@ def preflight() -> list[str]:
         except Exception as exc:                      # noqa: BLE001
             problems.append(f"Could not read {INTERP}: {exc}")
         else:
-            missing = [c for c in required if c not in header]
+            aliased = set(header) | set(_alias_columns(header).values())
+            missing = [c for c in required if c not in aliased]
             if missing:
                 problems.append(
                     f"{INTERP.name} is missing required column(s): "
@@ -1852,7 +1875,8 @@ def run(log=print) -> dict:
     interp, nav = load_navigation()
     log("  loading detector events ...")
     events = load_events(interp)
-    ctd_flags = load_ctd1_flags(interp)
+    # CTD1 T/S corroboration is optional — only when the TS-analysis .mat exists.
+    ctd_flags = load_ctd1_flags(interp) if TS_RESULTS.is_file() else {}
     log("  fusing events into signature windows ...")
     windows = pd.DataFrame(build_exact_signature_windows(events, interp))
     windows = add_context(windows, interp, nav, ctd_flags)

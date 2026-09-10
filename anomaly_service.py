@@ -162,12 +162,17 @@ def run_detector(
         # cd(workdir)    -> resolve GrapherMatrix's relative interp_full.csv
         # repo=...       -> injected for the exporters (they honour it if set)
         # figures off    -> headless
+        # Invoke the script BY NAME (not run('<path>')): MATLAB's run() cd's into
+        # the script's own folder for the duration, which would override cd(workdir)
+        # and make the relative 'interp_full.csv' unresolvable when the interp lives
+        # in a separate inputs/ dir (the .eprproj bundle layout).  Calling the stem
+        # after addpath executes it in the current folder (workdir).
         stmt = (
             f"addpath('{_m_escape(repo)}');"
             f"cd('{_m_escape(workdir)}');"
             f"repo=\"{_m_escape(repo)}\";"
             "set(0,'DefaultFigureVisible','off');"
-            f"run('{_m_escape(repo / script)}');"
+            f"{Path(script).stem};"
         )
         _matlab_run(exe, stmt, script, log_fn, file_log_fn, cancel_cb, timeout_s)
         dt = time.time() - t0
@@ -218,6 +223,25 @@ def _matlab_run(
     capped = False
     tail: list[str] = []          # keep the last lines for error reporting
     deadline = time.time() + timeout_s
+
+    # The stdout loop below blocks between lines, so a MATLAB that goes silent
+    # (e.g. waiting on a licensing sign-in dialog) would never hit the inline
+    # deadline/cancel checks.  A watchdog thread enforces both regardless.
+    import threading
+    timed_out = threading.Event()
+    watchdog_stop = threading.Event()
+
+    def _watchdog():
+        while not watchdog_stop.wait(2.0):
+            if time.time() > deadline or (cancel_cb and cancel_cb()):
+                if time.time() > deadline:
+                    timed_out.set()
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                return
+    threading.Thread(target=_watchdog, daemon=True).start()
     try:
         for raw in proc.stdout:
             line = raw.rstrip("\n").rstrip()
@@ -251,6 +275,11 @@ def _matlab_run(
             pass
 
     code = proc.wait()
+    watchdog_stop.set()
+    if timed_out.is_set():
+        raise RuntimeError(f"{label} exceeded {timeout_s}s timeout (killed while silent)")
+    if cancel_cb and cancel_cb():
+        raise RuntimeError(f"Cancelled during {label}")
     if code != 0:
         detail = "\n".join(f"      {t}" for t in tail[-15:])
         raise RuntimeError(

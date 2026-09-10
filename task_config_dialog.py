@@ -644,10 +644,19 @@ class TaskConfigDialog(QDialog):
         mesh_form.addRow("Source data:", w["mesh_source"])
         w["mesh_vertex_colors"] = self._check("Calculate vertex colors", bool(s.get("mesh_vertex_colors", True)))
         mesh_form.addRow("", w["mesh_vertex_colors"])
+        w["mesh_interpolation"] = self._combo(
+            ["Enabled", "Disabled", "Extrapolated"],
+            s.get("mesh_interpolation", "Enabled"),
+        )
+        w["mesh_interpolation"].setToolTip(
+            "Mesh interpolation across data gaps.  'Disabled' leaves honest holes\n"
+            "instead of stretched triangles."
+        )
+        mesh_form.addRow("Interpolation:", w["mesh_interpolation"])
 
         def _sync_mesh():
             on = w["build_mesh"].isChecked()
-            for key in ("mesh_surface", "mesh_faces", "mesh_source", "mesh_vertex_colors"):
+            for key in ("mesh_surface", "mesh_faces", "mesh_source", "mesh_vertex_colors", "mesh_interpolation"):
                 w[key].setEnabled(on)
             # texture depends on mesh
             if "build_texture" in w:
@@ -694,6 +703,14 @@ class TaskConfigDialog(QDialog):
         w["build_dem"] = self._check(
             "Build DEM (digital elevation model)", bool(s.get("build_dem", False)))
         raster_form.addRow("", w["build_dem"])
+        w["ortho_surface"] = self._combo(
+            ["DEM", "Mesh"],
+            s.get("ortho_surface", "DEM"),
+        )
+        w["ortho_surface"].setToolTip(
+            "Surface the orthomosaic is built on: the DEM elevation or the mesh."
+        )
+        raster_form.addRow("Orthomosaic surface:", w["ortho_surface"])
         w["export_dem"] = self._check(
             "Export DEM as GeoTIFF", bool(s.get("export_dem", False)))
         raster_form.addRow("", w["export_dem"])
@@ -709,6 +726,11 @@ class TaskConfigDialog(QDialog):
         exp_form.addRow("", w["export_dense_ply"])
         w["export_mesh_obj"] = self._check("Export mesh as OBJ", bool(s.get("export_mesh_obj", False)))
         exp_form.addRow("", w["export_mesh_obj"])
+        w["make_report"] = self._check(
+            "Export processing report (PDF)",
+            bool(s.get("make_report", True)),
+        )
+        exp_form.addRow("", w["make_report"])
         w["save_project"] = self._check(
             "Save Metashape project (.psx)",
             bool(s.get("save_project", True)),
@@ -960,6 +982,7 @@ class TaskConfigDialog(QDialog):
             s["mesh_faces"]        = w["mesh_faces"].currentText()
             s["mesh_source"]       = w["mesh_source"].currentText()
             s["mesh_vertex_colors"] = w["mesh_vertex_colors"].isChecked()
+            s["mesh_interpolation"] = w["mesh_interpolation"].currentText()
 
             # Texture
             s["build_texture"]      = w["build_texture"].isChecked()
@@ -970,11 +993,13 @@ class TaskConfigDialog(QDialog):
             # Raster products
             s["build_orthomosaic"] = w["build_orthomosaic"].isChecked()
             s["build_dem"]         = w["build_dem"].isChecked()
+            s["ortho_surface"]     = w["ortho_surface"].currentText()
             s["export_dem"]        = w["export_dem"].isChecked()
 
             # Export & project
             s["export_dense_ply"] = w["export_dense_ply"].isChecked()
             s["export_mesh_obj"]  = w["export_mesh_obj"].isChecked()
+            s["make_report"]      = w["make_report"].isChecked()
             s["save_project"]     = w["save_project"].isChecked()
 
             # Georeference
