@@ -167,7 +167,9 @@ _NODES: list[Node] = [
         task_type="photogrammetry", is_archived=True, chunked=True,
         params={
             "build_dense":   {"type": "bool", "default": True, "label": "Build dense cloud"},
-            "dense_quality": {"type": "choice", "default": "Medium",
+            # Low per the adopted recipe — /home/troyboland/epr_claude_paper/
+            # docs/RECIPE_REFERENCE.md §2 ("millions of points is excessive").
+            "dense_quality": {"type": "choice", "default": "Low",
                               "label": "Dense quality",
                               "choices": ["Lowest", "Low", "Medium", "High", "Highest"]},
         },

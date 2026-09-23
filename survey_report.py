@@ -37,6 +37,19 @@ def _excluded(path: str) -> bool:
     return any(p.endswith(x) or f"/{x}/" in p + "/" for x in _bundle_excludes(p))
 
 
+def _chunk_dirs(pg: str, suffix: str = "") -> list:
+    """Every photogrammetry chunk under either on-disk layout.
+
+    ``seg<NN>/chunk_<NN>/`` is what the batch runner writes;
+    ``run_<stamp>__<sampling>/chunk_<NN>/`` is what the simple UI's
+    Photogrammetry product writes.  Both are real, so both are searched.
+    """
+    out: list = []
+    for parent in ("seg*", "run_*"):
+        out.extend(glob.glob(f"{pg}/{parent}/chunk_*{suffix}"))
+    return sorted(dict.fromkeys(out))
+
+
 def _b64(data: bytes, mime: str) -> str:
     return f"data:{mime};base64," + base64.b64encode(data).decode()
 
@@ -167,7 +180,10 @@ def collect(B, fast_mesh=False) -> dict:
         name=_dive_name(B),
         excl=sorted(_bundle_excludes(f"{B}/")))
     PG = f"{B}/survey/photogrammetry"
-    chunks = [c for c in sorted(glob.glob(f"{PG}/seg*/chunk_*")) if not _excluded(c)]
+    # Chunks live under seg*/ (batch runner) or run_<stamp>__<sampling>/
+    # (simple UI).  Globbing only seg*/ reported 0 chunks / 0 orthos / 0 DEMs
+    # for every dive processed through the simple UI.
+    chunks = [c for c in sorted(_chunk_dirs(PG)) if not _excluded(c)]
     orthos = [c for c in chunks if os.path.exists(f"{c}/orthomosaic.tif")
               and os.path.getsize(f"{c}/orthomosaic.tif") > 1e6]
     # streaming OBJ line counts are slow on /mnt/f — cache by (size, mtime)
@@ -211,9 +227,13 @@ def collect(B, fast_mesh=False) -> dict:
     try: cache_path.write_text(json.dumps(_vf_cache))
     except OSError: pass
     with rasterio.open(f"{PG}/merged/ortho_merged.tif") as ds:
-        me = f"{ds.width*ds.res[0]:.0f}×{ds.height*ds.res[1]:.0f} m @ {ds.res[0]*100:.0f} cm"
+        # Sub-centimetre merges are normal (3 mm here), and "%.0f cm" printed
+        # them as "@ 0 cm"; show mm below 1 cm.
+        _r = ds.res[0]
+        _res_txt = f"{_r*1000:.0f} mm" if _r < 0.01 else f"{_r*100:.1f} cm"
+        me = f"{ds.width*ds.res[0]:.0f}×{ds.height*ds.res[1]:.0f} m @ {_res_txt}"
     photo = dict(segments=len(segrows), chunks=len(chunks), orthos=len(orthos),
-                 dems=len([d for d in glob.glob(f"{PG}/seg*/chunk_*/dem.tif") if not _excluded(d)]),
+                 dems=len([d for d in _chunk_dirs(PG, "/dem.tif") if not _excluded(d)]),
                  verts=tv, faces=tf, merged_ext=me, rows=segrows)
     # anomaly (optional — the detector may not have run yet)
     anom, win = None, pd.DataFrame()

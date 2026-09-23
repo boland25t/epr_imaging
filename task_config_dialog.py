@@ -601,9 +601,12 @@ class TaskConfigDialog(QDialog):
         dense_form  = QFormLayout(dense_group)
         w["build_dense"] = self._check("Build dense cloud", bool(s.get("build_dense", True)))
         dense_form.addRow("", w["build_dense"])
+        # Low by default per the adopted recipe — /home/troyboland/
+        # epr_claude_paper/docs/RECIPE_REFERENCE.md §2 (orthos first; dense Low
+        # gives ~9-12 M pts per ~300-frame chunk, which the user calls ample).
         w["dense_quality"] = self._combo(
             ["Ultra", "High", "Medium", "Low", "Lowest"],
-            s.get("dense_quality", "Medium"),
+            s.get("dense_quality", "Low"),
         )
         dense_form.addRow("Quality:", w["dense_quality"])
         w["depth_filter"] = self._combo(
@@ -752,7 +755,9 @@ class TaskConfigDialog(QDialog):
         geo_form.addRow("", w["use_nav_reference"])
         w["nav_accuracy_h"] = self._dspin(0.001, 100.0, s.get("nav_accuracy_h", 0.1), " m", 0.01, 3)
         geo_form.addRow("Horizontal accuracy:", w["nav_accuracy_h"])
-        w["nav_accuracy_v"] = self._dspin(0.001, 100.0, s.get("nav_accuracy_v", 0.5), " m", 0.01, 3)
+        # 0.05 m vertical per the adopted recipe (pressure depth is cm-accurate)
+        # — /home/troyboland/epr_claude_paper/docs/RECIPE_REFERENCE.md §2.
+        w["nav_accuracy_v"] = self._dspin(0.001, 100.0, s.get("nav_accuracy_v", 0.05), " m", 0.01, 3)
         geo_form.addRow("Vertical accuracy:", w["nav_accuracy_v"])
 
         def _sync_geo():

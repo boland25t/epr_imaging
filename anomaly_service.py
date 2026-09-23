@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -50,6 +52,19 @@ TIER_COLORS = {
 
 # Cap GUI log lines per MATLAB stage; the rest goes to the file log only.
 _MAX_GUI_LOG_LINES = 200
+
+#: How long MATLAB may stay completely silent after launch before we treat it
+#: as stuck before the script (licensing, missing toolbox, dead install).  A
+#: cold MATLAB start on a loaded WSL VM is ~90 s, so this is generous.
+_STARTUP_GRACE_S = 420
+
+#: MATLAB's online-licensing sign-in prompt / failure, in the forms it takes on
+#: a terminal.  Seen on stdout before MATLAB has run a single statement.
+_SIGNIN_RE = re.compile(
+    r"MathWorks Account email address|Sign-in failed|"
+    r"Please enter your MathWorks|License Manager Error|"
+    r"Unable to (?:reach|connect to) (?:the )?MathWorks",
+    re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------
@@ -84,6 +99,7 @@ def matlab_version(timeout: int = 60) -> Optional[str]:
         out = subprocess.run(
             [exe, "-batch", "disp(version)"],
             capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,   # never block on a sign-in prompt
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -214,6 +230,17 @@ def _matlab_run(
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            # MATLAB with an expired/signed-out ONLINE licence prompts on the
+            # terminal ("Please enter your MathWorks Account email address").
+            # Inheriting a live stdin makes -batch block on that prompt
+            # forever — the watchdog below only reaps it at timeout_s, which
+            # defaults to 24 h.  With no stdin the prompt fails at once and we
+            # surface the real reason.
+            stdin=subprocess.DEVNULL,
+            # Own process group: MATLAB spawns helpers (matlabwindowhelper &c.)
+            # that inherit this pipe, so killing the parent alone leaves the
+            # pipe open and the reader below blocked.  Kill the whole group.
+            start_new_session=True,
             text=True, bufsize=1, env=env,
         )
     except OSError as exc:
@@ -229,27 +256,70 @@ def _matlab_run(
     # deadline/cancel checks.  A watchdog thread enforces both regardless.
     import threading
     timed_out = threading.Event()
+    stalled_at_startup = threading.Event()
     watchdog_stop = threading.Event()
+    started_at = time.time()
+    saw_output = threading.Event()
+
+    def _reap():
+        """Kill MATLAB *and its helpers*, then break the reader out of its
+        blocking read on the shared pipe."""
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, AttributeError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        # A helper that outlived the group kill would keep the write end open
+        # and the read loop would never see EOF; closing our end unblocks it
+        # (the reader turns the resulting ValueError/OSError into the verdict
+        # recorded in the flags above).
+        try:
+            proc.stdout.close()
+        except Exception:                                           # noqa: BLE001
+            pass
 
     def _watchdog():
         while not watchdog_stop.wait(2.0):
+            # A MATLAB that has printed NOTHING after the startup grace is not
+            # running the script — it is stuck before it, and the usual cause is
+            # licensing (an online licence that wants an interactive sign-in
+            # prints its prompt unflushed into our pipe and waits).  Without
+            # this, such a run is only reaped at timeout_s, which defaults to
+            # 24 h: the UI looks hung for a day.
+            if (not saw_output.is_set()
+                    and time.time() - started_at > _STARTUP_GRACE_S):
+                stalled_at_startup.set()
+                _reap()
+                return
             if time.time() > deadline or (cancel_cb and cancel_cb()):
                 if time.time() > deadline:
                     timed_out.set()
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+                _reap()
                 return
     threading.Thread(target=_watchdog, daemon=True).start()
     try:
         for raw in proc.stdout:
             line = raw.rstrip("\n").rstrip()
+            saw_output.set()
             if not line.strip():
                 continue
             tail.append(line)
             if len(tail) > 40:
                 tail.pop(0)
+            # A licensing failure is not a MATLAB error the script can report:
+            # name it here, or the caller only ever sees "exit code 1".
+            if _SIGNIN_RE.search(line):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"{label} could not start: this MATLAB uses ONLINE licensing "
+                    "and is not signed in to a MathWorks Account. Run `matlab` "
+                    "once interactively and sign in (or install a licence file), "
+                    f"then retry. MATLAB said: {line!r}")
             if file_log_fn:
                 file_log_fn(f"    {line}")
             if emitted < _MAX_GUI_LOG_LINES:
@@ -268,6 +338,13 @@ def _matlab_run(
             if time.time() > deadline:
                 proc.kill()
                 raise RuntimeError(f"{label} exceeded {timeout_s}s timeout")
+    except (ValueError, OSError):
+        # _reap() closed the pipe out from under this read.  That is the
+        # watchdog talking, not a failure here: fall through to the verdict
+        # below, which names the reason.  Anything else still propagates.
+        if not (stalled_at_startup.is_set() or timed_out.is_set()
+                or (cancel_cb and cancel_cb())):
+            raise
     finally:
         try:
             proc.stdout.close()
@@ -276,6 +353,14 @@ def _matlab_run(
 
     code = proc.wait()
     watchdog_stop.set()
+    if stalled_at_startup.is_set():
+        raise RuntimeError(
+            f"{label} produced no output in {_STARTUP_GRACE_S}s and was killed — "
+            "MATLAB did not get as far as the script. The usual cause is "
+            "licensing: an ONLINE-licensing install that is not signed in to a "
+            "MathWorks Account blocks before it runs anything. Run `matlab` "
+            "once interactively and sign in, or point MLM_LICENSE_FILE at a "
+            "licence file, then retry.")
     if timed_out.is_set():
         raise RuntimeError(f"{label} exceeded {timeout_s}s timeout (killed while silent)")
     if cancel_cb and cancel_cb():

@@ -39,6 +39,16 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
+# Shared fixed camera calibration for the photogrammetry fallback defaults below.
+# Single source of truth: batch_service.DEFAULT_PHOTO_SETTINGS, whose values come
+# from /home/troyboland/epr_claude_paper/docs/RECIPE_REFERENCE.md §2.
+try:
+    from batch_service import DEFAULT_PHOTO_SETTINGS as _RECIPE
+    _FIXED_CALIB = _RECIPE.get("fixed_calibration")
+except Exception:                                                   # noqa: BLE001
+    _FIXED_CALIB = dict(f=3836.98, cx=0.0, cy=0.0, k1=-0.2607, k2=0.4638,
+                        k3=-0.2959, width=5312, height=2988)
+
 
 class StackWorker(QObject):
     """Executes a resolved product-stack plan in a background thread."""
@@ -994,8 +1004,12 @@ class StackWorker(QObject):
             adaptive_fitting=bool(kwargs.get("adaptive_fitting", True)),
             reset_cameras=bool(kwargs.get("reset_cameras", False)),
             build_dense=bool(kwargs.get("build_dense", True)),
-            dense_quality=kwargs.get("dense_quality", "Medium"),
+            # Adopted recipe defaults — /home/troyboland/epr_claude_paper/docs/
+            # RECIPE_REFERENCE.md §2 (dense Low, gate off, mount-corrected
+            # rotation priors, shared fixed calibration).
+            dense_quality=kwargs.get("dense_quality", "Low"),
             depth_filter=kwargs.get("depth_filter", "Moderate"),
+            quality_threshold=float(kwargs.get("quality_threshold", 0.0)),
             reuse_depth=bool(kwargs.get("reuse_depth", False)),
             build_mesh=bool(kwargs.get("build_mesh", False)),
             mesh_surface=kwargs.get("mesh_surface", "Arbitrary"),
@@ -1017,7 +1031,13 @@ class StackWorker(QObject):
             make_report=bool(kwargs.get("make_report", True)),
             use_nav_reference=bool(kwargs.get("use_nav_reference", True)),
             nav_accuracy_h=float(kwargs.get("nav_accuracy_h", 0.1)),
-            nav_accuracy_v=float(kwargs.get("nav_accuracy_v", 0.5)),
+            nav_accuracy_v=float(kwargs.get("nav_accuracy_v", 0.05)),
+            rotation_mode=kwargs.get("rotation_mode", "mount_corrected"),
+            mount_yaw_offset_deg=float(kwargs.get("mount_yaw_offset_deg", 180.0)),
+            mount_pitch_offset_deg=float(kwargs.get("mount_pitch_offset_deg", -22.0)),
+            nav_rotation_accuracy_deg=float(
+                kwargs.get("nav_rotation_accuracy_deg", 30.0)),
+            fixed_calibration=kwargs.get("fixed_calibration", _FIXED_CALIB),
             save_project=bool(kwargs.get("save_project", True)),
             log_fn=self._emit,
             file_log_fn=self._file_write,

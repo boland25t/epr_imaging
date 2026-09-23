@@ -383,7 +383,9 @@ class OneClickPipelineDialog(QDialog):
             bits = [f"align {s.get('align_accuracy', 'High')}",
                     f"chunks ≤{s.get('chunk_size', 250)} images"]
             if s.get("build_dense", True):
-                bits.append(f"dense {s.get('dense_quality', 'Medium')}")
+                # Default mirrors the adopted recipe (dense Low) — see
+                # /home/troyboland/epr_claude_paper/docs/RECIPE_REFERENCE.md §2.
+                bits.append(f"dense {s.get('dense_quality', 'Low')}")
             if s.get("build_mesh", False):
                 bits.append("mesh")
             if s.get("build_texture", False):

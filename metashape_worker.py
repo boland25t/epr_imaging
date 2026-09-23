@@ -173,7 +173,7 @@ def _utm_epsg(zone_str):
     return (32600 if north else 32700) + zone
 
 
-def _seed_reference(chunk, nav_csv, acc_h, acc_v):
+def _seed_reference(chunk, nav_csv, acc_h, acc_v, opt=None):
     """Best-effort: give each camera a lat/lon/alt from the nav CSV.
 
     Matches on the frame filename's trailing YYYYMMDDTHHMMSS timestamp against
@@ -183,6 +183,19 @@ def _seed_reference(chunk, nav_csv, acc_h, acc_v):
     import csv
     import re
     from datetime import datetime, timezone
+
+    # Rotation-prior mode — see /home/troyboland/epr_claude_paper/docs/
+    # RECIPE_REFERENCE.md §2/§3 (orientation audit 2026-09-18): the camera's
+    # image-top faces AFT, so camera yaw = vehicle heading + 180 deg, and the
+    # mount is pitched ~22 deg off vehicle nadir (pitch offset -22 deg).  Seeding
+    # RAW vehicle YPR (the previous behaviour) is a ~180 deg misfit that harms
+    # alignment; "off" lets narrow strips roll about the track axis.
+    #   "mount_corrected" (default) | "raw" (legacy) | "off"
+    opt = opt or {}
+    rot_mode = str(opt.get("rotation_mode", "mount_corrected"))
+    yaw_off = float(opt.get("mount_yaw_offset_deg", 180.0))
+    pitch_off = float(opt.get("mount_pitch_offset_deg", -22.0))
+    rot_acc = float(opt.get("nav_rotation_accuracy_deg", 30.0))
 
     def parse_iso(s):
         s = (s or "").strip().rstrip("Zz")
@@ -296,14 +309,18 @@ def _seed_reference(chunk, nav_csv, acc_h, acc_v):
         cam.reference.location = Metashape.Vector([x, y, z])
         cam.reference.accuracy = Metashape.Vector([acc_h, acc_h, acc_v])
         cam.reference.enabled = True
-        # Orientation prior (heading/pitch/roll → Metashape yaw/pitch/roll), seeded
-        # LOOSELY: a large rotation accuracy makes it a gentle nudge, so if the
-        # vehicle→camera convention is off it can't dominate the image-based
-        # solution, but when it's right it helps constrain a low-parallax scene.
-        if has_orient and None not in (heading, pitch, roll):
+        # Orientation prior (heading/pitch/roll → Metashape yaw/pitch/roll),
+        # MOUNT-CORRECTED by default (see rot_mode above) and seeded LOOSELY:
+        # a large rotation accuracy (30 deg) makes it a nudge, not a clamp.
+        if rot_mode != "off" and has_orient and None not in (heading, pitch, roll):
             try:
-                cam.reference.rotation = Metashape.Vector([heading, pitch, roll])
-                cam.reference.rotation_accuracy = Metashape.Vector([30.0, 30.0, 30.0])
+                yaw_v, pitch_v = heading, pitch
+                if rot_mode == "mount_corrected":
+                    yaw_v = (heading + yaw_off) % 360.0
+                    pitch_v = pitch + pitch_off
+                cam.reference.rotation = Metashape.Vector([yaw_v, pitch_v, roll])
+                cam.reference.rotation_accuracy = Metashape.Vector(
+                    [rot_acc, rot_acc, rot_acc])
                 cam.reference.rotation_enabled = True
                 oriented += 1
             except Exception:                                   # noqa: BLE001
@@ -316,9 +333,49 @@ def _seed_reference(chunk, nav_csv, acc_h, acc_v):
             chunk.updateTransform()
         except Exception:                                       # noqa: BLE001
             pass
-    log("georeference: seeded %d/%d cameras (%d with orientation)"
-        % (seeded, len(chunk.cameras), oriented))
+    log("georeference: seeded %d/%d cameras (%d with orientation, mode=%s, "
+        "acc h=%.3f v=%.3f rot=%.0f deg)"
+        % (seeded, len(chunk.cameras), oriented, rot_mode, acc_h, acc_v, rot_acc))
     return seeded
+
+
+def _apply_fixed_calibration(chunk, fc):
+    """Freeze every sensor's intrinsics to a shared, pre-computed calibration.
+
+    Per /home/troyboland/epr_claude_paper/docs/RECIPE_REFERENCE.md §2/§3:
+    per-strip self-calibration varies ~5% in f on corridor geometry and is the
+    strip-curvature (doming) mechanism; a pooled fixed calibration removes it.
+
+    Applied ONLY when the sensor's frame size matches the calibration's — a
+    calibration is meaningless at a different resolution, so a non-matching
+    sensor keeps self-calibrating instead of being silently mis-modelled.
+    Works on both API generations (sensor.user_calib + sensor.fixed exist in
+    Metashape 1.x and 2.x).
+    """
+    try:
+        cw, ch = int(fc.get("width") or 0), int(fc.get("height") or 0)
+        for sensor in chunk.sensors:
+            sw, sh = int(sensor.width or 0), int(sensor.height or 0)
+            if cw and ch and (sw, sh) != (cw, ch):
+                log("fixed calibration SKIPPED for sensor %dx%d "
+                    "(calibration is %dx%d) — self-calibrating" % (sw, sh, cw, ch))
+                continue
+            calib = Metashape.Calibration()
+            calib.width = cw or sw
+            calib.height = ch or sh
+            calib.f = float(fc["f"])
+            for k in ("cx", "cy", "k1", "k2", "k3", "k4", "p1", "p2", "b1", "b2"):
+                if fc.get(k) is not None:
+                    try:
+                        setattr(calib, k, float(fc[k]))
+                    except Exception:                           # noqa: BLE001
+                        pass                # attribute absent on this API version
+            sensor.user_calib = calib
+            sensor.fixed = True
+            log("sensor calibration FIXED (f=%.2f px, %dx%d)"
+                % (calib.f, calib.width, calib.height))
+    except Exception as e:                                      # noqa: BLE001
+        log("fixed calibration failed: %r — continuing self-calibrated" % (e,))
 
 
 # --------------------------------------------------------------------------
@@ -334,13 +391,19 @@ def process_chunk(chunk, spec, opt):
     log("add %d photos" % len(spec["photos"]))
     chunk.addPhotos(spec["photos"])
 
+    # ---- shared fixed intrinsics (before matching, so alignment uses them) ----
+    if opt.get("fixed_calibration"):
+        _apply_fixed_calibration(chunk, opt["fixed_calibration"])
+
     # ---- image quality gate (Metashape's own grading) ----
     # analyzeImages() scores each photo 0-1 on the sharpness of its sharpest
     # region; Agisoft recommends disabling anything below ~0.5.  For underwater
     # footage (motion blur, backscatter, turbidity) this removes garbage frames
     # that otherwise poison feature matching.  Disabled cameras are skipped by
-    # matchPhotos/alignCameras.  Threshold 0 disables the gate.
-    q_thresh = float(opt.get("quality_threshold", 0.5))
+    # matchPhotos/alignCameras.  Threshold 0 disables the gate — which is the
+    # adopted default: the 0.5 gate fragmented strips with no measured quality
+    # benefit (/home/troyboland/epr_claude_paper/docs/RECIPE_REFERENCE.md §2/§3).
+    q_thresh = float(opt.get("quality_threshold", 0.0))
     if q_thresh > 0:
         try:
             analyze = getattr(chunk, "analyzeImages", None) or getattr(chunk, "estimateImageQuality")
@@ -370,7 +433,8 @@ def process_chunk(chunk, spec, opt):
     # supplied.  (Georeferencing of the solved cameras is finalised after align.)
     use_ref = bool(spec.get("nav_csv") and opt["use_nav_reference"])
     if use_ref:
-        _seed_reference(chunk, spec["nav_csv"], opt["nav_accuracy_h"], opt["nav_accuracy_v"])
+        _seed_reference(chunk, spec["nav_csv"], opt["nav_accuracy_h"],
+                        opt["nav_accuracy_v"], opt)
 
     log("matchPhotos + alignCameras (accuracy=%s, reference_preselection=%s)"
         % (opt["align_accuracy"], use_ref))
@@ -423,8 +487,9 @@ def process_chunk(chunk, spec, opt):
 
         # Confidence is computed above (point_confidence=True) so the user can
         # Filter-by-Confidence in the Metashape GUI to strip water-column noise.
-        # Point count is controlled by dense quality + confidence, NOT by
-        # degrading quality to Low (which produces stretched depth-map artifacts).
+        # Dense quality is LOW by policy (/home/troyboland/epr_claude_paper/docs/
+        # RECIPE_REFERENCE.md §2): ~9-12 M pts per ~300-frame chunk is ample for
+        # the ortho/DEM deliverables — "millions of points is excessive".
         if have_dense and opt["export_dense_ply"]:
             chunk.exportPointCloud(j("dense.ply"), source_data=Metashape.PointCloudData)
             products["dense_ply"] = j("dense.ply")

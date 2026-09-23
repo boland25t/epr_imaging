@@ -479,7 +479,15 @@ class SensorService:
         df = SensorService._read_file(config.csv_path, no_header=getattr(config, "no_header", False))
 
         # Build the list of columns we need from the file.
-        cols = [config.timestamp_column] + [channel.source_column for channel in config.channels]
+        # Two channels may legitimately point at the SAME source column (e.g. the
+        # same series under two display names, or the same channel imported
+        # twice).  df[cols] with a repeated name yields duplicate columns, and
+        # every later ``sensor_df[source_column]`` then returns a DataFrame
+        # instead of a Series — which blows up in pd.to_numeric.  Select each
+        # source column exactly once, in first-seen order.
+        cols = list(dict.fromkeys(
+            [config.timestamp_column]
+            + [channel.source_column for channel in config.channels]))
         if config.date_column is not None and config.date_column not in cols:
             cols = [config.date_column] + cols
 

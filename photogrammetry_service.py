@@ -50,8 +50,14 @@ from typing import Callable, Optional
 _META_ALIGN_ACC: dict[str, int] = {
     "highest": 0, "high": 1, "medium": 2, "low": 4, "lowest": 8,
 }
+#   buildDepthMaps downscale is a DIFFERENT scale from matchPhotos: quality
+#   Ultra=1, High=2, Medium=4, Low=8, Lowest=16 (matches metashape_worker.py).
+#   It was previously written on the matchPhotos scale, so "Low" silently built
+#   Medium-quality depth maps — now that Low is the default dense quality
+#   (/home/troyboland/epr_claude_paper/docs/RECIPE_REFERENCE.md §2) the mapping
+#   has to be right.
 _META_DENSE_QUAL: dict[str, int] = {
-    "ultra": 0, "high": 1, "medium": 2, "low": 4, "lowest": 8,
+    "ultra": 1, "ultra high": 1, "high": 2, "medium": 4, "low": 8, "lowest": 16,
 }
 _META_DEPTH_FILTER: dict[str, int] = {
     "disabled": 0, "aggressive": 1, "moderate": 2, "mild": 3,
@@ -419,9 +425,9 @@ def run_metashape(
     reference_preselect: bool = True,
     adaptive_fitting: bool = True,
     reset_cameras: bool = False,
-    # Dense cloud
+    # Dense cloud (guide: Low + Moderate — RECIPE_REFERENCE.md §2)
     build_dense: bool = True,
-    dense_quality: str = "Medium",
+    dense_quality: str = "Low",
     depth_filter: str = "Moderate",
     reuse_depth: bool = False,
     # Mesh
@@ -438,11 +444,14 @@ def run_metashape(
     # Export
     export_dense_ply: bool = False,   # ARCHIVED deliverable; dense build stays on
     export_mesh_obj: bool = False,
-    # Georeference
+    # Georeference (guide: 0.1 m / 0.05 m).  NOTE: mount-corrected rotation priors
+    # and the shared fixed calibration are implemented in metashape_worker.py
+    # (the subprocess path used under WSL); this in-process path seeds locations
+    # only, exactly as before.
     nav_csv: Optional[str] = None,
     use_nav_reference: bool = True,
     nav_accuracy_h: float = 0.1,
-    nav_accuracy_v: float = 0.5,
+    nav_accuracy_v: float = 0.05,
     # Project
     save_project: bool = True,
     log_fn: Optional[Callable[[str], None]] = None,
@@ -628,7 +637,7 @@ def _process_metashape_chunk(Metashape, doc, chunk, run_dir, *, api, major,
             log(f"Sparse cloud export skipped (non-fatal): {exc}")
 
     # ── Dense cloud ───────────────────────────────────────────────────────────
-    dq    = _META_DENSE_QUAL.get(dense_quality.lower(), 2)
+    dq    = _META_DENSE_QUAL.get(dense_quality.lower(), 4)   # unknown name → Medium
     dfilt = _META_DEPTH_FILTER.get(depth_filter.lower(), 2)
     depth_maps_built = False
     if build_dense:
@@ -793,15 +802,18 @@ def _run_metashape_batch_subprocess(exe, project_psx, frame_sets, *,
     def o(k, d):
         return opts.get(k, d)
 
+    # Defaults below are the adopted recipe block — see
+    # /home/troyboland/epr_claude_paper/docs/RECIPE_REFERENCE.md §2 (mirrored in
+    # batch_service.DEFAULT_PHOTO_SETTINGS, which is what app runs actually send).
     options = {
-        "quality_threshold": float(o("quality_threshold", 0.5)),
+        "quality_threshold": float(o("quality_threshold", 0.0)),   # guide: gate OFF
         "align_accuracy": o("align_accuracy", "High"),
         "key_point_limit": int(o("key_point_limit", 40000)),
         "tie_point_limit": int(o("tie_point_limit", 10000)),
         "generic_preselect": bool(o("generic_preselect", True)),
         "adaptive_fitting": bool(o("adaptive_fitting", True)),
         "build_dense": bool(o("build_dense", True)),
-        "dense_quality": o("dense_quality", "Medium"),
+        "dense_quality": o("dense_quality", "Low"),                # guide: Low
         "depth_filter": o("depth_filter", "Moderate"),
         "export_dense_ply": bool(o("export_dense_ply", False)),
         "build_mesh": bool(o("build_mesh", False)),
@@ -820,10 +832,18 @@ def _run_metashape_batch_subprocess(exe, project_psx, frame_sets, *,
         "build_dem": bool(o("build_dem", o("build_orthomosaic", False))),
         "export_dem": bool(o("export_dem", False)),
         "build_orthomosaic": bool(o("build_orthomosaic", False)),
-        # georeference
+        # georeference (guide: 0.1 m horizontal clamp, 0.05 m vertical)
         "use_nav_reference": bool(o("use_nav_reference", True)),
         "nav_accuracy_h": float(o("nav_accuracy_h", 0.1)),
-        "nav_accuracy_v": float(o("nav_accuracy_v", 0.5)),
+        "nav_accuracy_v": float(o("nav_accuracy_v", 0.05)),
+        # Rotation priors: "mount_corrected" (guide) | "raw" (legacy) | "off".
+        # yaw += 180 deg (image-top aft), pitch += -22 deg (mount tilt).
+        "rotation_mode": o("rotation_mode", "mount_corrected"),
+        "mount_yaw_offset_deg": float(o("mount_yaw_offset_deg", 180.0)),
+        "mount_pitch_offset_deg": float(o("mount_pitch_offset_deg", -22.0)),
+        "nav_rotation_accuracy_deg": float(o("nav_rotation_accuracy_deg", 30.0)),
+        # Shared FIXED intrinsics (guide): None disables and self-calibrates.
+        "fixed_calibration": o("fixed_calibration", None),
         "make_report": bool(o("make_report", o("save_project", True))),
         "save_project": bool(o("save_project", True)),
     }
@@ -950,7 +970,7 @@ def _run_metashape_batch_inproc(
     adaptive_fitting: bool = True,
     reset_cameras: bool = False,
     build_dense: bool = True,
-    dense_quality: str = "Medium",
+    dense_quality: str = "Low",        # guide: RECIPE_REFERENCE.md §2
     depth_filter: str = "Moderate",
     reuse_depth: bool = False,
     build_mesh: bool = False,
@@ -966,7 +986,7 @@ def _run_metashape_batch_inproc(
     export_mesh_obj: bool = False,
     use_nav_reference: bool = True,
     nav_accuracy_h: float = 0.1,
-    nav_accuracy_v: float = 0.5,
+    nav_accuracy_v: float = 0.05,      # guide: RECIPE_REFERENCE.md §2
     save_project: bool = True,
     log_fn: Optional[Callable[[str], None]] = None,
     file_log_fn: Optional[Callable[[str], None]] = None,

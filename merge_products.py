@@ -24,9 +24,18 @@ from rasterio.vrt import WarpedVRT
 
 
 def _chunk_rasters(workspace_dir: str, name: str, exclude) -> list[str]:
-    pat = f"{workspace_dir}/survey/photogrammetry/seg*/chunk_*/{name}"
+    # Two layouts write chunk rasters: the batch runner's
+    # survey/photogrammetry/seg*/chunk_*/ and the simple UI's
+    # survey/photogrammetry/run_<stamp>__<sampling>/chunk_*/.  Globbing only
+    # the first made merge_survey() a no-op for everything the simple UI
+    # produced, so the survey report never found ortho_merged.tif.
+    pats = (f"{workspace_dir}/survey/photogrammetry/seg*/chunk_*/{name}",
+            f"{workspace_dir}/survey/photogrammetry/run_*/chunk_*/{name}")
+    found: list[str] = []
+    for pat in pats:
+        found.extend(glob.glob(pat))
     out = []
-    for p in sorted(glob.glob(pat)):
+    for p in sorted(dict.fromkeys(found)):
         norm = p.replace("\\", "/")
         if any(f"/{x}/" in norm + "/" for x in exclude):
             continue

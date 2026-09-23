@@ -115,6 +115,13 @@ class SensorChannel:
     # sets this to True when the user hasn't overridden the name.
     use_header_name: bool = True
 
+    # Sensor response delay in seconds: a reading logged at time T reflects
+    # the water encountered at T - time_delay_s (membrane equilibration,
+    # inlet plumbing, internal processing).  Interpolation shifts the sensor
+    # series earlier by this amount so values align with the vehicle position
+    # at the true moment of encounter.  0 = no adjustment.
+    time_delay_s: float = 0.0
+
     def to_dict(self) -> dict[str, Any]:
         """Serialise for JSON workspace storage."""
         return {
@@ -122,6 +129,7 @@ class SensorChannel:
             "display_name": self.display_name,
             "units": self.units,
             "use_header_name": self.use_header_name,
+            "time_delay_s": self.time_delay_s,
         }
 
 

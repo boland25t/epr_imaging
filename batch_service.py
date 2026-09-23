@@ -26,15 +26,43 @@ from typing import Callable, Optional
 import nav_segments
 
 
-# The settled J1756 photogrammetry recipe (see product_tree_ui memory): Medium
-# dense (not Low — Low makes stretched depth-map curtains), Height Field surface
-# with interpolation Disabled (nadir gaps stay honest holes), reference
-# preselection on via nav, ortho on the DEM, pressure-depth Z.
+# The adopted "recipe1" photogrammetry settings block.  SOURCE OF TRUTH:
+#   /home/troyboland/epr_claude_paper/docs/RECIPE_REFERENCE.md  §2
+#   (derivation: epr_claude_paper/decisions/0008-reconstruction-quality.md)
+# Validated on J1754 300-frame strips: |sag| <= 0.014 m on 3/4 strips, "orthomosaics
+# vastly improved" (user GUI verdict 2026-09-18).  Height Field surface with
+# interpolation Enabled, reference preselection on via nav, ortho on the DEM,
+# pressure-depth Z are unchanged app behaviour.
+#
+# Not governed by the guide (app policy, in product_catalog.DEFAULTS): chunk target
+# 250-350 frames, altitude gate alt <= 8 m, dynamic sampling spacing 0.25 m.
 DEFAULT_PHOTO_SETTINGS = dict(
-    quality_threshold=0.5,
+    # Guide: quality_gate_threshold = 0.0 (OFF) — the 0.5 gate caused mid-strip
+    # fragmentation with no measured quality benefit.
+    quality_threshold=0.0,
     align_accuracy="High",
+    key_point_limit=40000, tie_point_limit=10000, adaptive_fitting=True,
+    generic_preselect=True,
     use_nav_reference=True,
-    build_dense=True, dense_quality="Medium", depth_filter="Moderate",
+    # Guide: nav clamp 0.1 m horizontal / 0.05 m vertical (pressure depth is
+    # cm-accurate); the 0.1 m horizontal clamp is what flattens corridor warp.
+    nav_accuracy_h=0.1, nav_accuracy_v=0.05,
+    # Guide: mount-corrected rotation priors.  Camera image-top faces AFT
+    # (yaw = heading + 180 deg) and is pitched ~22 deg off vehicle nadir.  RAW
+    # vehicle YPR (the old behaviour) is a ~180 deg misfit that actively harms
+    # alignment; priors OFF lets strips roll about the track axis.
+    rotation_mode="mount_corrected",
+    mount_yaw_offset_deg=180.0, mount_pitch_offset_deg=-22.0,
+    nav_rotation_accuracy_deg=30.0,
+    # Guide: shared FIXED calibration (pooled median of fully-aligned self-
+    # calibrations) — per-strip self-calibration varies ~5% in f and is the
+    # strip-curvature mechanism.  Applied only to 5312x2988 sensors (HERO11 5.3K).
+    fixed_calibration=dict(f=3836.98, cx=0.0, cy=0.0,
+                           k1=-0.2607, k2=0.4638, k3=-0.2959,
+                           width=5312, height=2988),
+    # Guide: dense quality Low + Moderate filter ("millions of points is
+    # excessive"; ~9-12 M pts per 300-frame strip is ample for orthos).
+    build_dense=True, dense_quality="Low", depth_filter="Moderate",
     export_dense_ply=True,
     build_mesh=True, mesh_source="Dense cloud", mesh_surface="Height Field",
     # interpolation ENABLED: Disabled leaves a pitted/broken surface on traverse

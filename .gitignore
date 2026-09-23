@@ -37,7 +37,6 @@ GrapherMatrix_Report.pdf
 GrapherMatrix_AllPlots.pdf
 # Generated analysis/report trees.
 grapher_matrix_figs/
-archive/
 *.qgs
 # Keep the curated handbook under docs/reports, but ignore generated PDFs
 # everywhere else.

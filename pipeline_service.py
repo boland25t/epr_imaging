@@ -1807,11 +1807,18 @@ class PipelineService:
 
         # Interpolate each sensor channel at every frame timestamp.
         # The display_name from the channel config becomes the column header.
+        # A channel's time_delay_s shifts its series earlier by that amount so
+        # the value aligns with the vehicle position at the true moment of
+        # water encounter (readings lag the encounter by the sensor's response
+        # delay); 0 leaves the series untouched.
         for sensor_cfg, sensor_df in sensor_frames:
             for channel in sensor_cfg.channels:
                 display_name = channel.display_name or channel.source_column
+                delay = float(getattr(channel, "time_delay_s", 0.0) or 0.0)
                 master[display_name] = SensorService.interpolate_series(
-                    master["unix_time"], sensor_df["unix_time"], sensor_df[channel.source_column]
+                    master["unix_time"],
+                    sensor_df["unix_time"] - delay,
+                    sensor_df[channel.source_column],
                 )
 
         master = self._add_utm_columns(master)

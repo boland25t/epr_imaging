@@ -357,7 +357,9 @@ def collect_anomaly_layers(resolver: PathResolver, notes: List[str]) -> List[_La
         notes.append(f"no anomaly dir: {anomaly_root}")
         return out
 
-    segments = anomaly_root / "qgis" / "J1754_anomaly_segments.geojson"
+    candidates = sorted((anomaly_root / "qgis").glob("*_anomaly_segments.geojson")) \
+        if (anomaly_root / "qgis").is_dir() else []
+    segments = candidates[0] if candidates else anomaly_root / "qgis" / "missing_anomaly_segments.geojson"
     if _nonempty(segments):
         epsg = _detect_geojson_epsg(segments, notes)
         n = _feature_count(segments)

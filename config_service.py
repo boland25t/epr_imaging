@@ -526,6 +526,7 @@ class ConfigService:
                 display_name=channel["display_name"],
                 units=channel.get("units", ""),
                 use_header_name=channel.get("use_header_name", True),
+                time_delay_s=float(channel.get("time_delay_s", 0.0) or 0.0),
             )
             for channel in data.get("channels", [])
         ]

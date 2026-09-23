@@ -34,7 +34,7 @@ def _crop(path, bbox, bands, res_t):
     return data, nod
 
 
-def build_portrait(workspace_dir, bbox=None, out_path=None) -> str:
+def build_portrait(workspace_dir, bbox=None, out_path=None, title=None) -> str:
     B = str(workspace_dir)
     sites = json.load(open(f"{B}/survey/anomaly/anomalous_sites_utm.geojson"))
     seg = json.load(open(f"{B}/survey/anomaly/anomaly_segments_utm.geojson"))
@@ -145,7 +145,7 @@ def build_portrait(workspace_dir, bbox=None, out_path=None) -> str:
     axi.set_xticks([]); axi.set_yticks([]); axi.set_aspect("equal")
     for s_ in axi.spines.values(): s_.set_color("#3a4b5c")
     axi.set_title("survey context", fontsize=7.5, color="#9fb0bd", pad=3)
-    ax.set_title("Vent-field core — photogrammetry, brightness and anomaly windows fused",
+    ax.set_title(title or "Vent-field core — photogrammetry, brightness and anomaly windows fused",
                  fontsize=13, color="#e8eef3", pad=10)
     out = out_path or f"{B}/survey/analysis_figs/region_portrait_core.png"
     fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="#0b1119")

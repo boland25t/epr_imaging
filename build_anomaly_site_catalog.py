@@ -9,6 +9,7 @@ file. Outputs are CSV/GeoJSON datasets and an annotated PDF report.
 from __future__ import annotations
 
 import json
+import re
 import math
 import re
 import zipfile
@@ -279,13 +280,22 @@ def load_navigation() -> tuple[pd.DataFrame, pd.DataFrame]:
     interp["time"] = pd.to_datetime(interp.pop("timestamp_iso"), utc=True)
     interp = interp.sort_values("time").reset_index(drop=True)
 
-    nav = pd.read_csv(
-        RAW_NAV,
-        header=None,
-        names=["date", "clock", "lat", "lon", "water_depth", "heading", "pitch", "roll", "flag"],
-        dtype={"date": str, "clock": str, "flag": str},
-        low_memory=False,
-    )
+    # Read positionally, then name the leading columns.  Some Renav exports
+    # carry trailing empty columns (dangling commas); passing `names` shorter
+    # than the real column count would silently shift everything left (pandas
+    # promotes the surplus leading column to the index), so drop the empty
+    # trailers first.
+    nav = pd.read_csv(RAW_NAV, header=None, dtype=str, low_memory=False)
+    nav = nav.dropna(axis=1, how="all")
+    nav_names = ["date", "clock", "lat", "lon", "water_depth", "heading",
+                 "pitch", "roll", "flag"]
+    if nav.shape[1] < len(nav_names):
+        raise ValueError(
+            f"raw nav {RAW_NAV} has {nav.shape[1]} columns; expected >= {len(nav_names)}")
+    nav = nav.iloc[:, :len(nav_names)]
+    nav.columns = nav_names
+    for col in ("lat", "lon", "water_depth", "heading", "pitch", "roll"):
+        nav[col] = pd.to_numeric(nav[col], errors="coerce")
     nav["time"] = pd.to_datetime(
         nav["date"] + " " + nav["clock"], format="%m/%d/%y %H:%M:%S", utc=True
     )
@@ -682,6 +692,16 @@ def make_video_clips(windows: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(clips)
 
 
+def _dive_label() -> str:
+    """Dive id (e.g. 'J1758') derived from the workspace path; falls back to
+    'dive'.  Outputs were historically hard-coded 'J1754_*', which mislabelled
+    every other dive's QGIS bundle (found on J1758, 2026-09-21)."""
+    for part in (*Path(OUT).resolve().parts, *Path(INTERP).resolve().parts):
+        m = re.match(r"(J\d{4})", part)
+        if m:
+            return m.group(1)
+    return "dive"
+
 def write_qgis_layer(windows: pd.DataFrame, nav: pd.DataFrame) -> None:
     qgis_dir = OUT / "qgis"
     qgis_dir.mkdir(exist_ok=True)
@@ -731,7 +751,7 @@ def write_qgis_layer(windows: pd.DataFrame, nav: pd.DataFrame) -> None:
         )
     layer = {
         "type": "FeatureCollection",
-        "name": "J1754_anomaly_segments",
+        "name": f"{_dive_label()}_anomaly_segments",
         "crs": {
             "type": "name",
             "properties": {"name": "urn:ogc:def:crs:EPSG::4326"},
@@ -746,12 +766,12 @@ def write_qgis_layer(windows: pd.DataFrame, nav: pd.DataFrame) -> None:
         },
         "features": features,
     }
-    geojson_path = qgis_dir / "J1754_anomaly_segments.geojson"
+    geojson_path = qgis_dir / f"{_dive_label()}_anomaly_segments.geojson"
     geojson_path.write_text(json.dumps(layer, separators=(",", ":")))
 
     context = {
         "type": "FeatureCollection",
-        "name": "J1754_trackline_context",
+        "name": f"{_dive_label()}_trackline_context",
         "crs": layer["crs"],
         "features": [
             {
@@ -764,14 +784,14 @@ def write_qgis_layer(windows: pd.DataFrame, nav: pd.DataFrame) -> None:
                         if np.isfinite(lon) and np.isfinite(lat)
                     ],
                 },
-                "properties": {"dive": "J1754", "role": "trackline context"},
+                "properties": {"dive": _dive_label(), "role": "trackline context"},
             }
         ],
     }
-    context_path = qgis_dir / "J1754_trackline_context.geojson"
+    context_path = qgis_dir / f"{_dive_label()}_trackline_context.geojson"
     context_path.write_text(json.dumps(context, separators=(",", ":")))
 
-    qml_path = qgis_dir / "J1754_anomaly_segments.qml"
+    qml_path = qgis_dir / f"{_dive_label()}_anomaly_segments.qml"
     qml_path.write_text(
         """<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
 <qgis version="3.34.15-Prizren" styleCategories="Symbology|Labeling">
@@ -811,17 +831,17 @@ def write_qgis_layer(windows: pd.DataFrame, nav: pd.DataFrame) -> None:
     )
     readme_path = qgis_dir / "README.txt"
     readme_path.write_text(
-        "J1754 anomaly layers for AT50-45-QGIS-feb-2026.qgs\n\n"
+        f"{_dive_label()} anomaly layers for AT50-45-QGIS-feb-2026.qgs\n\n"
         "CRS: EPSG:4326 (WGS 84), matching the QGIS project.\n"
         "Primary layer: J1754_anomaly_segments.geojson\n"
         "Context layer: J1754_trackline_context.geojson\n"
-        "Style: J1754_anomaly_segments.qml\n\n"
+        f"Style: {_dive_label()}_anomaly_segments.qml\n\n"
         "QGIS: Layer > Add Layer > Add Vector Layer, select both GeoJSON files.\n"
         "Then open anomaly layer Properties > Symbology > Style > Load Style and\n"
         "select the QML file. The style categorizes line segments by confidence.\n"
         "Use 'combination' or 'n_channels' for pair/triplet/n-wise categorization.\n"
     )
-    zip_path = qgis_dir / "J1754_anomaly_QGIS_upload.zip"
+    zip_path = qgis_dir / f"{_dive_label()}_anomaly_QGIS_upload.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in (geojson_path, context_path, qml_path, readme_path):
             archive.write(path, arcname=path.name)
@@ -1251,7 +1271,7 @@ def stacked_sensor_page(pdf: PdfPages, windows: pd.DataFrame, interp: pd.DataFra
         ("Salinity", "Salinity (PSU)", "#007c91"),
     ]
     fig, axes = plt.subplots(5, 1, figsize=(14, 12), sharex=True, constrained_layout=True)
-    fig.suptitle("J1754 sensor record with independently flagged anomaly regions",
+    fig.suptitle(f"{_dive_label()} sensor record with independently flagged anomaly regions",
                  fontsize=18, weight="bold")
     for ax, (column, ylabel, color) in zip(axes, specs):
         intervals = channel_windows(windows, column)
@@ -1485,7 +1505,7 @@ def ts_analysis_pages(pdf: PdfPages) -> None:
 def trackline_page(pdf: PdfPages, windows: pd.DataFrame, nav: pd.DataFrame) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(15, 9), facecolor="#f4f1e8")
     fig.subplots_adjust(left=0.05, right=0.98, top=0.89, bottom=0.20, wspace=0.20)
-    fig.suptitle("J1754 trackline with anomaly segments and priority-site callouts",
+    fig.suptitle(f"{_dive_label()} trackline with anomaly segments and priority-site callouts",
                  fontsize=18, weight="bold")
     colors = {"HIGH": "#c62828", "MODERATE": "#ef7d00", "SCREEN": "#3d6ea8"}
     widths = {"HIGH": 4.0, "MODERATE": 3.0, "SCREEN": 2.2}
@@ -1600,7 +1620,7 @@ def build_report(
     with PdfPages(report) as pdf:
         text_page(
             pdf,
-            "J1754 Anomaly Site Catalog and Video Review Queue",
+            f"{_dive_label()} Anomaly Site Catalog and Video Review Queue",
             [
                 f"Outcome. The fused catalog contains {len(windows)} anomaly windows at "
                 f"{len(sites)} spatial sites: {high} HIGH, {moderate} MODERATE, and "
@@ -1902,7 +1922,7 @@ def run(log=print) -> dict:
         "sites_csv": OUT / "anomalous_sites.csv",
         "sites_geojson": OUT / "anomalous_sites.geojson",
         "clips_csv": OUT / "video_review_clips.csv",
-        "qgis_zip": OUT / "qgis" / "J1754_anomaly_QGIS_upload.zip",
+        "qgis_zip": OUT / "qgis" / f"{_dive_label()}_anomaly_QGIS_upload.zip",
     }
     log(
         f"  wrote {summary['windows']} windows, {summary['clips']} review clips, "

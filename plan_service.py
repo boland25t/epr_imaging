@@ -39,6 +39,16 @@ from typing import Any, Callable, Iterator, Optional
 
 from models import Job, Task, TaskStack
 
+# Shared fixed camera calibration used as the photogrammetry default below.
+# Single source of truth: batch_service.DEFAULT_PHOTO_SETTINGS, whose values come
+# from /home/troyboland/epr_claude_paper/docs/RECIPE_REFERENCE.md §2.
+try:
+    from batch_service import DEFAULT_PHOTO_SETTINGS as _RECIPE
+    _FIXED_CALIB = _RECIPE.get("fixed_calibration")
+except Exception:                                                   # noqa: BLE001
+    _FIXED_CALIB = dict(f=3836.98, cx=0.0, cy=0.0, k1=-0.2607, k2=0.4638,
+                        k3=-0.2959, width=5312, height=2988)
+
 
 # Fill-method labels (as shown in the GUI) → the token the services expect.
 FILL_3CH = {
@@ -393,10 +403,13 @@ def build_plan(ctx: PlanContext, stack: TaskStack) -> PlanResult:
                     "reference_preselect": bool(s.get("reference_preselect", True)),
                     "adaptive_fitting":   bool(s.get("adaptive_fitting", True)),
                     "reset_cameras":      bool(s.get("reset_cameras", False)),
-                    # Dense cloud
+                    # Dense cloud — adopted recipe defaults, see
+                    # /home/troyboland/epr_claude_paper/docs/RECIPE_REFERENCE.md §2
                     "build_dense":   bool(s.get("build_dense", True)),
-                    "dense_quality": s.get("dense_quality", "Medium"),
+                    "dense_quality": s.get("dense_quality", "Low"),
                     "depth_filter":  s.get("depth_filter", "Moderate"),
+                    # Image-quality gate OFF (0.0): it fragmented strips.
+                    "quality_threshold": float(s.get("quality_threshold", 0.0)),
                     "reuse_depth":   bool(s.get("reuse_depth", False)),
                     # Mesh
                     "build_mesh":         bool(s.get("build_mesh", False)),
@@ -420,10 +433,17 @@ def build_plan(ctx: PlanContext, stack: TaskStack) -> PlanResult:
                     "export_dense_ply": bool(s.get("export_dense_ply", False)),  # ARCHIVED: dense PLY export off (dense build kept for mesh/DEM/ortho)
                     "export_mesh_obj":  bool(s.get("export_mesh_obj", False)),
                     "save_project":     bool(s.get("save_project", True)),
-                    # Georeference
+                    # Georeference (recipe: 0.1 m horizontal clamp / 0.05 m vertical,
+                    # mount-corrected rotation priors, shared fixed calibration)
                     "use_nav_reference": bool(s.get("use_nav_reference", True)),
                     "nav_accuracy_h":    float(s.get("nav_accuracy_h", 0.1)),
-                    "nav_accuracy_v":    float(s.get("nav_accuracy_v", 0.5)),
+                    "nav_accuracy_v":    float(s.get("nav_accuracy_v", 0.05)),
+                    "rotation_mode":     s.get("rotation_mode", "mount_corrected"),
+                    "mount_yaw_offset_deg":   float(s.get("mount_yaw_offset_deg", 180.0)),
+                    "mount_pitch_offset_deg": float(s.get("mount_pitch_offset_deg", -22.0)),
+                    "nav_rotation_accuracy_deg": float(
+                        s.get("nav_rotation_accuracy_deg", 30.0)),
+                    "fixed_calibration": s.get("fixed_calibration", _FIXED_CALIB),
                     # COLMAP — matching / SfM
                     "max_features":  int(s.get("max_features", 8192)),
                     "matcher":       s.get("matcher", "Exhaustive"),
