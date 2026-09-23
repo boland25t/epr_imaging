@@ -9,8 +9,8 @@ Oceanographic Institution. Version: [`version.txt`](version.txt).
 **The app is the simple UI, `simple_main.py`.** One window per dive
 workspace (`<dive>.eprproj`): pick a product, generate it (or run the Default
 Run for all of them), and view it in place. What the UI promises is written
-down in [`docs/simple_ui_contract.md`](docs/simple_ui_contract.md). A user
-manual is on the way.
+down in [`docs/simple_ui_contract.md`](docs/simple_ui_contract.md). The user
+manual is [`docs/MANUAL.md`](docs/MANUAL.md).
 
 ---
 
@@ -81,6 +81,7 @@ Legacy: the old `app.py` UI and its Windows installer (`EPRSamplingToolSetup.exe
 
 ## Docs
 
+- [`docs/MANUAL.md`](docs/MANUAL.md) — the instruction manual (install, quick start, products, troubleshooting)
 - [`docs/simple_ui_contract.md`](docs/simple_ui_contract.md) — what the simple UI does and guarantees
 - [`docs/DEV_SETUP.md`](docs/DEV_SETUP.md) — developer environment notes (partly legacy)
 - [`docs/anomaly/`](docs/anomaly/) — anomaly detector design notes
