@@ -770,15 +770,109 @@ def _win_temp_dir() -> "Path":
     return tmp
 
 
+# Watchdog budgets for the Metashape subprocess (review 04 P1-8 / 03 P1-4).
+# Every long worker stage prints throttled progress (<= 10 s apart while it
+# advances), and the worker prints its PID first, so:
+#   * nothing at all after METASHAPE_STARTUP_GRACE_S  -> stuck before the
+#     script (licence / activation dialog, UNC prompt): kill;
+#   * no line for METASHAPE_SILENCE_S once running    -> hung stage: kill;
+#   * past the overall deadline                        -> kill.
+# Overridable per call via opts: timeout_s, silence_s, startup_grace_s.
+METASHAPE_STARTUP_GRACE_S = 300
+METASHAPE_SILENCE_S = 45 * 60
+METASHAPE_BASE_TIMEOUT_S = 2 * 3600
+METASHAPE_PER_CHUNK_TIMEOUT_S = 3600
+
+
+def _dur(sec: float) -> str:
+    sec = float(sec)
+    return (f"{sec:.0f} s" if sec < 120 else f"{sec / 60:.0f} min" if sec < 7200
+            else f"{sec / 3600:.1f} h")
+
+
+def _utc_stamp() -> str:
+    from datetime import timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_run_status(run_root, data: dict) -> None:
+    """``run_status.json`` beside project.psx: running -> ok | partial | failed,
+    with per-chunk QC.  Read by merge_products (skips failed/running runs) and
+    the catalog/report (QC tables).  Best effort — never fails the run."""
+    try:
+        data = dict(data)
+        data["updated_utc"] = _utc_stamp()
+        try:
+            from reporting_common import code_version
+            data.setdefault("code_version", code_version())
+        except Exception:                                           # noqa: BLE001
+            pass
+        Path(run_root).mkdir(parents=True, exist_ok=True)
+        tmp = Path(run_root) / "run_status.json.tmp"
+        tmp.write_text(json.dumps(data, indent=1, default=str), encoding="utf-8")
+        os.replace(tmp, Path(run_root) / "run_status.json")
+    except OSError:
+        pass
+
+
+def _drop_empty_files(run_dir) -> list[str]:
+    """Remove 0-byte product files (Metashape writes an empty report.pdf for a
+    chunk with nothing aligned) so nothing lists them as deliverables."""
+    removed = []
+    for name in ("report.pdf", "orthomosaic.tif", "dem.tif", "mesh.obj",
+                 "dense.ply", "sparse.ply"):
+        p = Path(run_dir) / name
+        try:
+            if p.is_file() and p.stat().st_size == 0:
+                p.unlink()
+                removed.append(name)
+        except OSError:
+            pass
+    return removed
+
+
+def _kill_windows_tree(win_pid, proc, log) -> None:
+    """Stop a Windows metashape.exe and its children.  Under WSL, killing the
+    Linux-side interop process does not stop the Windows process, so the
+    worker's own PID goes to taskkill /T /F; the local handle is killed too."""
+    if win_pid:
+        for exe in ("taskkill.exe", "/mnt/c/Windows/System32/taskkill.exe"):
+            try:
+                subprocess.run([exe, "/PID", str(win_pid), "/T", "/F"],
+                               capture_output=True, timeout=30)
+                break
+            except (OSError, subprocess.SubprocessError):
+                continue
+    else:
+        log("  !! Metashape never reported its PID; a metashape.exe may still be "
+            "running on Windows — check Task Manager")
+    try:
+        os.killpg(proc.pid, 9)
+    except (OSError, AttributeError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.stdout.close()
+    except Exception:                                               # noqa: BLE001
+        pass
+
+
 def _run_metashape_batch_subprocess(exe, project_psx, frame_sets, *,
-                                    log_fn=None, file_log_fn=None, **opts):
+                                    log_fn=None, file_log_fn=None,
+                                    cancel_cb=None, **opts):
     """Drive Metashape via ``metashape.exe -r metashape_worker.py params.json``.
 
     Builds a params file (all paths translated to Windows form), launches the
-    worker in Metashape's own interpreter, streams its stdout to the app log,
-    then reads back the result JSON.  Returns {run_dir: [product paths]}.
+    worker in Metashape's own interpreter, streams its stdout to the app log
+    under a watchdog (startup grace, silence limit, overall deadline, optional
+    cancel), then reads back the result JSON.  Returns {run_dir: [product
+    paths]}.  Raises when EVERY chunk failed (review 04 P1-5).  Per-chunk QC is
+    written to ``run_status.json`` beside the project.
     """
-    import subprocess
+    import re
+    import threading
     import uuid
 
     def log(msg):
@@ -791,7 +885,9 @@ def _run_metashape_batch_subprocess(exe, project_psx, frame_sets, *,
     win_dir = _win_temp_dir()
     tag = uuid.uuid4().hex[:8]
     # Copy the worker next to the params so both live on the Windows filesystem.
-    worker_dst = win_dir / "metashape_worker.py"
+    # The copy is TAGGED like the params: two concurrent runs (batch CLI + UI)
+    # used to overwrite one fixed metashape_worker.py under each other.
+    worker_dst = win_dir / f"metashape_worker_{tag}.py"
     shutil.copyfile(worker_src, worker_dst)
     params_path = win_dir / f"params_{tag}.json"
     result_path = win_dir / f"result_{tag}.json"
@@ -861,7 +957,14 @@ def _run_metashape_batch_subprocess(exe, project_psx, frame_sets, *,
             "nav_csv": _to_windows_path(nav_csv) if nav_csv else None,
         })
 
-    Path(project_psx).parent.mkdir(parents=True, exist_ok=True)
+    run_root = Path(project_psx).parent
+    run_root.mkdir(parents=True, exist_ok=True)
+    status = {"status": "running", "started_utc":
+              _utc_stamp(),
+              "n_chunks": len(chunks), "worker_tag": tag,
+              "chunks": [{"label": c["label"], "run_dir": rd}
+                         for c, (_p, rd, _n, _l) in zip(chunks, frame_sets)]}
+    _write_run_status(run_root, status)
     params = {
         "project_psx": _to_windows_path(project_psx),
         "log_path": _to_windows_path(log_path),
@@ -873,52 +976,141 @@ def _run_metashape_batch_subprocess(exe, project_psx, frame_sets, *,
     if result_path.exists():
         result_path.unlink()
 
+    timeout_s = float(opts.get("timeout_s") or (
+        METASHAPE_BASE_TIMEOUT_S + METASHAPE_PER_CHUNK_TIMEOUT_S * len(chunks)))
+    silence_s = float(opts.get("silence_s") or METASHAPE_SILENCE_S)
+    grace_s = float(opts.get("startup_grace_s") or METASHAPE_STARTUP_GRACE_S)
+
     cmd = [str(exe), "-r", _to_windows_path(worker_dst), _to_windows_path(params_path)]
-    log(f"  $ metashape.exe -r metashape_worker.py params_{tag}.json")
-    log(f"  driving Metashape as a subprocess ({len(chunks)} chunk(s))")
+    log(f"  $ metashape.exe -r metashape_worker_{tag}.py params_{tag}.json")
+    log(f"  driving Metashape as a subprocess ({len(chunks)} chunk(s); watchdog: "
+        f"startup {_dur(grace_s)}, silence {_dur(silence_s)}, "
+        f"deadline {_dur(timeout_s)})")
+
+    def _fail(reason: str):
+        status.update(status="failed", error=reason)
+        _write_run_status(run_root, status)
+        raise RuntimeError(reason)
 
     t0 = time.time()
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True,
                                 text=True, bufsize=1)
     except OSError as e:
-        raise RuntimeError(f"Failed to launch Metashape: {e}") from e
+        _fail(f"Failed to launch Metashape: {e}")
 
+    last_line = [time.time()]
+    win_pid = [None]
+    verdict: dict = {}
+    stop = threading.Event()
+
+    def _watchdog():
+        while not stop.wait(5.0):
+            now = time.time()
+            if win_pid[0] is None and now - t0 > grace_s:
+                verdict["why"] = (
+                    f"Metashape printed nothing for {grace_s:.0f} s after launch — it "
+                    "is stuck before the worker script (licence/activation dialog, "
+                    "a path prompt, or demo mode). Open Metashape once on Windows, "
+                    "confirm it is activated, then retry.")
+            elif win_pid[0] is not None and now - last_line[0] > silence_s:
+                verdict["why"] = (
+                    f"Metashape went silent for {_dur(silence_s)} (no "
+                    "progress from the current stage) — treated as hung.")
+            elif now - t0 > timeout_s:
+                verdict["why"] = (f"Metashape exceeded the {timeout_s / 3600:.1f} h "
+                                  "deadline for this run.")
+            elif cancel_cb and cancel_cb():
+                verdict["why"] = "Cancelled by the user."
+            if "why" in verdict:
+                _kill_windows_tree(win_pid[0], proc, log)
+                return
+    threading.Thread(target=_watchdog, daemon=True).start()
+
+    pid_rx = re.compile(r"^\[worker\] pid (\d+)")
     emitted = 0
-    for raw in proc.stdout:
-        line = raw.rstrip("\n")
-        if not line.strip():
-            continue
-        if file_log_fn:
-            file_log_fn(f"    {line}")
-        # Keep the GUI log readable: forward worker/progress lines, cap the rest.
-        if line.startswith("[worker]") or emitted < 400:
-            if log_fn:
-                log_fn(f"    {line}")
-            emitted += 1
-    proc.wait()
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            last_line[0] = time.time()
+            if not line.strip():
+                continue
+            m = pid_rx.match(line)
+            if m:
+                win_pid[0] = int(m.group(1))
+            if file_log_fn:
+                file_log_fn(f"    {line}")
+            # Keep the GUI log readable: forward worker/progress lines, cap the rest.
+            if line.startswith("[worker]") or emitted < 400:
+                if log_fn:
+                    log_fn(f"    {line}")
+                emitted += 1
+    except (ValueError, OSError):
+        if "why" not in verdict:           # not the watchdog closing the pipe
+            stop.set()
+            raise
+    finally:
+        stop.set()
+    try:
+        proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        _kill_windows_tree(win_pid[0], proc, log)
     log(f"  Metashape subprocess finished in {time.time() - t0:.0f}s (exit {proc.returncode})")
+    try:
+        worker_dst.unlink()
+    except OSError:
+        pass
+    if "why" in verdict:
+        _fail(verdict["why"] + f" Worker log: {log_path}")
 
     if not result_path.exists():
-        raise RuntimeError(
-            "Metashape produced no result file — the subprocess likely failed to "
-            f"start the script. Check {log_path}. Exit code {proc.returncode}.")
+        _fail("Metashape produced no result file — the subprocess likely failed to "
+              f"start the script. Check {log_path}. Exit code {proc.returncode}.")
     result = json.loads(result_path.read_text(encoding="utf-8"))
     if not result.get("ok"):
-        raise RuntimeError(f"Metashape pipeline failed: {result.get('error', 'unknown')}")
+        _fail(f"Metashape pipeline failed: {result.get('error', 'unknown')}")
 
     # Translate product paths back to WSL and group by run_dir.
     out: dict[str, list[str]] = {}
+    qc = []
     for ch in result.get("chunks", []):
         wsl_run = run_dir_by_win.get(ch.get("run_dir"), ch.get("run_dir"))
-        paths = []
-        for _key, winpath in (ch.get("products") or {}).items():
-            paths.append(_from_windows_path(winpath))
+        removed = _drop_empty_files(wsl_run)
+        paths = [p for p in (_from_windows_path(w)
+                             for w in (ch.get("products") or {}).values())
+                 if Path(p).is_file() and Path(p).stat().st_size > 0]
         out[wsl_run] = paths
-        log(f"  chunk '{ch.get('label')}' — {ch.get('cameras_aligned')}/"
-            f"{ch.get('cameras_total')} cameras aligned, {len(paths)} product(s)")
-        if ch.get("error"):
-            log(f"    chunk error: {ch['error']}")
+        aligned, total = ch.get("cameras_aligned"), ch.get("cameras_total")
+        failed = bool(ch.get("error")) or ch.get("status") == "failed" or not (
+            aligned and aligned >= 2)
+        qc.append({"label": ch.get("label"), "run_dir": wsl_run,
+                   "cameras_aligned": aligned, "cameras_total": total,
+                   "status": "failed" if failed else "ok",
+                   "reason": ch.get("error") or "",
+                   "n_products": len(paths), "removed_empty": removed})
+        if failed:
+            log(f"  !! chunk '{ch.get('label')}' FAILED — {aligned}/{total} cameras "
+                f"aligned: {ch.get('error') or 'nothing reconstructed'}")
+        else:
+            log(f"  chunk '{ch.get('label')}' — {aligned}/{total} cameras aligned, "
+                f"{len(paths)} product(s)")
+    n_ok = sum(1 for q in qc if q["status"] == "ok")
+    status.update(chunks=qc, n_ok=n_ok, n_failed=len(qc) - n_ok,
+                  metashape_version=result.get("version"),
+                  finished_utc=_utc_stamp(),
+                  status=("ok" if n_ok == len(qc) and qc else
+                          "partial" if n_ok else "failed"))
+    _write_run_status(run_root, status)
+    if not n_ok:
+        reasons = "; ".join(f"{q['label']}: {q['cameras_aligned']}/"
+                            f"{q['cameras_total']} aligned" for q in qc)
+        raise RuntimeError(
+            f"Photogrammetry FAILED: none of the {len(qc)} chunk(s) reconstructed "
+            f"({reasons}). No orthomosaic or DEM was produced. Worker log: {log_path}")
+    if n_ok < len(qc):
+        log(f"  !! {len(qc) - n_ok} of {len(qc)} chunk(s) failed; {n_ok} reconstructed "
+            f"(details in {run_root / 'run_status.json'})")
     return out
 
 
@@ -947,15 +1139,36 @@ def run_metashape_batch(project_psx, frame_sets, **opts):
 
     Both paths honour the same options and return {run_dir: [product paths]}.
     """
+    exe = _find_windows_metashape_exe()
     try:
         import Metashape  # noqa: F401
     except ImportError:
-        exe = _find_windows_metashape_exe()
         if not exe:
             raise RuntimeError(metashape_unavailable_reason() or
                                "Metashape is not available.")
         return _run_metashape_batch_subprocess(exe, project_psx, frame_sets, **opts)
+    # The worker (metashape_worker.process_chunk) is the ONLY full recipe; the
+    # in-process path drops DEM, orthomosaic, rotation priors and the fixed
+    # calibration.  Prefer the worker whenever an exe exists; otherwise refuse
+    # loudly instead of silently delivering a run with no ortho/DEM (review
+    # 08 P1-4).
+    if exe:
+        return _run_metashape_batch_subprocess(exe, project_psx, frame_sets, **opts)
+    dropped = sorted(k for k in _INPROC_UNSUPPORTED
+                     if opts.get(k) and str(opts.get(k)).lower() != "off")
+    if dropped:
+        raise RuntimeError(
+            "The full photogrammetry pipeline requires Windows Metashape via WSL "
+            "(metashape.exe driving metashape_worker.py). This host only has the "
+            "in-process Metashape module, which cannot build: "
+            + ", ".join(dropped) + ". Install Metashape Professional 2.x on Windows "
+            "and run the app under WSL2, or turn those options off.")
     return _run_metashape_batch_inproc(project_psx, frame_sets, **opts)
+
+
+# Options the in-process path ignores (it absorbs them via **_unused).
+_INPROC_UNSUPPORTED = ("build_dem", "export_dem", "build_orthomosaic",
+                       "fixed_calibration", "rotation_mode")
 
 
 def _run_metashape_batch_inproc(

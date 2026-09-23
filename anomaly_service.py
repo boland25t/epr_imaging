@@ -384,13 +384,44 @@ def run_catalog(
     ts_results: Optional[Path] = None,
     out_dir: Optional[Path] = None,
     log_fn: Callable[[str], None] = print,
+    dive: Optional[str] = None,
 ) -> dict:
     """Build the anomaly site catalog (windows, sites, clips, QGIS, PDF).
 
     Thin wrapper over build_anomaly_site_catalog so the GUI never imports the
     script's globals directly.  Returns the builder's summary dict.
+
+    The builder is configured through module globals whose defaults are
+    J1754's own files (``REPO/ts_analysis_results.mat``, the J1754 renav
+    under ``REPO/BioIntervals``).  Every run-scoped path is therefore resolved
+    HERE, explicitly, on every call (review 03 P1-7):
+
+    * ``interp_csv`` / ``event_root`` / ``out_dir`` are required;
+    * ``raw_nav_csv`` missing -> refused unless the dive is J1754;
+    * ``ts_results`` missing -> a workspace-local path beside ``interp_csv``
+      (CTD1 corroboration simply disabled when absent) — never the repo's
+      J1754 file for another dive.
+
+    ``dive`` ("J1756") defaults to the name of the ``*.eprproj`` folder that
+    contains ``interp_csv``.
     """
     import build_anomaly_site_catalog as builder
+
+    missing = [name for name, value in (("interp_csv", interp_csv),
+                                        ("event_root", event_root),
+                                        ("out_dir", out_dir)) if value is None]
+    if missing:
+        raise ValueError("run_catalog needs explicit run-scoped paths; missing: "
+                         + ", ".join(missing))
+    dive = dive or _dive_of(interp_csv)
+    is_j1754 = str(dive or "").upper() == "J1754"
+    if raw_nav_csv is None and not is_j1754:
+        raise RuntimeError(
+            f"no raw navigation file for dive {dive or '(unknown)'}: the catalog would "
+            "fall back to J1754's renav (build_anomaly_site_catalog default). Import "
+            "navigation for this workspace first.")
+    if ts_results is None and not is_j1754:
+        ts_results = Path(interp_csv).resolve().parent / "ts_analysis_results.mat"
 
     paths = builder.configure(
         repo=repo,
@@ -400,6 +431,16 @@ def run_catalog(
         ts_results=ts_results,
         out=out_dir,
     )
+    if not is_j1754:
+        repo_res = Path(repo).resolve()
+        for key in ("raw_nav", "ts_results"):
+            value = Path(paths[key]).resolve()
+            j1754_default = repo_res in value.parents and "J1754" in str(value).upper()
+            repo_ts = key == "ts_results" and value == repo_res / "ts_analysis_results.mat"
+            if j1754_default or repo_ts:
+                raise RuntimeError(
+                    f"refusing to build dive {dive}'s catalog with J1754 fallback "
+                    f"{key}={value}; pass this workspace's own file")
     for key, value in paths.items():
         log_fn(f"  {key:<11}{value}")
 
@@ -512,6 +553,18 @@ def windows_to_intervals(
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+def _dive_of(path) -> Optional[str]:
+    """"J1756" from any path inside ".../J1756_down.eprproj/..." (else None)."""
+    try:
+        parts = Path(path).resolve().parts
+    except (OSError, TypeError):
+        return None
+    for part in reversed(parts):
+        if part.endswith(".eprproj"):
+            return part.split("_")[0] or None
+    return None
+
+
 def _m_escape(value) -> str:
     """Escape a path for embedding in a single-quoted MATLAB string."""
     return str(value).replace("'", "''")

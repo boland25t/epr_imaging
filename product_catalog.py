@@ -107,8 +107,20 @@ except Exception:                                                   # noqa: BLE0
 #: Fauna computer vision.  The FINE-TUNE FAILED (see deploy_config.json's
 #: recommended_model_per_bucket / f1_by_model): the MBARI 315k zero-shot model
 #: wins on every bucket that matters, so it — not epr_fauna_v2 — is production.
-FAUNA_WEIGHTS = Path("/home/troyboland/models/mbari_315k_yolov8.pt")
-FAUNA_DEPLOY_CONFIG = Path("/home/troyboland/models/deploy/deploy_config.json")
+#:
+#: Locations (review 08 P1-1).  Set these environment variables on any machine
+#: other than the author's:
+#:   EPR_FAUNA_WEIGHTS        path to mbari_315k_yolov8.pt (MBARI FathomNet 315k)
+#:   EPR_FAUNA_DEPLOY_CONFIG  path to deploy/deploy_config.json (optional; only
+#:                            used when per-bucket thresholds are switched on)
+#: Documented fallbacks (the author's workstation) apply when a variable is unset.
+FAUNA_WEIGHTS_ENV = "EPR_FAUNA_WEIGHTS"
+FAUNA_DEPLOY_CONFIG_ENV = "EPR_FAUNA_DEPLOY_CONFIG"
+_FAUNA_WEIGHTS_FALLBACK = "/home/troyboland/models/mbari_315k_yolov8.pt"
+_FAUNA_DEPLOY_CONFIG_FALLBACK = "/home/troyboland/models/deploy/deploy_config.json"
+FAUNA_WEIGHTS = Path(os.environ.get(FAUNA_WEIGHTS_ENV) or _FAUNA_WEIGHTS_FALLBACK)
+FAUNA_DEPLOY_CONFIG = Path(os.environ.get(FAUNA_DEPLOY_CONFIG_ENV)
+                           or _FAUNA_DEPLOY_CONFIG_FALLBACK)
 FAUNA_MODEL_KEY = "mbari_zero_shot"
 
 DEFAULTS: dict = {
@@ -253,7 +265,8 @@ class ProductType:
         merged = self.defaults(ws)
         merged.update(settings or {})
         log(f"=== {self.label} — {job.name} ===")
-        return self._generate(ws, job, merged, log)
+        with run_lock(ws, f"{self.key} ({job.name})"):
+            return self._generate(ws, job, merged, log)
 
 
 # --------------------------------------------------------------------------
@@ -313,18 +326,95 @@ def _ws_data(ws: str) -> dict:
 
 
 def _raw_ws(ws: str) -> dict:
-    try:
-        return json.loads(_ws_json(ws).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    """Raw workspace.json.  {} only when the file is ABSENT; a present but
+    unreadable/corrupt file raises ``config_service.WorkspaceFileError`` so no
+    read-modify-write caller can turn it into a jobs-only file (review 04 P1-1,
+    03 P1-2)."""
+    from config_service import read_workspace_json
+    return read_workspace_json(_ws_json(ws))
 
 
 def _write_raw_ws(ws: str, data: dict) -> None:
-    """Rewrite workspace.json preserving every other key (atomic-ish)."""
-    path = _ws_json(ws)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    """Rewrite workspace.json preserving every other key.
+
+    Atomic: unique temp name in the same directory + fsync + os.replace (the
+    old shared ``workspace.json.tmp`` let two writers crash each other).
+    Callers doing read-modify-write hold ``_ws_lock(ws)`` around both halves.
+    """
+    from config_service import atomic_write_text
+    atomic_write_text(_ws_json(ws), json.dumps(data, indent=2))
+
+
+def _ws_lock(ws: str):
+    """Cross-process lock around a workspace.json read-modify-write."""
+    from config_service import workspace_json_lock
+    return workspace_json_lock(_ws_json(ws))
+
+
+# --------------------------------------------------------------------------
+# Run lock: one generating process per workspace (review 04 P1-2)
+# --------------------------------------------------------------------------
+
+_RUN_LOCK_NAME = ".epr_run.lock"
+_RUN_LOCK_DEPTH: dict[str, int] = {}
+
+
+def run_lock_path(ws: str) -> Path:
+    return Path(ws) / _RUN_LOCK_NAME
+
+
+def run_lock_holder(ws: str) -> Optional[dict]:
+    """Who is generating in this workspace right now (None = nobody).
+
+    A lock left by a dead process on this host counts as free (stale).  The
+    UI can call this on open to warn "a run is already in progress".
+    """
+    from config_service import lock_holder
+    return lock_holder(run_lock_path(ws))
+
+
+class run_lock(object):
+    """Hold the workspace run lock for the duration of a generate/default run.
+
+    Re-entrant within one process (default_run_all -> generate -> generate),
+    refuses with a clear RuntimeError while ANOTHER live process holds it, and
+    silently takes over a stale lock (dead pid on this host).
+    """
+
+    def __init__(self, ws: str, task: str = "") -> None:
+        self.ws, self.task = str(ws), task
+        self.key = str(run_lock_path(ws))
+
+    def __enter__(self):
+        from config_service import try_acquire_lock
+        depth = _RUN_LOCK_DEPTH.get(self.key, 0)
+        if depth:
+            _RUN_LOCK_DEPTH[self.key] = depth + 1
+            return self
+        if not Path(self.ws).is_dir():
+            raise FileNotFoundError(f"workspace directory not found: {self.ws}")
+        if not try_acquire_lock(self.key, task=self.task):
+            holder = run_lock_holder(self.ws) or {}
+            started = holder.get("started_at")
+            when = (datetime.fromtimestamp(float(started), timezone.utc)
+                    .strftime("%Y-%m-%d %H:%M:%SZ") if started else "?")
+            raise RuntimeError(
+                f"another run is already working in this workspace (pid "
+                f"{holder.get('pid')} on {holder.get('host')}, task "
+                f"'{holder.get('task')}', since {when}); wait for it to finish. "
+                f"If that process is gone, delete {self.key}")
+        _RUN_LOCK_DEPTH[self.key] = 1
+        return self
+
+    def __exit__(self, *_exc):
+        from config_service import release_lock
+        depth = _RUN_LOCK_DEPTH.get(self.key, 0) - 1
+        if depth > 0:
+            _RUN_LOCK_DEPTH[self.key] = depth
+            return False
+        _RUN_LOCK_DEPTH.pop(self.key, None)
+        release_lock(self.key)
+        return False
 
 
 def job_slug(job_id: str) -> str:
@@ -404,6 +494,135 @@ def _unique_dir(parent: Path, name: str) -> Path:
         candidate = Path(parent) / f"{name}_{n}"
     candidate.mkdir(parents=True)
     return candidate
+
+
+SUPERSEDED_DIR = "_superseded"
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _supersede(ws: str, paths: Sequence, reason: str, log: Optional[Callable] = None,
+               stamp_dir: Optional[Path] = None) -> Optional[Path]:
+    """Move existing ``paths`` to ``<ws>/_superseded/<UTC-stamp>/<relpath>``.
+
+    Canonical products are never overwritten in place (review 06 P0-1): the
+    old files keep their workspace-relative layout under one stamped folder,
+    with ``superseded.json`` recording why.  Paths outside the workspace keep
+    their absolute layout under ``_abs/``.  Returns the stamped folder, or None
+    when nothing existed.  Directories are moved whole.
+    """
+    log = _logger(log)
+    ws_path = Path(ws).resolve()
+    existing = [Path(p) for p in paths if p and Path(p).exists()]
+    if not existing:
+        return None
+    if stamp_dir is None:
+        root = ws_path / SUPERSEDED_DIR
+        stamp_dir = root / _utc_stamp()
+        n = 1
+        while stamp_dir.exists():
+            n += 1
+            stamp_dir = root / f"{_utc_stamp()}_{n}"
+    moved: list[dict] = []
+    for src in existing:
+        src_abs = src.resolve()
+        try:
+            rel = src_abs.relative_to(ws_path)
+        except ValueError:
+            rel = Path("_abs") / str(src_abs).lstrip("/")
+        dest = stamp_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_abs), str(dest))
+        moved.append({"from": str(src_abs), "to": str(dest)})
+    record_path = stamp_dir / "superseded.json"
+    record = {"reason": reason, "superseded_at_utc": _utc_stamp(), "moved": []}
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    record.setdefault("moved", []).extend(moved)
+    record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    log(f"  {LOG_WARN}superseded {len(moved)} existing file(s) -> {stamp_dir} ({reason})")
+    return stamp_dir
+
+
+def _restore_superseded(stamp_dir: Optional[Path], log: Optional[Callable] = None,
+                        new_paths: Sequence = ()) -> None:
+    """Roll a failed replacement back: move the partial NEW outputs aside into
+    ``<stamp>/_failed_partial/`` and put the superseded originals back."""
+    log = _logger(log)
+    if stamp_dir is None:
+        return
+    try:
+        record = json.loads((Path(stamp_dir) / "superseded.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    failed = Path(stamp_dir) / "_failed_partial"
+    for p in new_paths:
+        p = Path(p)
+        if p.exists():
+            dest = failed / p.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(p), str(dest))
+    for item in record.get("moved", []):
+        src, dest = Path(item["to"]), Path(item["from"])
+        if not src.exists():
+            continue
+        if dest.exists():                       # partial new output in the way
+            aside = failed / dest.name
+            aside.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(dest), str(aside))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dest))
+    record["rolled_back_utc"] = _utc_stamp()
+    (Path(stamp_dir) / "superseded.json").write_text(json.dumps(record, indent=2),
+                                                     encoding="utf-8")
+    log(f"  {LOG_WARN}replacement failed — previous files restored "
+        f"(partial new output kept in {failed})")
+
+
+def _anomaly_outputs(directory: Path) -> list[Path]:
+    """Everything a catalog run rewrites in an anomaly directory (files + qgis/)."""
+    directory = Path(directory)
+    if not directory.is_dir():
+        return []
+    return sorted(p for p in directory.iterdir()
+                  if p.is_file() or p.name == "qgis")
+
+
+def _merged_outputs(ws: str) -> list[Path]:
+    merged = Path(_resolver(ws).survey_products()) / "photogrammetry" / "merged"
+    return sorted(p for p in merged.iterdir()) if merged.is_dir() else []
+
+
+def _census_outputs(ws: str) -> list[Path]:
+    census = Path(_resolver(ws).survey_products()) / "fauna"
+    names = list(FAUNA_PRODUCT_FILES) + [_META, "fauna_run_summary.json"]
+    return [census / n for n in names if (census / n).is_file()]
+
+
+def replacement_preview(ws: str, job: Optional[Job] = None) -> list[str]:
+    """Canonical files a Default run on ``job`` would REPLACE (moved to
+    ``<ws>/_superseded/<stamp>/`` first).  Empty list = nothing is replaced.
+
+    For the UI's confirmation dialog (review 06 P0-1): whole scope lists the
+    fauna census, the anomaly catalog, the merged ortho/DEM and
+    SURVEY_REPORT.html; a job lists its own anomaly directory.
+    """
+    scope = job or whole_job()
+    out: list[Path] = []
+    if scope.is_whole:
+        out += _census_outputs(ws)
+        out += _anomaly_outputs(_anomaly_dir(ws, scope))
+        out += _merged_outputs(ws)
+        report = Path(ws) / "SURVEY_REPORT.html"
+        if report.is_file():
+            out.append(report)
+    else:
+        out += _anomaly_outputs(_anomaly_dir(ws, scope))
+    return [str(p) for p in out]
 
 
 def _unique_file(parent: Path, stem: str, suffix: str) -> Path:
@@ -531,7 +750,13 @@ def whole_job() -> Job:
 def load_jobs(ws: str) -> list[Job]:
     """Every job in the workspace, WHOLE_TRACKLINE first."""
     jobs = [whole_job()]
-    for record in _raw_ws(ws).get("simple_jobs") or []:
+    try:
+        records = _raw_ws(ws).get("simple_jobs") or []
+    except ValueError:
+        # Read-only listing: an unreadable workspace.json shows no jobs.  The
+        # writers below still refuse (they call _raw_ws directly).
+        records = []
+    for record in records:
         try:
             jobs.append(Job(
                 job_id=str(record["job_id"]),
@@ -564,7 +789,12 @@ def create_job(ws: str, intervals, base_job: Optional[Job] = None) -> Job:
     if not new:
         raise ValueError("create_job: no usable intervals")
 
-    data = _raw_ws(ws)
+    with _ws_lock(ws):
+        return _create_job_locked(ws, new)
+
+
+def _create_job_locked(ws: str, new: list) -> Job:
+    data = _raw_ws(ws)                    # raises on a corrupt file — never {}
     records = list(data.get("simple_jobs") or [])
     used = set()
     for record in records:
@@ -594,15 +824,18 @@ def rename_job(ws: str, job_id: str, name: str) -> Job:
     label = " ".join(str(name).split())
     if not label:
         raise ValueError("a job needs a non-empty name")
-    data = _raw_ws(ws)
-    records = list(data.get("simple_jobs") or [])
-    for record in records:
-        if str(record.get("job_id")) == str(job_id):
-            record["name"] = label
-            data["simple_jobs"] = records
-            _write_raw_ws(ws, data)
-            return get_job(ws, job_id)
-    raise ValueError(f"no such job: {job_id}")
+    with _ws_lock(ws):
+        data = _raw_ws(ws)                # raises on a corrupt file — never {}
+        records = list(data.get("simple_jobs") or [])
+        for record in records:
+            if str(record.get("job_id")) == str(job_id):
+                record["name"] = label
+                data["simple_jobs"] = records
+                _write_raw_ws(ws, data)
+                break
+        else:
+            raise ValueError(f"no such job: {job_id}")
+    return get_job(ws, job_id)
 
 
 def job_product_counts(ws: str, job: Job) -> dict[str, int]:
@@ -619,6 +852,7 @@ def delete_job(ws: str, job_id: str, force: bool = False) -> dict[str, int]:
     """
     if not job_id or job_id == WHOLE_TRACKLINE:
         raise ValueError("the whole trackline cannot be deleted")
+    _raw_ws(ws)          # a corrupt workspace.json refuses here, by name
     job = get_job(ws, job_id)
     if job.is_whole:
         raise ValueError(f"no such job: {job_id}")
@@ -628,11 +862,12 @@ def delete_job(ws: str, job_id: str, force: bool = False) -> dict[str, int]:
             f"{job.name} still has products ("
             + ", ".join(f"{k}×{v}" for k, v in sorted(counts.items()))
             + ") — delete or move them first, or rename the job instead")
-    data = _raw_ws(ws)
-    records = [r for r in (data.get("simple_jobs") or [])
-               if str(r.get("job_id")) != str(job_id)]
-    data["simple_jobs"] = records
-    _write_raw_ws(ws, data)
+    with _ws_lock(ws):
+        data = _raw_ws(ws)                # raises on a corrupt file — never {}
+        records = [r for r in (data.get("simple_jobs") or [])
+                   if str(r.get("job_id")) != str(job_id)]
+        data["simple_jobs"] = records
+        _write_raw_ws(ws, data)
     return counts
 
 
@@ -651,15 +886,181 @@ def _nonempty(path) -> bool:
         return False
 
 
+#: Bump when the interp build's semantics change.  Part of the fingerprint of a
+#: NEWLY built table; a legacy table (no meta) is adopted, not rebuilt.
+INTERP_SCHEMA = "interp-v2 (nav-span grid, NaN outside source coverage)"
+_INTERP_INPUT_KEYS = ("navigation_file", "sensor_files", "depth_source", "speed_source")
+#: Keys that are DERIVED from the files (their parsed span), not configuration.
+_VOLATILE_KEYS = ("start_time", "end_time")
+
+
+def interp_meta_path(ws: str) -> Path:
+    """``interp_full.meta.json`` beside interp_full.csv (fingerprint + shape)."""
+    return interp_path(ws).with_name("interp_full.meta.json")
+
+
+def _strip_volatile(value):
+    if isinstance(value, dict):
+        return {k: _strip_volatile(v) for k, v in value.items() if k not in _VOLATILE_KEYS}
+    if isinstance(value, list):
+        return [_strip_volatile(v) for v in value]
+    return value
+
+
+def _csv_paths(value, out: list) -> list:
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k == "csv_path" and v:
+                out.append(str(v))
+            else:
+                _csv_paths(v, out)
+    elif isinstance(value, list):
+        for v in value:
+            _csv_paths(v, out)
+    return out
+
+
+def interp_fingerprint(ws: str) -> dict:
+    """Identity of interp_full.csv's INPUTS.
+
+    The nav/sensor/depth/speed configuration as saved in workspace.json (minus
+    the derived start/end spans; channel names, columns and ``time_delay_s``
+    included), plus every referenced CSV's size and mtime, plus the build
+    schema.  Any change means the table on disk no longer describes the inputs
+    (review 10 P0-1 / 06 P1-1).
+    """
+    import hashlib
+    data = _raw_ws(ws)
+    config = {k: _strip_volatile(data.get(k)) for k in _INTERP_INPUT_KEYS}
+    base = _ws_json(ws).parent
+    files: dict[str, dict] = {}
+    for stored in sorted(set(_csv_paths(config, []))):
+        path = Path(stored) if Path(stored).is_absolute() else (base / stored)
+        try:
+            st = path.stat()
+            files[stored] = {"size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+        except OSError:
+            files[stored] = {"missing": True}
+    body = {"schema": INTERP_SCHEMA, "config": config, "files": files}
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True, default=str)
+                            .encode("utf-8")).hexdigest()
+    return {"fingerprint": digest, "schema": INTERP_SCHEMA, "config": config,
+            "files": files}
+
+
+def _read_interp_meta(ws: str) -> Optional[dict]:
+    try:
+        return json.loads(interp_meta_path(ws).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_interp_meta(ws: str, fp: dict, adopted: bool = False) -> None:
+    target = interp_path(ws)
+    meta = dict(fp)
+    try:
+        st = target.stat()
+        meta["interp_size"] = int(st.st_size)
+        meta["interp_mtime_ns"] = int(st.st_mtime_ns)
+    except OSError:
+        pass
+    meta["written_at"] = time.time()
+    meta["adopted_legacy"] = bool(adopted)
+    try:
+        from config_service import atomic_write_text
+        atomic_write_text(interp_meta_path(ws), json.dumps(meta, indent=2, default=str))
+    except OSError:
+        pass
+
+
+def interp_staleness(ws: str) -> tuple[bool, str]:
+    """(stale?, why) for the interp_full.csv on disk.
+
+    Stale when its recorded input fingerprint differs from the current inputs,
+    or its size differs from what was written (truncated/edited).  A legacy
+    table with no fingerprint is stale only if an input file is NEWER than it;
+    otherwise it is adopted as-is.
+    """
+    target = interp_path(ws)
+    if not _nonempty(target):
+        return True, "interp_full.csv is missing"
+    current = interp_fingerprint(ws)
+    meta = _read_interp_meta(ws)
+    if meta is None:
+        try:
+            built = target.stat().st_mtime_ns
+        except OSError:
+            return True, "interp_full.csv unreadable"
+        newer = [name for name, st in current["files"].items()
+                 if not st.get("missing") and int(st.get("mtime_ns") or 0) > built]
+        if newer:
+            return True, ("an input changed after it was built (no fingerprint on file): "
+                          + ", ".join(Path(n).name for n in newer))
+        return False, "legacy (no fingerprint) — adopted"
+    try:
+        if int(meta.get("interp_size", -1)) != int(target.stat().st_size):
+            return True, (f"interp_full.csv is {target.stat().st_size:,} bytes but was "
+                          f"written as {int(meta.get('interp_size', -1)):,} (truncated or edited)")
+    except OSError:
+        return True, "interp_full.csv unreadable"
+    if meta.get("fingerprint") == current["fingerprint"]:
+        return False, "fingerprint matches"
+    reasons: list[str] = []
+    if meta.get("schema") != current["schema"]:
+        reasons.append(f"build schema {meta.get('schema')!r} -> {current['schema']!r}")
+    old_cfg, new_cfg = meta.get("config") or {}, current["config"]
+    for key in _INTERP_INPUT_KEYS:
+        if json.dumps(old_cfg.get(key), sort_keys=True, default=str) != \
+                json.dumps(new_cfg.get(key), sort_keys=True, default=str):
+            reasons.append(f"{key} configuration changed")
+    old_files, new_files = meta.get("files") or {}, current["files"]
+    for name in sorted(set(old_files) | set(new_files)):
+        if old_files.get(name) != new_files.get(name):
+            what = ("added" if name not in old_files else
+                    "no longer used" if name not in new_files else "modified (size/mtime)")
+            reasons.append(f"{Path(name).name} {what}")
+    return True, "; ".join(reasons) or "input fingerprint changed"
+
+
 def ensure_interp(ws: str, log_fn: Optional[Callable[[str], None]] = None) -> Path:
-    """Path to interp_full.csv, building it through the real pipeline if absent."""
+    """Path to interp_full.csv, (re)building it through the real pipeline when
+    it is absent OR stale (inputs changed since it was built — the backstop to
+    the UI invalidating on import)."""
     log = _logger(log_fn)
     target = interp_path(ws)
     if _nonempty(target):
-        return target
-
+        stale, reason = interp_staleness(ws)
+        if not stale:
+            if _read_interp_meta(ws) is None:
+                _write_interp_meta(ws, interp_fingerprint(ws), adopted=True)
+                log(f"  {LOG_WARN}interp_full.csv predates input fingerprinting — "
+                    "adopted as-is (rows outside the navigation span are ignored on "
+                    "read; delete it to rebuild a clean table)")
+            return target
+        log(f"{LOG_WARN}interp_full.csv is stale — {reason}. Rebuilding.")
+        moved = None
+        try:
+            moved = _supersede(ws, [target, interp_meta_path(ws)],
+                               f"interp_full.csv rebuilt: {reason}", log)
+            if moved:
+                log(f"  previous table kept in {moved}")
+        except Exception as exc:                                    # noqa: BLE001
+            log(f"  {LOG_WARN}could not keep a copy of the old table: {one_line(exc)}")
+        try:
+            return _build_interp(ws, target, log)
+        except BaseException:
+            # A failed rebuild must not leave the dive with NO table: put the
+            # stale one back (it stays stale, so the next run retries).
+            if moved is not None and not _nonempty(target):
+                _restore_superseded(moved, log)
+            raise
     log(f"interp_full.csv missing — building via pipeline ({target})")
+    return _build_interp(ws, target, log)
+
+
+def _build_interp(ws: str, target: Path, log: Callable) -> Path:
     from pipeline_service import PipelineService, PipelineConfig
+    fingerprint = interp_fingerprint(ws)          # BEFORE reading: inputs as used
     data = _ws_data(ws)
     inputs = Path(_resolver(ws).inputs_dir(create=True))
     cfg = PipelineConfig(
@@ -680,33 +1081,138 @@ def ensure_interp(ws: str, log_fn: Optional[Callable[[str], None]] = None) -> Pa
     PipelineService(log_fn=lambda m: log("  " + str(m))).run(cfg)
     if not _nonempty(target):
         raise RuntimeError(f"interp_full.csv was not produced at {target}")
+    _write_interp_meta(ws, fingerprint)
     log(f"  interp_full.csv built: {target}")
     return target
+
+
+# ---- read-side guards for interp tables built before the nav-span fix -------
+#
+# Tables built by the old union-of-sources grid carry hours of rows whose
+# position is the first/last renav fix held constant (06 P1-2).  They are NOT
+# rewritten; every reader here clips them to the positional source's real span.
+
+#: A leading/trailing run of IDENTICAL positions at least this long (rows) is
+#: treated as edge-hold padding when no stored nav span is available.
+HELD_EDGE_MIN_ROWS = 60
+
+
+def _stored_time(value) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        return float(calendar.timegm(dt.utctimetuple())) + dt.microsecond / 1e6
+    return unix(dt) + dt.microsecond / 1e6
+
+
+def nav_span(ws: str) -> Optional[tuple[float, float]]:
+    """Positional (lat ∩ lon) source span as recorded in workspace.json.
+
+    ``navigation_file.start_time/end_time`` is the UNION with the altimeter and
+    is deliberately not used.  None when unknown.
+    """
+    try:
+        nav = (_raw_ws(ws).get("navigation_file") or {})
+    except ValueError:
+        return None
+    starts, ends = [], []
+    for key in ("latitude_source", "longitude_source"):
+        src = nav.get(key) or {}
+        a, b = _stored_time(src.get("start_time")), _stored_time(src.get("end_time"))
+        if a is None or b is None:
+            return None
+        starts.append(a)
+        ends.append(b)
+    if not starts or max(starts) >= min(ends):
+        return None
+    return max(starts), min(ends)
+
+
+def _held_edge_bounds(df: pd.DataFrame) -> tuple[int, int]:
+    """[i0, i1) row range after dropping leading/trailing constant-position
+    runs of >= HELD_EDGE_MIN_ROWS rows (time-sorted frame)."""
+    cols = [c for c in (("lat", "lon"), ("easting", "northing"))
+            if c[0] in df.columns and c[1] in df.columns]
+    n = len(df)
+    if not cols or n < 2:
+        return 0, n
+    a = df[cols[0][0]].to_numpy(dtype=float)
+    b = df[cols[0][1]].to_numpy(dtype=float)
+    same = (a[1:] == a[:-1]) & (b[1:] == b[:-1])      # row k+1 repeats row k
+    i0 = 0
+    while i0 < n - 1 and same[i0]:
+        i0 += 1
+    i1 = n - 1
+    while i1 > 0 and same[i1 - 1]:
+        i1 -= 1
+    lead = i0            # rows 0..i0-1 repeat row i0's position
+    trail = n - 1 - i1   # rows i1+1..n-1 repeat row i1's position
+    start = i0 if lead >= HELD_EDGE_MIN_ROWS else 0
+    stop = i1 + 1 if trail >= HELD_EDGE_MIN_ROWS else n
+    return start, max(start, stop)
+
+
+def clip_to_nav(ws: str, df: pd.DataFrame, log: Optional[Callable] = None) -> pd.DataFrame:
+    """Rows of a time-sorted interp frame that carry a REAL position.
+
+    Clips to the stored positional span (±1 s), then drops any remaining
+    leading/trailing edge-hold run.  A table built after the fix passes
+    through unchanged.
+    """
+    if df.empty or "unix_time" not in df.columns:
+        return df
+    n0 = len(df)
+    span = nav_span(ws)
+    if span is not None:
+        t = df["unix_time"].to_numpy(dtype=float)
+        keep = (t >= span[0] - 1.0) & (t <= span[1] + 1.0)
+        if keep.any():
+            df = df[keep]
+    i0, i1 = _held_edge_bounds(df)
+    if (i0, i1) != (0, len(df)):
+        df = df.iloc[i0:i1]
+    if log is not None and len(df) != n0:
+        log(f"  {LOG_WARN}ignored {n0 - len(df):,} interp row(s) outside the "
+            "navigation span (edge-held positions from an older interp build)")
+    return df
 
 
 def track_polyline(ws: str) -> np.ndarray:
     """Nx3 array of [unix_time, easting, northing], time-ordered.
 
     Builds interp_full.csv through the pipeline when it is missing, so the UI
-    can draw a trackline for a freshly imported dive.
+    can draw a trackline for a freshly imported dive.  Rows without a real
+    position (NaN, or edge-held padding in an older table) are excluded.
     """
     path = ensure_interp(ws)
-    df = pd.read_csv(path, usecols=lambda c: c in ("unix_time", "easting", "northing"))
+    wanted = ("unix_time", "easting", "northing", "lat", "lon")
+    df = pd.read_csv(path, usecols=lambda c: c in wanted)
     for column in ("unix_time", "easting", "northing"):
         if column not in df.columns:
             raise ValueError(f"{path} lacks a '{column}' column")
-    df = df.dropna(subset=["unix_time", "easting", "northing"]).sort_values("unix_time")
+    df = df.dropna(subset=["unix_time", "easting", "northing"]).sort_values(
+        "unix_time", kind="stable").reset_index(drop=True)
+    df = clip_to_nav(ws, df)
     return df[["unix_time", "easting", "northing"]].to_numpy(dtype=float)
 
 
 def _interp_df(ws: str, columns: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """interp_full.csv as a time-sorted frame, clipped to the navigation span."""
     path = ensure_interp(ws)
     if columns:
-        wanted = set(columns)
+        wanted = set(columns) | {"unix_time", "lat", "lon", "easting", "northing"}
         df = pd.read_csv(path, usecols=lambda c: c in wanted)
     else:
         df = pd.read_csv(path)
-    return df.sort_values("unix_time").reset_index(drop=True)
+    df = df.sort_values("unix_time", kind="stable").reset_index(drop=True)
+    df = clip_to_nav(ws, df).reset_index(drop=True)
+    if columns:
+        df = df[[c for c in df.columns if c in set(columns)]]
+    return df
 
 
 def job_intervals(ws: str, job: Job) -> list[Interval]:
@@ -1015,6 +1521,8 @@ def scan_frame_pool(ws: str, spacing_m: float, sampling_mode: str = "dynamic",
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if not _set_complete(meta):
+            continue                     # a build in progress / failed: never recycle
         settings = meta.get("settings") or {}
         if str(settings.get("sampling_mode", "dynamic")) != str(sampling_mode):
             continue
@@ -1108,6 +1616,22 @@ def _frame_set_characteristic(meta: dict) -> str:
     return " · ".join(bits)
 
 
+SET_STATUS_IN_PROGRESS = "in_progress"
+SET_STATUS_FAILED = "failed"
+SET_STATUS_COMPLETE = "complete"
+
+
+def _set_complete(meta: dict) -> bool:
+    """A frame set is usable only once its build finished.  Sets written
+    before status markers existed carry no status and count as complete."""
+    return str(meta.get("status") or SET_STATUS_COMPLETE) == SET_STATUS_COMPLETE
+
+
+def _write_set_meta(set_dir: Path, meta: dict) -> None:
+    from config_service import atomic_write_text
+    atomic_write_text(Path(set_dir) / _SET_META, json.dumps(meta, indent=2))
+
+
 def _discover_frame_set(ws: str, job: Job) -> list[ProductInstance]:
     out: list[ProductInstance] = []
     for meta_path in sorted(frame_sets_root(ws).glob("*/set_*/" + _SET_META)):
@@ -1117,6 +1641,8 @@ def _discover_frame_set(ws: str, job: Job) -> list[ProductInstance]:
             continue
         if str(meta.get("job_id") or WHOLE_TRACKLINE) != job.job_id:
             continue
+        if not _set_complete(meta):
+            continue                     # partial/failed set: not a product
         set_dir = meta_path.parent
         segments = _segment_dirs(set_dir)
         out.append(_instance(
@@ -1142,10 +1668,6 @@ def _discover_frame_set(ws: str, job: Job) -> list[ProductInstance]:
 
 
 def _generate_frame_set(ws: str, job: Job, settings: dict, log: Callable) -> ProductInstance:
-    from models import SelectedTimeRange
-    from pipeline_service import PipelineConfig
-    from video_service import VideoService
-
     spacing = float(settings.get("spacing_m", DEFAULTS["spacing_m"]))
     mode = str(settings.get("sampling_mode", DEFAULTS["sampling_mode"]))
     floor_hz = float(settings.get("min_frequency_hz", DEFAULTS["min_frequency_hz"]))
@@ -1158,6 +1680,16 @@ def _generate_frame_set(ws: str, job: Job, settings: dict, log: Callable) -> Pro
     intervals = job_intervals(ws, job)
     grid = sampling_grid(ws, spacing, floor_hz)
     desired = grid[_mask_intervals(grid, intervals)]
+    # Never request a frame outside the span that has REAL positions: the
+    # clock floor used to add a sample every 10 s across hours of edge-held
+    # nav (review 06 P1-2 #3 — 351 such frames on J1758_rehearsal).
+    track = track_polyline(ws)
+    if len(track):
+        inside = (desired >= track[0, 0]) & (desired <= track[-1, 0])
+        if not inside.all():
+            log(f"  {LOG_WARN}{int((~inside).sum()):,} requested sample time(s) outside "
+                "the navigation span dropped")
+        desired = desired[inside]
     log(f"  grid: {len(grid):,} whole-dive samples @ {spacing:g} m; "
         f"{len(desired):,} inside {len(intervals)} interval(s)")
     if not len(desired):
@@ -1176,6 +1708,41 @@ def _generate_frame_set(ws: str, job: Job, settings: dict, log: Callable) -> Pro
     created = time.time()
     set_dir = _unique_dir(frame_sets_root(ws, create=True) / job_slug(job.job_id),
                           f"set_{_stamp(created)}")
+    # Partial-write marker (review 04 P1-4): until the final meta lands this
+    # set is "in_progress" — never recycled, never discovered as a product.
+    base_meta = {
+        "status": SET_STATUS_IN_PROGRESS,
+        "job_id": job.job_id,
+        "job_name": job.name,
+        "created_at": created,
+        "intervals": [iv.as_list() for iv in intervals],
+        "settings": {"sampling_mode": mode, "spacing_m": spacing,
+                     "min_frequency_hz": floor_hz,
+                     "reuse_tolerance_s": tolerance,
+                     "reuse_legacy": reuse_legacy},
+        "n_requested": int(len(desired)),
+    }
+    _write_set_meta(set_dir, base_meta)
+    try:
+        return _fill_frame_set(ws, job, set_dir, base_meta, runs, pool, data,
+                               desired, intervals, spacing, floor_hz, tolerance,
+                               reuse_mode, created, log)
+    except BaseException as exc:
+        if set_dir.is_dir():
+            try:
+                _write_set_meta(set_dir, dict(base_meta, status=SET_STATUS_FAILED,
+                                              error=one_line(exc)))
+            except OSError:
+                pass
+        raise
+
+
+def _fill_frame_set(ws, job, set_dir, base_meta, runs, pool, data, desired,
+                    intervals, spacing, floor_hz, tolerance, reuse_mode, created,
+                    log) -> ProductInstance:
+    from models import SelectedTimeRange
+    from pipeline_service import PipelineConfig
+    from video_service import VideoService
 
     # ---- uncovered runs: the real extraction pipeline, explicit schedule ----
     extract_runs = [times for covered, times in runs if not covered]
@@ -1261,14 +1828,8 @@ def _generate_frame_set(ws: str, job: Job, settings: dict, log: Callable) -> Pro
         detail = skipped_reason or "no frames were reused or extracted"
         raise RuntimeError(f"frame set is empty — {detail}")
     meta = {
-        "job_id": job.job_id,
-        "job_name": job.name,
-        "created_at": created,
-        "intervals": [iv.as_list() for iv in intervals],
-        "settings": {"sampling_mode": mode, "spacing_m": spacing,
-                     "min_frequency_hz": floor_hz,
-                     "reuse_tolerance_s": tolerance,
-                     "reuse_legacy": reuse_legacy},
+        **base_meta,
+        "status": SET_STATUS_COMPLETE,
         "n_frames": n_frames,
         "n_reused": n_reused,
         "n_extracted": n_extracted,
@@ -1277,7 +1838,7 @@ def _generate_frame_set(ws: str, job: Job, settings: dict, log: Callable) -> Pro
         "segments": [{"dir": d.name, "n_frames": len(_segment_frames(d))} for d in segments],
     }
     meta["characteristic"] = _frame_set_characteristic(meta)
-    (set_dir / _SET_META).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    _write_set_meta(set_dir, meta)
     _write_meta(set_dir, "frame_set", job, meta["characteristic"], set_dir)
     log(f"  frame set: {_fmt_int(n_frames)} frames in {len(segments)} segment(s) -> {set_dir}")
     return _instance("frame_set", job.job_id, set_dir, meta["characteristic"],
@@ -1366,11 +1927,29 @@ def _discover_photogrammetry(ws: str, job: Job) -> list[ProductInstance]:
         if owner != job.job_id:
             continue
         meta = _read_meta(run_dir) or {}
+        # run_status.json (photogrammetry_service): "running" before Metashape
+        # starts, then "ok" | "partial" | "failed".  Crashed, still-running and
+        # all-chunks-failed runs are not products (reviews 04 P1-5, 06 P1-6).
+        status: dict = {}
+        try:
+            status = json.loads((run_dir / "run_status.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        st = status.get("status")
+        if st == "failed" or (st == "running" and not meta):
+            continue
+        # a run with neither outputs nor a meta is a crash left behind
+        if not meta and not any((c / "orthomosaic.tif").is_file() or (c / "dem.tif").is_file()
+                                for c in chunks):
+            continue
         views: list[str] = []
         for chunk in chunks:
             views.extend(str(p) for p in _CHUNK_VIEWS(chunk) if p.exists())
         characteristic = meta.get("characteristic") or (
             f"{run_dir.name} · {len(chunks)} chunk{'s' if len(chunks) != 1 else ''}")
+        if st == "partial":
+            characteristic += (f"  [{status.get('n_ok')}/{len(chunks)} chunks "
+                               "reconstructed]")
         primary = run_dir / "project.psx"
         out.append(_instance("photogrammetry", owner,
                              primary if primary.exists() else run_dir,
@@ -1605,6 +2184,10 @@ def _generate_photogrammetry(ws: str, job: Job, settings: dict, log: Callable) -
         str(run_dir / "project.psx"), frame_sets,
         log_fn=lambda m: log("    " + str(m)), **photo_settings)
     n_products = sum(len(v) for v in (result or {}).values())
+    try:
+        run_qc = json.loads((run_dir / "run_status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        run_qc = {}
 
     # Merge the per-chunk orthos/DEMs into the survey-wide mosaics.  Nothing
     # else in the app called merge_products, so survey/photogrammetry/merged/
@@ -1612,14 +2195,26 @@ def _generate_photogrammetry(ws: str, job: Job, settings: dict, log: Callable) -
     # merged/ortho_merged.tif — could not succeed on any freshly built
     # workspace.  Survey scope only: the merge reads the whole dive.
     if job.is_whole:
+        superseded = None
+        before = {p.name for p in _merged_outputs(ws)}
         try:
             from merge_products import build_previews, merge_survey
+            # Previous mosaics move aside first (review 06 P0-1); a failed
+            # merge puts them back.
+            superseded = _supersede(ws, _merged_outputs(ws),
+                                    "survey ortho/DEM re-merged after photogrammetry", log)
             merged = merge_survey(ws, log_fn=lambda m: log("    " + str(m)))
             previews = build_previews(ws, log_fn=lambda m: log("    " + str(m)))
             log("    merged: " + (", ".join(sorted({**merged, **previews}))
                                   or "nothing to merge"))
+            lost = before - {p.name for p in _merged_outputs(ws)}
+            if superseded is not None and lost:
+                raise RuntimeError("merge did not reproduce " + ", ".join(sorted(lost)))
         except Exception as exc:                                    # noqa: BLE001
             log(f"    {LOG_WARN}ortho/DEM merge failed: {one_line(exc)}")
+            if superseded is not None:
+                _restore_superseded(superseded, log, [p for p in _merged_outputs(ws)
+                                                      if p.name not in before])
     else:
         log("    ortho/DEM merge is survey-scoped — skipped for a job")
 
@@ -1637,7 +2232,9 @@ def _generate_photogrammetry(ws: str, job: Job, settings: dict, log: Callable) -
                        "frame_set": str(set_dir), "n_products": n_products,
                        "sampling": sampling,
                        "sampling_label": sampling_label(sampling),
-                       "photo_settings": photo_settings})
+                       "photo_settings": photo_settings,
+                       "chunk_qc": run_qc.get("chunks"),
+                       "run_status": run_qc.get("status")})
     log(f"  photogrammetry done — {n_products} product file(s)")
     return _instance("photogrammetry", job.job_id, run_dir / "project.psx",
                      characteristic, views=views, created_at=created)
@@ -1920,9 +2517,26 @@ def _generate_anomaly(ws: str, job: Job, settings: dict, log: Callable) -> Produ
     created = time.time()
 
     anomaly.run_detector(_REPO, interp, log_fn=lambda m: log("    " + str(m)))
-    anomaly.run_catalog(_REPO, interp_csv=interp, raw_nav_csv=_raw_nav_csv(ws),
-                        event_root=event_root, out_dir=out_dir,
-                        log_fn=lambda m: log("    " + str(m)))
+
+    # The detector succeeded; only now move the previous catalog aside (never
+    # overwrite in place — review 06 P0-1 / 04 P2-5).  A catalog failure rolls
+    # back to the previous files instead of leaving a new/old mix.
+    before = {p.name for p in _anomaly_outputs(out_dir)}
+    superseded = _supersede(ws, _anomaly_outputs(out_dir),
+                            f"anomaly detection re-run ({job.name})", log)
+    try:
+        # Every run-scoped path is explicit: nothing may fall back to the
+        # builder's J1754 module defaults (review 03 P1-7).
+        anomaly.run_catalog(_REPO, interp_csv=interp, raw_nav_csv=_raw_nav_csv(ws),
+                            event_root=event_root, out_dir=out_dir,
+                            ts_results=Path(_resolver(ws).inputs_dir()) / "ts_analysis_results.mat",
+                            dive=_dive_name(ws),
+                            log_fn=lambda m: log("    " + str(m)))
+    except BaseException:
+        if superseded is not None:
+            _restore_superseded(superseded, log, [p for p in _anomaly_outputs(out_dir)
+                                                  if p.name not in before])
+        raise
 
     if job.is_whole:
         try:
@@ -2242,8 +2856,19 @@ def _generate_survey_report(ws: str, job: Job, settings: dict, log: Callable) ->
                                     f"SURVEY_REPORT_{_stamp(created)}", ".html"))
         log("  note: survey_report.collect() is dive-wide; the job scope only "
             "changes where the file is written")
-    result = build_survey_report(ws, out_path=out_path,
-                                 fast_mesh=bool(settings.get("fast_mesh", True)))
+    superseded = None
+    if job.is_whole:
+        # The fixed-name dive report is moved aside, never overwritten in place
+        # (review 06 P0-1); a failed build puts it back.
+        superseded = _supersede(ws, [Path(ws) / "SURVEY_REPORT.html"],
+                                "survey report regenerated", log)
+    try:
+        result = build_survey_report(ws, out_path=out_path,
+                                     fast_mesh=bool(settings.get("fast_mesh", True)))
+    except BaseException:
+        if superseded is not None:
+            _restore_superseded(superseded, log)
+        raise
     path = Path(result)
     characteristic = f"HTML · {path.stat().st_size / 1e6:.1f} MB"
     log(f"  survey report -> {path}")
@@ -2287,6 +2912,10 @@ FAUNA_PRODUCT_FILES = (
     "fathomnet_detections.csv", "fauna_points_utm.geojson", "fauna_density.csv",
     "fish_frame_shortlist.csv", "occurrences.csv", "fauna_vs_anomaly.png",
     "fauna_density_timeseries_v2.png", "fauna_density_timeseries.png",
+    # provenance sidecars written by fathomnet_detect / fauna_timeseries /
+    # fauna_occurrences (review 02 P1-2); listed so a census replacement
+    # supersedes them together with the tables they describe.
+    "fauna_provenance.json", "fauna_density.meta.json", "occurrences.meta.json",
 )
 
 #: Columns the fauna modules read off window_context.csv.  An empty table with
@@ -2329,7 +2958,8 @@ def fauna_thresholds(settings: Optional[dict] = None,
         config = json.loads(path.read_text(encoding="utf-8"))
         buckets = config["models"][FAUNA_MODEL_KEY]["buckets"]
     except (OSError, ValueError, KeyError) as exc:
-        log(f"  {LOG_WARN}deploy config unreadable ({one_line(exc)}) — using a "
+        log(f"  {LOG_WARN}deploy config {path} unreadable ({one_line(exc)}; set "
+            f"{FAUNA_DEPLOY_CONFIG_ENV} to its path) — using a "
             f"flat conf floor of {float(settings.get('fauna_conf', DEFAULTS['fauna_conf'])):g}")
         return {}
     out = {name: float(spec.get("conf_balanced", DEFAULTS["fauna_conf"]))
@@ -2429,53 +3059,52 @@ class _nav_from(object):
         return False
 
 
+def _is_census_run(job: Job, settings: dict) -> bool:
+    """The DIVE-WIDE run at the default sampling produces the canonical census
+    (<ws>/survey/fauna) that catalog_builder, fauna_ortho, worm_cover, the
+    BIIGLE bridge and the angle scripts read by name."""
+    return bool(job.is_whole and sampling_matches(settings, {}))
+
+
 def _fauna_run_root(ws: str, job: Job, settings: dict, created: float,
                     log: Callable, temporary: list) -> tuple[Path, bool]:
-    """The workspace root a fauna run writes into, and whether windows exist.
+    """The miniature workspace a fauna run writes into, and whether windows exist.
 
-    The DIVE-WIDE run at the default sampling is the census every other tool in
-    this repo reads — ``catalog_builder``, ``fauna_ortho``, ``worm_cover``, the
-    BIIGLE bridge and the angle scripts all open ``<ws>/survey/fauna/…`` by
-    name.  So that run writes straight into the workspace: the workspace IS the
-    shape these modules want (survey/fauna, survey/anomaly, inputs), no staging
-    needed, and the products land where the rest of the system looks for them.
+    EVERY run — the dive-wide census included — builds inside its own mini
+    workspace (survey/fauna, survey/anomaly/window_context.csv, inputs/
+    interp_full.csv), the interface fathomnet_detect / fauna_timeseries /
+    fauna_occurrences take.  For the census that root is a STAGING directory
+    (``survey/.fauna_staging/…``, registered in ``temporary`` for removal); the
+    finished products are promoted into ``survey/fauna`` only after the whole
+    build succeeded, with the previous census moved to ``_superseded/``.  So:
 
-    Every other run — a job scope, or a second sampling regime — gets its own
-    miniature workspace instead, so it can never overwrite the census.
+    * a crash or kill mid-run never leaves new detections beside old density /
+      occurrence / meta files (review 06 P1-3, 04 P1-7);
+    * the "no windows yet" EMPTY window_context.csv placeholder is only ever
+      written inside the run root — never into the dive's own anomaly
+      directory, where a kill used to leave a fabricated zero-window table
+      behind (review 04 P1-6).
 
-    ``have_windows`` is False when the dive has no anomaly window table yet, in
-    which case an EMPTY one is written so the downstream joins still produce
-    their columns (blank) rather than raising.
+    ``have_windows`` is False when the dive has no anomaly window table yet.
     """
-    if job.is_whole and sampling_matches(settings, {}):
-        census = Path(_resolver(ws).survey_products()) / "fauna"
-        census.mkdir(parents=True, exist_ok=True)
-        existing = [p.name for p in (census / n for n in FAUNA_PRODUCT_FILES)
-                    if p.is_file()]
+    census = _is_census_run(job, settings)
+    if census:
+        existing = [p.name for p in _census_outputs(ws)]
         if existing:
-            log(f"  {LOG_WARN}this dive-wide run REPLACES the existing census "
-                f"in {census} ({len(existing)} file(s): "
-                + ", ".join(existing[:4])
-                + ("…" if len(existing) > 4 else "") + ")")
-        log(f"  dive-wide census -> {census} (where every other tool reads it)")
-        windows = Path(_resolver(ws).anomaly_dir()) / "window_context.csv"
-        if windows.is_file():
-            return Path(ws), True
-        # The joins need the file to exist.  Write an EMPTY one, and register it
-        # for removal: leaving a fabricated "zero windows" table behind in the
-        # dive's anomaly directory would lie to every other reader of it.
-        windows.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(columns=list(_WINDOW_CONTEXT_COLUMNS)).to_csv(windows, index=False)
-        temporary.append(windows)
-        log(f"  {LOG_WARN}no anomaly window table ({windows}) — anomaly "
-            "detection has not run yet. Fauna products are still built; the "
-            "in/out-of-window comparison is skipped and the occurrence table's "
-            "window columns stay blank.")
-        return Path(ws), False
-
-    root = _unique_dir(_fauna_runs_root(ws, job, create=True),
-                       f"{_dive_name(ws)}_fauna_{_stamp(created)}"
-                       f"__{sampling_slug(settings)}")
+            log(f"  {LOG_WARN}this dive-wide run will REPLACE the census in "
+                f"{Path(_resolver(ws).survey_products()) / 'fauna'} once it completes "
+                f"({len(existing)} file(s): " + ", ".join(existing[:4])
+                + ("…" if len(existing) > 4 else "") + "); the previous files are "
+                f"moved to {Path(ws) / SUPERSEDED_DIR}/<stamp>/ first")
+        parent = Path(_resolver(ws).survey_products()) / ".fauna_staging"
+    else:
+        parent = _fauna_runs_root(ws, job, create=True)
+    # "<DIVE>_…": the fauna modules derive the dive label from the root's name.
+    root = _unique_dir(parent, f"{_dive_name(ws)}_fauna_{_stamp(created)}"
+                               f"__{sampling_slug(settings)}")
+    if census:
+        temporary.append(root)
+        log(f"  staging census build in {root}")
     (root / "survey" / "fauna").mkdir(parents=True, exist_ok=True)
     (root / "survey" / "anomaly").mkdir(parents=True, exist_ok=True)
     (root / "inputs").mkdir(parents=True, exist_ok=True)
@@ -2501,6 +3130,33 @@ def _fauna_run_root(ws: str, job: Job, settings: dict, created: float,
         "still built; the in/out-of-window comparison is skipped and the "
         "occurrence table's window columns stay blank.")
     return root, False
+
+
+def _promote_census(ws: str, staged: Path, log: Callable) -> Path:
+    """Move a finished staged census into <ws>/survey/fauna.
+
+    The previous census files that this run replaces — AND any stale sibling
+    in FAUNA_PRODUCT_FILES the new run did not produce — go to
+    ``_superseded/<stamp>/`` first, so the directory never mixes generations.
+    Files derived from the old census that no code here regenerates are named
+    in the log.
+    """
+    census = Path(_resolver(ws).survey_products()) / "fauna"
+    census.mkdir(parents=True, exist_ok=True)
+    new_files = sorted(p for p in Path(staged).iterdir() if p.is_file())
+    _supersede(ws, _census_outputs(ws), "fauna census replaced by a dive-wide run", log)
+    for p in new_files:
+        os.replace(p, census / p.name)
+    derived = sorted(p.name for p in census.iterdir()
+                     if p.is_file() and not p.name.startswith("fathomnet_detections")
+                     and p.name not in {q.name for q in new_files}
+                     and "_subsample" not in p.name)
+    if derived:
+        log(f"  {LOG_WARN}files in {census} were derived from the PREVIOUS census and "
+            "are not regenerated here — rebuild them: " + ", ".join(derived[:8])
+            + ("…" if len(derived) > 8 else ""))
+    log(f"  census promoted: {len(new_files)} file(s) -> {census}")
+    return census
 
 
 def _fauna_characteristic(meta: dict) -> str:
@@ -2610,7 +3266,14 @@ def _generate_fauna(ws: str, job: Job, settings: dict, log: Callable) -> Product
 
     weights = Path(settings.get("fauna_weights") or FAUNA_WEIGHTS)
     if not weights.is_file():
-        raise RuntimeError(f"detector weights not found: {weights}")
+        source = ("the Detector weights setting" if settings.get("fauna_weights")
+                  and str(settings.get("fauna_weights")) != str(FAUNA_WEIGHTS)
+                  else (f"${FAUNA_WEIGHTS_ENV}" if os.environ.get(FAUNA_WEIGHTS_ENV)
+                        else f"the built-in fallback (${FAUNA_WEIGHTS_ENV} is not set)"))
+        raise RuntimeError(
+            f"detector weights not found: {weights} (from {source}). Set the "
+            f"environment variable {FAUNA_WEIGHTS_ENV} to the path of "
+            "mbari_315k_yolov8.pt, or enter it under Detector weights")
 
     # ---- frames: ALWAYS a recycled frame set, never a fresh extraction ------
     set_dir = resolve_frame_set(ws, job, settings, log)
@@ -2682,9 +3345,14 @@ def _generate_fauna(ws: str, job: Job, settings: dict, log: Callable) -> Product
                                      set_dir, weights, floor, thresholds, imgsz,
                                      batch, device, runtime, created, temporary, log)
     finally:
+        # Staging roots / placeholders are removed however the build ended
+        # (exception, KeyboardInterrupt, …) — nothing temporary survives.
         for path in temporary:
             try:
-                Path(path).unlink()
+                if Path(path).is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    Path(path).unlink()
             except OSError:
                 pass
 
@@ -2753,11 +3421,18 @@ def _build_fauna_products(ws, job, settings, det, nav, frames, kept, set_dir,
         "had_anomaly_windows": have_windows,
         "skipped": notes,
     }
+    try:
+        meta_extra["provenance"] = json.loads(
+            (out_dir / "fauna_provenance.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
     characteristic = _fauna_characteristic(meta_extra)
+    if _is_census_run(job, settings):
+        # The whole build succeeded in staging: only now does it replace the
+        # canonical census (old files -> _superseded/, review 06 P0-1 / P1-3).
+        out_dir = _promote_census(ws, out_dir, log)
     views = _fauna_views(out_dir)
-    # Meta lives beside the products, never at the run root: for the dive-wide
-    # census the run root IS the workspace, and a simple_meta.json dropped there
-    # would sit next to workspace.json.
+    # Meta lives beside the products (survey/fauna), never at a run root.
     _write_meta(out_dir, "fauna_detection", job, characteristic,
                 out_dir / "fathomnet_detections.csv", views, extra=meta_extra)
     (out_dir / "fauna_run_summary.json").write_text(
@@ -2886,6 +3561,12 @@ def default_run_all(ws: str, log_fn: Optional[Callable[[str], None]] = None,
     and the suite continues, so one missing dependency never kills the run.  The
     last line is always a verdict: how many steps failed, and which.
     """
+    with run_lock(ws, f"default run ({(job or whole_job()).name})"):
+        _default_run_all_locked(ws, log_fn, job)
+
+
+def _default_run_all_locked(ws: str, log_fn: Optional[Callable[[str], None]] = None,
+                            job: Optional[Job] = None) -> None:
     log = _logger(log_fn)
     scope = job or whole_job()
     started = time.time()

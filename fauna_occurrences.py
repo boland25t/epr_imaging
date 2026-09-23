@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
-"""Megafauna occurrence table: every detection joined to nav, sensors, anomalies.
+"""Megafauna frame-detection table: every detection joined to nav, sensors, anomalies.
 
-One row per kept detection (excluded classes dropped): what was seen, when,
+One row per kept FRAME DETECTION (excluded classes dropped) -- not per
+individual: frames overlap heavily (~0.25 m spacing), so the same animal is
+detected in several consecutive frames.  The file keeps its historical name
+(occurrences.csv) but its first line is a '#' comment saying so; read it with
+``pandas.read_csv(path, comment="#")``.  Columns lead with the bucket (the only
+level that was checked); the model's class name is ``model_label_unaudited``.
+Sensor columns carry their units from workspace.json (e.g. "pCH4 (uatm)" --
+CO2/CH4 are partial pressures).  ``depth`` is vehicle depth, m, NEGATIVE down;
+``water_depth`` is positive down.  Column notes + provenance are written to
+occurrences.meta.json.
+
+What was seen, when,
 where the vehicle was, what every gas/CTD channel read at that instant, and
 whether the detectors called a gas anomaly there (window id, tier, class,
 channels, station/transit context).
@@ -22,6 +33,7 @@ Qt-free.  build(workspace_dir) -> path to survey/fauna/occurrences.csv.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -61,6 +73,22 @@ def _window_at(win: pd.DataFrame, t: np.ndarray) -> pd.DataFrame:
     return pd.DataFrame(cols)
 
 
+HEADER_NOTE = ("# FRAME DETECTIONS, NOT INDIVIDUALS: overlapping frames re-detect "
+               "the same animal. model_label_unaudited is zero-shot FathomNet/MBARI "
+               "output (trust bucket only). depth = vehicle depth m NEGATIVE down; "
+               "water_depth positive down. Units in column names. See "
+               "occurrences.meta.json. Read with pandas.read_csv(path, comment='#').")
+
+
+def _sensor_columns(ws: Path) -> dict:
+    """{interp_full column: unit-bearing output name} for every sensor channel
+    workspace.json declares (falls back to the historical five)."""
+    from reporting_common import channel_label, sensor_units
+    units = sensor_units(ws)
+    names = list(units) or list(SENSORS)
+    return {n: channel_label(n, units.get(n, "")) for n in names}
+
+
 def build(workspace_dir, det_csv=None, out_csv=None, log=print) -> str:
     ws = Path(workspace_dir)
     det_csv = Path(det_csv or ws / "survey" / "fauna" / "fathomnet_detections.csv")
@@ -72,10 +100,14 @@ def build(workspace_dir, det_csv=None, out_csv=None, log=print) -> str:
     det = det.join(nav, on="fn", how="inner").reset_index(drop=True)
     det = det.sort_values("unix_time", kind="stable").reset_index(drop=True)
 
+    sensors = _sensor_columns(ws)
+    # heading comes from the frame manifest (load_frame_nav); pulling it from
+    # interp_full as well produced heading_x/heading_y merge artefacts.
+    wanted = ("unix_time", "lat", "lon", "water_depth") + tuple(sensors)
     ip = pd.read_csv(ws / "inputs" / "interp_full.csv",
-                     usecols=lambda c: c in ("unix_time", "lat", "lon",
-                                             "heading", "water_depth") + SENSORS
-                     ).sort_values("unix_time")
+                     usecols=lambda c: c in wanted).sort_values("unix_time")
+    ip = ip.drop(columns=[c for c in ip.columns
+                          if c != "unix_time" and c in det.columns])
     det = pd.merge_asof(det, ip, on="unix_time", direction="nearest",
                         tolerance=TOL_S)
 
@@ -88,17 +120,60 @@ def build(workspace_dir, det_csv=None, out_csv=None, log=print) -> str:
                  .dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
     for c in ("conf", "easting", "northing"):
         det[c] = det[c].round(4)
-    for c in SENSORS:
+    for c in sensors:
         if c in det:
             det[c] = det[c].round(5)
+    det = det.rename(columns={**sensors, "cls": "model_label_unaudited"})
+    # bucket first, the unaudited model label after it (review 02 P0-3)
+    lead = [c for c in ("dive", "fn", "timestamp_iso", "bucket",
+                        "model_label_unaudited", "conf") if c in det.columns]
+    det = det[lead + [c for c in det.columns if c not in lead]]
 
     out_csv = Path(out_csv or ws / "survey" / "fauna" / "occurrences.csv")
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    det.to_csv(out_csv, index=False)
+    with open(out_csv, "w", encoding="utf-8", newline="") as fh:
+        fh.write(HEADER_NOTE + "\n")
+        det.to_csv(fh, index=False)
+    _write_meta(ws, out_csv, det, sensors, det_csv)
     n_win = int(det.in_anomaly_window.sum())
-    log(f"[occurrences] {ws.name}: {len(det)} occurrences "
-        f"({n_win} inside anomaly windows, {det.fn.nunique()} frames) -> {out_csv}")
+    log(f"[occurrences] {ws.name}: {len(det)} frame detections (not individuals; "
+        f"{n_win} inside anomaly windows, {det.fn.nunique()} frames) -> {out_csv}")
     return str(out_csv)
+
+
+def _write_meta(ws: Path, out_csv: Path, det: pd.DataFrame, sensors: dict,
+                det_csv: Path) -> None:
+    from reporting_common import provenance, write_json
+    model = None
+    try:
+        model = json.loads((out_csv.parent / "fauna_provenance.json").read_text()
+                           ).get("model")
+    except (OSError, ValueError):
+        pass
+    write_json(out_csv.with_name("occurrences.meta.json"), {
+        "product": "fauna_frame_detections (occurrences.csv)",
+        "rows": int(len(det)),
+        "row_unit": "one kept frame DETECTION; not an individual organism "
+                    "(overlapping frames re-detect the same animal)",
+        "header_comment_line": HEADER_NOTE,
+        "columns": {
+            "bucket": "coarse morphology bucket (the only level checked)",
+            "model_label_unaudited": "zero-shot FathomNet/MBARI class name; "
+                                     "NOT an identification",
+            "conf": "detector confidence 0-1",
+            "timestamp_iso": "frame time, UTC",
+            "depth": "vehicle depth from the frame manifest, m, NEGATIVE down",
+            "water_depth": "vehicle depth from interp_full, m, POSITIVE down",
+            "alt": "altitude above seafloor, m",
+            "easting/northing": "frame-centre fix, EPSG:32613 (UTM 13N), m, "
+                                "~+/-3 m frame-level localisation",
+            **{v: f"sensor channel '{k}' at the frame time (nearest 1 Hz "
+                  f"sample within {TOL_S:g} s)" for k, v in sensors.items()},
+        },
+        "provenance": provenance(
+            [det_csv, ws / "inputs" / "interp_full.csv",
+             ws / "survey" / "anomaly" / "window_context.csv"], model=model),
+    })
 
 
 def main(argv=None):

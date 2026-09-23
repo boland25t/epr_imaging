@@ -13,6 +13,7 @@ import re
 import math
 import re
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
@@ -1617,6 +1618,27 @@ def build_report(
     high = int(counts.get("HIGH", 0))
     moderate = int(counts.get("MODERATE", 0))
     screen = int(counts.get("SCREEN", 0))
+    # The "longitude=0" caveat is printed only when the table really has such
+    # rows (review 02 P1-6: it shipped in every report although current
+    # interp_full files have none).
+    try:
+        if "lon" in getattr(interp, "columns", ()):
+            _lon = pd.to_numeric(interp["lon"], errors="coerce")
+        else:
+            _lon = pd.read_csv(INTERP, usecols=lambda c: c == "lon")["lon"]
+        _n_lon0 = int((_lon == 0).sum())
+    except Exception:                                   # noqa: BLE001
+        _n_lon0 = 0
+    nav_note = ([f"Navigation correction. interp_full.csv contains {_n_lon0} rows with "
+                 "longitude=0. Site coordinates in this product come from the raw "
+                 "renavigation longitude column, joined by timestamp."]
+                if _n_lon0 else [])
+    try:
+        from reporting_common import code_version
+        _code = code_version()
+    except Exception:                                   # noqa: BLE001
+        _code = "unknown"
+    _generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     with PdfPages(report) as pdf:
         text_page(
             pdf,
@@ -1657,10 +1679,7 @@ def build_report(
                 "The T–S curve path is gap-bridged only over five seconds and must persist for "
                 "at least ten seconds. A curve departure means unusual water-mass properties, "
                 "not necessarily a salinity sensor spike or hydrothermal source.",
-                "Navigation correction. interp_full.csv contains longitude=0 and invalid UTM "
-                "coordinates. Site coordinates in this product come from the correct raw "
-                "renavigation longitude column, joined by timestamp. Do not use the current "
-                "interp_full longitude/easting/northing for site mapping.",
+                *nav_note,
                 f"Actionable clips. Long parent windows are divided into at most "
                 f"{MAX_VIDEO_CLIP_SECONDS // 60}-minute anomaly clips, each with one minute "
                 "of visual context on both sides. video_review_clips.csv is the operational "
@@ -1669,6 +1688,7 @@ def build_report(
                 "The review queue therefore reports absolute UTC intervals. If the video clock is "
                 "UTC-synchronized, inspect those intervals directly; otherwise a video-to-UTC "
                 "offset must be supplied before frame/timecode fields can be generated.",
+                f"Generated {_generated} (UTC) by code version {_code}.",
             ],
         )
 

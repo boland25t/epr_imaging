@@ -61,7 +61,8 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -102,6 +103,15 @@ COLLAPSE_DIRS = ("project.files", "ortho_cache", "chunk_*", "segment_*",
                  "orthos", "frames", "catalog")
 # Directories never walked at all.
 SKIP_DIRS = ("catalog",)
+# Parallel stat() for the inventory walk: on /mnt/f each stat is a ~1 ms round
+# trip, and 16 in flight cut the J1754 walk from ~38 s (review 05 P1-3).
+INVENTORY_STAT_THREADS = 16
+
+UTM_LABEL = "UTM 13N (EPSG:32613)"
+ASSET_VERSION = "v2"          # bump when a rendering changes (see _Ctx.asset)
+LABEL_CAVEAT = ("Taxon labels are zero-shot FathomNet/MBARI model output, not "
+                "verified; only coarse buckets (crustacean / worm / fish / anemone "
+                "/ unknown) were checked. A model label is never an identification.")
 
 
 # --------------------------------------------------------------------------
@@ -245,6 +255,21 @@ class _Ctx:
         self.assets.mkdir(parents=True, exist_ok=True)
         self.dive = dive_id(self.ws)
         self._frame_roots: Optional[list[Path]] = None
+        # product family -> "job" | "whole-survey fallback" (review 02: say
+        # when a job catalog mixes its own products with the dive-wide ones)
+        self.sources: dict[str, str] = {}
+        try:
+            from reporting_common import sensor_units
+            self.units = sensor_units(self.ws)
+        except Exception:                                           # noqa: BLE001
+            self.units = {}
+
+    def _note_source(self, rel: str, base: Path) -> None:
+        if self.is_whole:
+            return
+        fam = str(rel).split("/")[0]
+        self.sources.setdefault(fam, "job" if base == self.scope
+                                else "whole-survey fallback")
 
     # -- product lookup ---------------------------------------------------
     def dir(self, *names: str) -> Optional[Path]:
@@ -254,6 +279,7 @@ class _Ctx:
             for name in names:
                 cand = base / name
                 if cand.is_dir():
+                    self._note_source(name, base)
                     return cand
         return None
 
@@ -263,12 +289,24 @@ class _Ctx:
             for rel in rels:
                 cand = base / rel
                 if cand.is_file():
+                    self._note_source(rel, base)
                     return cand
         return None
 
+    def label(self, channel: str, ascii_only: bool = False) -> str:
+        """Unit-bearing label for a sensor channel ("pCH4 (µatm)")."""
+        try:
+            from reporting_common import channel_label
+            return channel_label(channel, self.units.get(channel, ""),
+                                 ascii_only=ascii_only)
+        except Exception:                                           # noqa: BLE001
+            return channel
+
     # -- asset cache ------------------------------------------------------
     def asset(self, name: str) -> Path:
-        return self.assets / name
+        # versioned: renderings made by an older catalog_builder (no units, no
+        # CRS labels, no native resolution) must not be reused from the cache
+        return self.assets / f"{ASSET_VERSION}_{name}"
 
     def fresh(self, dst: Path, *sources) -> bool:
         """True when ``dst`` already exists and is newer than every source."""
@@ -406,6 +444,7 @@ def ortho_thumb(src: Path, dst: Path, max_px: int = ORTHO_THUMB_PX,
                                 resampling=Resampling.nearest)
             b = ds.bounds
             px_m = float(ds.res[0]) * sc
+            native_mm = float(ds.res[0]) * 1000.0
             crs = ds.crs.to_string() if ds.crs else ""
     except Exception:                                               # noqa: BLE001
         return None
@@ -436,7 +475,7 @@ def ortho_thumb(src: Path, dst: Path, max_px: int = ORTHO_THUMB_PX,
         del rgb, valid
     return {"cover": cover, "w_m": float(b.right - b.left),
             "h_m": float(b.top - b.bottom), "px_mm": px_m * 1000.0,
-            "crs": crs}
+            "native_mm": native_mm, "crs": crs}
 
 
 def _hillshade(z, ve: float = 2.0, az: float = 315.0, alt: float = 45.0):
@@ -466,6 +505,7 @@ def dem_thumb(src: Path, dst: Path, max_px: int = DEM_THUMB_PX) -> Optional[dict
                         resampling=Resampling.average).astype("float32")
             nod = ds.nodata
             px_m = float(ds.res[0]) * sc
+            native_mm = float(ds.res[0]) * 1000.0
     except Exception:                                               # noqa: BLE001
         return None
     bad = ~np.isfinite(z)
@@ -488,7 +528,38 @@ def dem_thumb(src: Path, dst: Path, max_px: int = DEM_THUMB_PX) -> Optional[dict
         return None
     finally:
         del z, hs, img, bad, good
-    return {"relief_m": relief, "px_mm": px_m * 1000.0}
+    return {"relief_m": relief, "px_mm": px_m * 1000.0, "native_mm": native_mm}
+
+
+def _crs_text(crs) -> str:
+    """"UTM 13N (EPSG:32613)" for axis labels; the raw string otherwise."""
+    try:
+        epsg = crs.to_epsg() if crs is not None else None
+    except Exception:                                               # noqa: BLE001
+        epsg = None
+    if epsg == 32613:
+        return UTM_LABEL
+    if epsg:
+        return f"EPSG:{epsg}"
+    return str(crs) if crs else "CRS unknown"
+
+
+def _track_crs(gj: Optional[dict], sample) -> str:
+    """CRS label for a GeoJSON track: its crs member, else by magnitude."""
+    try:
+        name = str(((gj or {}).get("crs") or {}).get("properties", {}).get("name", ""))
+        if "32613" in name:
+            return UTM_LABEL
+        if name:
+            return name
+    except Exception:                                               # noqa: BLE001
+        pass
+    try:
+        if abs(float(sample[0])) > 1000:
+            return f"{UTM_LABEL} (assumed from coordinate range)"
+    except Exception:                                               # noqa: BLE001
+        pass
+    return "WGS84 lon/lat (EPSG:4326)"
 
 
 def raster_figure(src: Path, dst: Path, title: str, units: str = "",
@@ -509,6 +580,8 @@ def raster_figure(src: Path, dst: Path, title: str, units: str = "",
                         resampling=Resampling.average).astype("float32")
             nod = ds.nodata
             b = ds.bounds
+            crs_txt = _crs_text(ds.crs)
+            band_unit = (ds.units or ("",))[0] or ""
     except Exception:                                               # noqa: BLE001
         return None
     if nod is not None:
@@ -529,6 +602,8 @@ def raster_figure(src: Path, dst: Path, title: str, units: str = "",
                    interpolation="nearest")
     ax.set_aspect("equal")
     ax.set_title(title, fontsize=10, color="#22303c")
+    ax.set_xlabel(f"Easting (m) · {crs_txt}", fontsize=7.5, color="#66757f")
+    ax.set_ylabel(f"Northing (m) · {crs_txt}", fontsize=7.5, color="#66757f")
     ax.tick_params(labelsize=7, colors="#66757f")
     ax.ticklabel_format(style="plain", useOffset=False)
     _thin_ticks(ax, fw, fh)
@@ -536,8 +611,9 @@ def raster_figure(src: Path, dst: Path, title: str, units: str = "",
         lbl.set_rotation(30)
         lbl.set_ha("right")
     cb = fig.colorbar(im, ax=ax, fraction=0.05, pad=0.03)
-    cb.set_label(units or title.split("·")[-1].strip(), fontsize=8,
-                 color="#55636e")
+    cb.set_label(units or (f"{title.split('·')[-1].strip()} ({band_unit})"
+                           if band_unit else title.split("·")[-1].strip()),
+                 fontsize=8, color="#55636e")
     cb.ax.tick_params(labelsize=7, colors="#66757f")
     fig.tight_layout()
     fig.savefig(dst, dpi=140, facecolor="white", bbox_inches="tight")
@@ -582,7 +658,8 @@ def collect_facts(ctx: _Ctx) -> dict:
     import pandas as pd  # noqa: F401  (ensures a clear error if pandas is absent)
 
     facts: dict = {"dive": ctx.dive, "ws": str(ctx.ws),
-                   "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                   "generated": datetime.now(timezone.utc).strftime(
+                       "%Y-%m-%d %H:%M UTC"),
                    "scope": ("whole trackline" if ctx.is_whole
                              else f"job {ctx.job_id}")}
 
@@ -600,6 +677,27 @@ def collect_facts(ctx: _Ctx) -> dict:
 
     facts["orthos"] = len(find_orthos(ctx))
     facts["dems"] = len(find_dems(ctx))
+    try:
+        from reporting_common import chunk_status, code_version
+        pg = ctx.dir("photogrammetry")
+        qc = ([chunk_status(c) for c in sorted(
+            {p for pat in ("*/chunk_*", "*/chunks/chunk_*") for p in pg.glob(pat)
+             if p.is_dir()}, key=str)] if pg else [])
+        facts["chunks_attempted"] = len(qc)
+        facts["chunks_ok"] = sum(q["status"] == "ok" for q in qc)
+        facts["code_version"] = code_version()
+    except Exception:                                               # noqa: BLE001
+        facts["chunks_attempted"] = facts["chunks_ok"] = 0
+        facts["code_version"] = "unknown"
+
+    # Seeded (copied, not recomputed) anomaly products — review 02 P2-4.
+    ameta = _read_json(ctx.file("anomaly/simple_meta.json")) or {}
+    if ameta.get("seeded_from"):
+        src = ctx.file("anomaly/anomaly_windows_all.csv")
+        facts["anomaly_seeded"] = {
+            "from": str(ameta["seeded_from"]),
+            "date": (datetime.fromtimestamp(src.stat().st_mtime, timezone.utc)
+                     .strftime("%Y-%m-%d") if src else "unknown")}
 
     win = _read_csv(ctx.file("anomaly/anomaly_windows_all.csv"))
     facts["_windows"] = win
@@ -649,19 +747,47 @@ def section_cover(ctx: _Ctx, facts: dict) -> list[dict]:
         ("Frames in the fauna census", _fmt_int(facts["frames_census"]),
          "rows of survey/fauna/fauna_density.csv"),
         ("Segments", _fmt_int(facts["segments"]), facts["segments_src"]),
+        ("Photogrammetry chunks reconstructed",
+         f"{_fmt_int(facts.get('chunks_ok'))} of "
+         f"{_fmt_int(facts.get('chunks_attempted'))}",
+         (f"{facts.get('chunks_attempted', 0) - facts.get('chunks_ok', 0)} "
+          f"failed — see the Reconstruction QC table"
+          if facts.get("chunks_attempted", 0) - facts.get("chunks_ok", 0)
+          else "all attempted chunks produced an ortho/DEM")),
         ("Chunk orthomosaics", _fmt_int(facts["orthos"]),
          "survey/photogrammetry/*/chunk_*/orthomosaic.tif"),
         ("Chunk DEMs", _fmt_int(facts["dems"]), "…/dem.tif"),
-        ("Anomaly windows", _fmt_int(facts["windows"]), tier_txt),
+        ("Anomaly windows", _fmt_int(facts["windows"]),
+         tier_txt + (f" — SEEDED from {facts['anomaly_seeded']['from']} "
+                     f"({facts['anomaly_seeded']['date']})"
+                     if facts.get("anomaly_seeded") else "")),
         ("Anomalous sites", _fmt_int(facts["sites"]),
          "survey/anomaly/anomalous_sites.csv"),
-        ("Fauna detections (kept)", _fmt_int(facts["det_kept"]), bucket_txt),
-        ("Fauna detections (excluded)", _fmt_int(facts["det_excluded"]),
-         "midwater / oversize / non-fauna filters"),
+        ("Fauna frame detections (kept)", _fmt_int(facts["det_kept"]),
+         bucket_txt + " — frame detections, NOT individuals (overlapping "
+                      "frames re-detect the same animal)"),
+        ("Fauna frame detections (excluded)", _fmt_int(facts["det_excluded"]),
+         "midwater / non-fauna / below per-bucket threshold"),
     ]
-    return [{"k": "cover", "facts": facts},
-            table(("Quantity", "Count", "Source"), rows,
-                  title="Headline counts", align_right=(1,))]
+    mix = []
+    if ctx.sources:
+        own = sorted(k for k, v in ctx.sources.items() if v == "job")
+        fb = sorted(k for k, v in ctx.sources.items() if v != "job")
+        if fb:
+            mix.append(f"Scope mix: this job catalog shows the job's own "
+                       f"{', '.join(own) or 'nothing'} and falls back to the "
+                       f"WHOLE-SURVEY {', '.join(fb)}.")
+    if facts.get("anomaly_seeded"):
+        mix.append(f"Anomaly products are SEEDED (copied from "
+                   f"{facts['anomaly_seeded']['from']}, dated "
+                   f"{facts['anomaly_seeded']['date']}), not recomputed here.")
+    out = [{"k": "cover", "facts": facts},
+           table(("Quantity", "Count", "Source"), rows,
+                 title="Headline counts", align_right=(1,),
+                 foot=f"Catalog code version {facts.get('code_version')}. "
+                      f"Times are UTC.")]
+    out += [note(m) for m in mix]
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -755,8 +881,12 @@ def render_nav_trackline(ctx: _Ctx, geojson: Path, dst: Path) -> bool:
     ax.margins(0.06)
     ax.set_title(f"{ctx.dive} — ROV trackline\n(colour = dive progress)",
                  fontsize=10.5, color="#22303c")
-    ax.set_xlabel("easting / longitude", fontsize=8, color="#66757f")
-    ax.set_ylabel("northing / latitude", fontsize=8, color="#66757f")
+    crs_txt = _track_crs(_read_json(geojson), allpts[0])
+    utm = crs_txt.startswith("UTM")
+    ax.set_xlabel(("Easting (m)" if utm else "Longitude (°)") + f" · {crs_txt}",
+                  fontsize=8, color="#66757f")
+    ax.set_ylabel(("Northing (m)" if utm else "Latitude (°)") + f" · {crs_txt}",
+                  fontsize=8, color="#66757f")
     ax.tick_params(labelsize=7, colors="#66757f")
     ax.ticklabel_format(style="plain", useOffset=False)
     _thin_ticks(ax, fw, fh)
@@ -834,6 +964,9 @@ def render_anomaly_trackline(ctx: _Ctx, track: Optional[Path], segs: Path,
     ax.margins(0.06)
     ax.set_title(f"{ctx.dive} — anomaly trackline\nby confidence tier",
                  fontsize=10.5, color="#22303c")
+    crs_txt = _track_crs(gj, extent[0])
+    ax.set_xlabel(f"Easting (m) · {crs_txt}", fontsize=8, color="#66757f")
+    ax.set_ylabel(f"Northing (m) · {crs_txt}", fontsize=8, color="#66757f")
     ax.tick_params(labelsize=7, colors="#66757f")
     ax.ticklabel_format(style="plain", useOffset=False)
     _thin_ticks(ax, fw, fh)
@@ -906,26 +1039,28 @@ def render_spectrum_trackline(ctx: _Ctx, interp: Path, dst: Path
         if pos.sum() > 32:
             lo_p, hi_p = np.nanpercentile(np.where(pos, v, np.nan), [2, 98])
             span = (hi_p / lo_p) if lo_p > 0 else 0.0
+        nice = ctx.label(chan)
         if span > 20.0:
             c = np.log10(np.where(pos, v, np.nan))
-            lab = f"log₁₀ {chan}"
+            lab = f"log₁₀ {nice}"
         else:
             c = np.where(finite, v, np.nan)
-            lab = chan
+            lab = nice
         ax.plot(x, y, color="#dde3e9", lw=0.6, zorder=1)
         lo, hi = np.nanpercentile(c, [2, 98])
         sc = ax.scatter(x, y, c=c, cmap="turbo", s=2.2, vmin=lo,
                         vmax=hi if hi > lo else lo + 1e-6, zorder=2)
         ax.set_aspect("equal")
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_title(chan, fontsize=9.5, color="#22303c")
+        ax.set_title(nice, fontsize=9.5, color="#22303c")
         cb = fig.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
         cb.set_label(lab, fontsize=7, color="#55636e")
         cb.ax.tick_params(labelsize=6, colors="#66757f")
     for j in range(len(chans), nrow * ncol):
         axes[j // ncol][j % ncol].axis("off")
-    fig.suptitle(f"{ctx.dive} — sensor spectrum tracklines", fontsize=12,
-                 color="#22303c")
+    fig.suptitle(f"{ctx.dive} — sensor spectrum tracklines (plan view, "
+                 f"{UTM_LABEL if xcol == 'easting' else 'lon/lat'}; units from "
+                 f"workspace.json)", fontsize=12, color="#22303c")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(dst, dpi=135, facecolor="white", bbox_inches="tight")
     plt.close(fig)
@@ -1074,13 +1209,24 @@ def section_rasters(ctx: _Ctx) -> tuple[list[dict], str]:
                            "(survey/sensor_2d, survey/nav_depth)."))
         return blocks, "not present"
     blocks.append(para(f"{len(rasters)} gridded raster product(s); the newest "
-                       f"run of each is shown."))
+                       f"run of each is shown. Sensor grids are interpolated "
+                       f"from along-track measurements (IDW); they are not a "
+                       f"synoptic field. Units come from workspace.json; CO2 and "
+                       f"CH4 in µatm are partial pressures. Axes in {UTM_LABEL}."))
     made = 0
     for label, tif in rasters:
         dst = ctx.asset(f"raster_{_slug(label)}.png")
-        ok = ctx.fresh(dst, tif) or bool(raster_figure(tif, dst, label))
+        fam, _, chan = label.partition(" · ")
+        if fam == "sensor_2d" and chan:
+            nice = ctx.label(chan)
+            title, units = f"{fam} · {nice}", nice
+        elif fam in ("nav_depth", "nav_2d") and not chan:
+            title, units = label, "nav depth (m, positive down)"
+        else:
+            title, units = label, ""
+        ok = ctx.fresh(dst, tif) or bool(raster_figure(tif, dst, title, units))
         if ok:
-            blocks.append(image(dst, f"{label} — {tif.name}"))
+            blocks.append(image(dst, f"{title} — {tif.name}"))
             made += 1
         else:
             blocks.append(note(f"{label}: {tif.name} could not be rendered."))
@@ -1093,6 +1239,12 @@ def section_rasters(ctx: _Ctx) -> tuple[list[dict], str]:
 
 def section_anomaly(ctx: _Ctx, facts: dict) -> tuple[list[dict], str]:
     blocks: list[dict] = [h2("4 · Anomaly detection", "anomaly")]
+    seeded = facts.get("anomaly_seeded")
+    if seeded:
+        blocks.append(note(
+            f"SEEDED PRODUCT: the anomaly results below were copied from "
+            f"{seeded['from']} (files dated {seeded['date']}), not recomputed in "
+            f"this workspace."))
     win = facts.get("_windows")
     if win is None:
         blocks.append(note("Anomaly windows — not present "
@@ -1233,6 +1385,54 @@ def _chunk_label(p: Path) -> str:
     return "/".join(parts[-2:]) if len(parts) >= 2 else p.parent.name
 
 
+def _chunk_qc_blocks(ctx: _Ctx) -> list[dict]:
+    """Per-chunk reconstruction QC (review 02 P1-5): every attempted chunk,
+    aligned/total cameras and ok|failed with the reason, so a failed chunk is
+    REPORTED instead of silently missing from the thumbnail grid."""
+    from reporting_common import chunk_status, run_status
+    pg = ctx.dir("photogrammetry")
+    if not pg:
+        return []
+    chunk_dirs = sorted({p for pat in ("*/chunk_*", "*/chunks/chunk_*")
+                         for p in pg.glob(pat) if p.is_dir()}, key=str)
+    if not chunk_dirs:
+        return []
+    rows, n_ok = [], 0
+    for c in chunk_dirs:
+        q = chunk_status(c)
+        n_ok += q["status"] == "ok"
+        al, tot = q.get("cameras_aligned"), q.get("cameras_total")
+        rows.append([_chunk_label(c / "x"),
+                     f"{al}/{tot}" if tot is not None else "—",
+                     q["status"].upper(),
+                     q.get("reason", "") or ", ".join(
+                         x for x in q["products"] if x != "report.pdf")])
+    runs = sorted({c.parent.name for c in chunk_dirs})
+    stat_txt = []
+    for r in runs:
+        st = run_status(pg / r)
+        if st.get("status"):
+            stat_txt.append(f"{r}: run status {st['status']}")
+    out = [h3("Reconstruction QC"),
+           table(("Chunk", "Cameras aligned", "Status", "Products / reason"),
+                 rows, title=f"{len(chunk_dirs)} chunk(s) attempted, {n_ok} "
+                             f"reconstructed, {len(chunk_dirs) - n_ok} failed",
+                 foot=("Aligned/total from each chunk's cameras.json; a chunk is "
+                       "reconstructed when it wrote an orthomosaic or DEM. Empty "
+                       "(0-byte) files are never counted."
+                       + (" " + "; ".join(stat_txt) if stat_txt else "")),
+                 align_right=(1,))]
+    if len(runs) > 1:
+        out.append(note(f"Photogrammetry products on this page come from "
+                        f"{len(runs)} different runs/segments ({', '.join(runs)}); "
+                        f"they are shown together, not as one reconstruction."))
+    if len(chunk_dirs) - n_ok:
+        out.append(note(f"{len(chunk_dirs) - n_ok} of {len(chunk_dirs)} chunk(s) "
+                        f"FAILED and produced no orthomosaic/DEM — see the QC "
+                        f"table."))
+    return out
+
+
 def section_photogrammetry(ctx: _Ctx) -> tuple[list[dict], str]:
     blocks: list[dict] = [h2("5 · Photogrammetry", "photogrammetry")]
     orthos = find_orthos(ctx)
@@ -1241,8 +1441,10 @@ def section_photogrammetry(ctx: _Ctx) -> tuple[list[dict], str]:
     if not orthos and not dems:
         blocks.append(note("Photogrammetry — not present "
                            "(no survey/photogrammetry/*/chunk_*/orthomosaic.tif)."))
+        blocks.extend(_chunk_qc_blocks(ctx))
         return blocks, "not present"
 
+    blocks.extend(_chunk_qc_blocks(ctx))
     merged = None
     if pg:
         for cand in ("merged/preview_ortho_merged.png", "merged/ortho_merged.tif"):
@@ -1280,7 +1482,7 @@ def section_photogrammetry(ctx: _Ctx) -> tuple[list[dict], str]:
         dst = ctx.asset(f"ortho_{_slug(label)}.jpg")
         meta_p = dst.with_suffix(".json")
         meta = _read_json(meta_p) if ctx.fresh(dst, p) else None
-        if meta is None:
+        if meta is None or "native_mm" not in meta:
             meta = ortho_thumb(p, dst)
             if meta is not None:
                 try:
@@ -1290,10 +1492,13 @@ def section_photogrammetry(ctx: _Ctx) -> tuple[list[dict], str]:
         if meta is None:
             failed += 1
             continue
+        native = meta.get("native_mm")
+        res_txt = (f"native {native:.1f} mm/px (thumbnail {meta['px_mm']:.0f})"
+                   if native else f"thumbnail {meta['px_mm']:.0f} mm/px")
         items.append({"src": str(dst),
                       "cap": (f"{label} · {meta['w_m']:.0f}×{meta['h_m']:.0f} m · "
-                              f"{meta['px_mm']:.0f} mm/px · "
-                              f"{meta['cover'] * 100:.0f} % imaged")})
+                              f"{res_txt} · "
+                              f"{meta['cover'] * 100:.0f} % of extent imaged")})
         if i % 20 == 0:
             ctx.log(f"    orthos {i}/{len(orthos)} ({time.time() - t0:.0f}s)")
     if items:
@@ -1324,14 +1529,16 @@ def section_photogrammetry(ctx: _Ctx) -> tuple[list[dict], str]:
         blocks.append(para(
             f"{_fmt_int(len(dems))} DEM(s) on disk; {len(pick)} shown "
             f"(hillshade, 315° azimuth, 45° altitude, 2× vertical "
-            f"exaggeration, nodata dark)."))
+            f"exaggeration, nodata dark). DEM values are as exported by "
+            f"Metashape; the vertical sign convention and absolute offset are "
+            f"not verified here, so read relative relief only."))
         ditems = []
         for p in pick:
             label = _chunk_label(p)
             dst = ctx.asset(f"dem_{_slug(label)}.jpg")
             meta_p = dst.with_suffix(".json")
             meta = _read_json(meta_p) if ctx.fresh(dst, p) else None
-            if meta is None:
+            if meta is None or "native_mm" not in meta:
                 meta = dem_thumb(p, dst)
                 if meta is not None:
                     try:
@@ -1340,8 +1547,11 @@ def section_photogrammetry(ctx: _Ctx) -> tuple[list[dict], str]:
                         pass
             if meta is None:
                 continue
+            native = meta.get("native_mm")
             ditems.append({"src": str(dst),
-                           "cap": f"{label} · relief {meta['relief_m']:.1f} m"})
+                           "cap": (f"{label} · relief {meta['relief_m']:.1f} m"
+                                   + (f" · native {native:.1f} mm/px" if native
+                                      else ""))})
         if ditems:
             blocks.append(grid(ditems, cols=4, title=""))
         else:
@@ -1393,18 +1603,26 @@ def _bucket_table(ctx: _Ctx, facts: dict) -> list[dict]:
                              "(excluded rows dropped); the census sum is the "
                              "n_<bucket> columns of fauna_density.csv; the "
                              "orthomosaic column is by_bucket_kept from "
-                             "ortho_fauna_summary.json.",
+                             "ortho_fauna_summary.json. Frame detections are NOT "
+                             "individuals: overlapping frames re-detect the same "
+                             "animal. The orthomosaic (deduplicated) count is the "
+                             "better abundance proxy where it exists.",
                         align_right=(1, 2, 3)))
 
     if ortho_sum:
         by_class = (ortho_sum.get("by_class_kept") or {})
         if by_class:
+            try:
+                from fathomnet_detect import bucket_of
+            except Exception:                                       # noqa: BLE001
+                bucket_of = lambda _c: "—"                          # noqa: E731
             top = sorted(by_class.items(), key=lambda kv: -kv[1])[:15]
-            blocks.append(table(("Class", "Detections"),
-                                [[k, _fmt_int(v)] for k, v in top],
-                                title="Top classes on the orthomosaics "
-                                      "(ortho_fauna_summary.json)",
-                                align_right=(1,)))
+            blocks.append(table(("Bucket", "Model label (unaudited)", "Detections"),
+                                [[bucket_of(k), k, _fmt_int(v)] for k, v in top],
+                                title="Top model labels on the orthomosaics "
+                                      "(ortho_fauna_summary.json) — model labels, "
+                                      "unaudited; bucket level only is trusted",
+                                align_right=(2,)))
     return blocks
 
 
@@ -1499,7 +1717,9 @@ def section_fauna(ctx: _Ctx, facts: dict) -> tuple[list[dict], str]:
                            "(no survey/fauna/)."))
         return blocks, "not present"
 
+    blocks.append(note(LABEL_CAVEAT))
     blocks.extend(_bucket_table(ctx, facts))
+    dmeta = _read_json(ctx.file("fauna/fauna_density.meta.json"))
 
     # -- density time series ---------------------------------------------
     ts = None
@@ -1512,13 +1732,28 @@ def section_fauna(ctx: _Ctx, facts: dict) -> tuple[list[dict], str]:
     if ts is not None:
         staged = ctx.stage(ts)
         if staged:
-            blocks.append(image(staged, f"Fauna density time series · {ts.name}"))
+            if dmeta:
+                band = dmeta.get("alt_band_m") or ["?", "?"]
+                fp = dmeta.get("footprint") or {}
+                cap = (f"Fauna detection density time series · {ts.name} · density "
+                       f"only for {band[0]}–{band[1]} m altitude "
+                       f"({_fmt_int(dmeta.get('n_alt_valid'))}/"
+                       f"{_fmt_int(dmeta.get('n_frames'))} frames), footprint "
+                       f"K_W={fp.get('K_W')} (nominal; ortho-measured "
+                       f"{fp.get('K_W_measured_alternative')})")
+            else:
+                cap = (f"Fauna density time series · {ts.name} · WARNING: no "
+                       f"fauna_density.meta.json, so this figure predates the "
+                       f"altitude-banded density (may include out-of-band frames)")
+            blocks.append(image(staged, cap))
     else:
         blocks.append(note("Fauna density time-series figure — not present "
                            "(survey/fauna/fauna_density_timeseries*.png)."))
 
     for name, cap in (("fauna_vs_anomaly.png",
-                       "Fauna density against anomaly windows"),
+                       "Frame detections per frame in vs out of anomaly windows "
+                       "(descriptive: overlapping frames are not independent, so "
+                       "printed p-values overstate significance)"),
                       ("ortho_fauna_qa.png",
                        "Orthomosaic fauna detection QA sheet"),
                       ("multiview_qa.png", "Multi-view association QA sheet")):
@@ -1537,7 +1772,8 @@ def section_fauna(ctx: _Ctx, facts: dict) -> tuple[list[dict], str]:
         sort_col = "max_conf" if "max_conf" in shortlist.columns else None
         top = (shortlist.sort_values(sort_col, ascending=False)
                if sort_col else shortlist).head(SHORTLIST_ROWS)
-        cols = [c for c in ("fn", "n_fish", "max_conf", "classes", "seg",
+        cols = [c for c in ("fn", "n_fish_detections", "n_fish", "max_conf",
+                            "model_labels_unaudited", "classes", "seg",
                             "depth", "alt") if c in top.columns] or list(top.columns)[:6]
         rows = []
         for _, r in top.iterrows():
@@ -1549,9 +1785,18 @@ def section_fauna(ctx: _Ctx, facts: dict) -> tuple[list[dict], str]:
                 else:
                     row.append(str(v))
             rows.append(row)
-        blocks.append(table([c.replace("_", " ") for c in cols], rows,
+        heads = {"n_fish": "fish-bucket frame detections",
+                 "n_fish_detections": "fish-bucket frame detections",
+                 "classes": "model labels (unaudited)",
+                 "model_labels_unaudited": "model labels (unaudited)",
+                 "depth": "depth (m, negative down)", "alt": "alt (m)"}
+        blocks.append(table([heads.get(c, c.replace("_", " ")) for c in cols], rows,
                             title=f"Fish frame shortlist — top {len(rows)} of "
-                                  f"{_fmt_int(len(shortlist))} rows"))
+                                  f"{_fmt_int(len(shortlist))} frames with "
+                                  f"fish-bucket frame detections",
+                            foot="A triage list for human review: frames, not "
+                                 "fish. The fish bucket is recall-oriented and "
+                                 "its model labels are unaudited."))
     else:
         blocks.append(note("Fish shortlist — not present "
                            "(survey/fauna/fish_frame_shortlist.csv)."))
@@ -1575,8 +1820,9 @@ def section_fauna(ctx: _Ctx, facts: dict) -> tuple[list[dict], str]:
         f"A mechanical sample: the highest-confidence detection per frame, "
         f"spread evenly across buckets, capped at {MAX_CROPS}. Nothing here is "
         f"curated by verdict — these are the detector's own top calls, right or "
-        f"wrong. Boxes as drawn by the model; {int(CROP_CONTEXT * 100)} % "
-        f"context margin."))
+        f"wrong. Captions give the BUCKET first; the text after it is the model's "
+        f"label, which is unaudited and is not an identification. Boxes as drawn "
+        f"by the model; {int(CROP_CONTEXT * 100)} % context margin."))
     items, missing = [], 0
     for rec in picks:
         fn = str(rec["fn"])
@@ -1588,7 +1834,8 @@ def section_fauna(ctx: _Ctx, facts: dict) -> tuple[list[dict], str]:
         bucket = str(rec.get("bucket", "") or "—")
         conf = float(rec.get("conf", 0) or 0)
         items.append({"src": str(dst),
-                      "cap": f"{bucket} · {cls} · conf {conf:.2f}"})
+                      "cap": (f"{bucket} · {cls} (model label, unaudited) · "
+                              f"conf {conf:.2f}")})
     if items:
         blocks.append(grid(items, cols=5, title="",
                            foot=(f"{missing} selected crop(s) skipped — frame "
@@ -1603,6 +1850,37 @@ def section_fauna(ctx: _Ctx, facts: dict) -> tuple[list[dict], str]:
 # Section 7 — other analysis figures
 # --------------------------------------------------------------------------
 
+def _flatten_stats(obj, prefix: str = "") -> list[list[str]]:
+    """Nested stats JSON as (dotted key, formatted value) rows — values are
+    formatted, never cut mid-number (review 02 P2-5)."""
+    rows: list[list[str]] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            rows += _flatten_stats(v, f"{prefix}.{k}" if prefix else str(k))
+    elif isinstance(obj, (list, tuple)) and len(obj) <= 6 and all(
+            isinstance(x, (int, float)) for x in obj):
+        rows.append([prefix, ", ".join(_fmt_num(x) for x in obj)])
+    elif isinstance(obj, (list, tuple)):
+        rows.append([prefix, f"[{len(obj)} values]"])
+    else:
+        rows.append([prefix, _fmt_num(obj)])
+    return rows
+
+
+def _fmt_num(v) -> str:
+    if isinstance(v, bool) or v is None:
+        return str(v)
+    if isinstance(v, int):
+        return f"{v:,}"
+    if isinstance(v, float):
+        if v != v:
+            return "NaN"
+        if v != 0 and (abs(v) < 1e-3 or abs(v) >= 1e6):
+            return f"{v:.3g}"
+        return f"{v:.4g}"
+    return str(v)
+
+
 def section_analysis(ctx: _Ctx) -> tuple[list[dict], str]:
     blocks: list[dict] = [h2("7 · Other analysis figures", "analysis")]
     found = 0
@@ -1615,9 +1893,13 @@ def section_analysis(ctx: _Ctx) -> tuple[list[dict], str]:
                 found += 1
     stats = _read_json(ctx.file("analysis_figs/analysis_stats.json"))
     if stats:
-        rows = [[k, json.dumps(v)[:120]] for k, v in list(stats.items())[:20]]
-        blocks.append(table(("Statistic", "Value"), rows,
-                            title="analysis_stats.json"))
+        rows = _flatten_stats(stats)
+        shown = rows[:80]
+        blocks.append(table(("Statistic", "Value"), shown,
+                            title="analysis_stats.json",
+                            foot=(f"{len(rows) - len(shown)} further values omitted."
+                                  if len(rows) > len(shown) else ""),
+                            break_cols=(0,)))
         found += 1
     if not found:
         blocks.append(note("Analysis figures — not present "
@@ -1647,19 +1929,16 @@ def _walk_inventory(root: Path) -> tuple[list[tuple[str, int, float]], dict]:
     if not root.is_dir():
         return rows, rollup
 
-    def _dir_size(d: Path) -> tuple[int, int, float]:
-        n = total = 0
-        newest = 0.0
+    # Phase 1: list directories only (readdir is cheap); phase 2: stat every
+    # file through a thread pool — on /mnt/f the cost is per-call latency, so
+    # 16 in flight turn ~38 s into a few seconds (review 05 P1-3).
+    plan: list[tuple[str, object]] = []      # (rel, path) or (rel, [paths])
+
+    def _list_tree(d: str) -> list[str]:
+        out: list[str] = []
         for dp, _dn, fns in os.walk(d):
-            for fn in fns:
-                try:
-                    st = os.stat(os.path.join(dp, fn))
-                except OSError:
-                    continue
-                n += 1
-                total += st.st_size
-                newest = max(newest, st.st_mtime)
-        return n, total, newest
+            out.extend(os.path.join(dp, fn) for fn in fns)
+        return out
 
     def _rec(d: Path) -> None:
         try:
@@ -1672,19 +1951,37 @@ def _walk_inventory(root: Path) -> tuple[list[tuple[str, int, float]], dict]:
                 if e.name in SKIP_DIRS and d == root:
                     continue
                 if _collapse_match(e.name):
-                    n, total, newest = _dir_size(Path(e.path))
-                    if n:
-                        rows.append((rel + f"/  ({n} files)", total, newest))
+                    plan.append((rel, _list_tree(e.path)))
                     continue
                 _rec(Path(e.path))
             elif e.is_file(follow_symlinks=False):
-                try:
-                    st = e.stat()
-                except OSError:
-                    continue
-                rows.append((rel, st.st_size, st.st_mtime))
+                plan.append((rel, e.path))
 
     _rec(root)
+
+    def _stat(path: str):
+        try:
+            st = os.stat(path)
+            return st.st_size, st.st_mtime
+        except OSError:
+            return None
+
+    flat: list[str] = []
+    for _rel, item in plan:
+        flat.extend(item if isinstance(item, list) else [item])
+    with ThreadPoolExecutor(max_workers=INVENTORY_STAT_THREADS) as pool:
+        stats = dict(zip(flat, pool.map(_stat, flat, chunksize=64)))
+    for rel, item in plan:
+        if isinstance(item, list):
+            got = [stats.get(p) for p in item]
+            got = [g for g in got if g]
+            if got:
+                rows.append((rel + f"/  ({len(got)} files)",
+                             sum(g[0] for g in got), max(g[1] for g in got)))
+        else:
+            g = stats.get(item)
+            if g:
+                rows.append((rel, g[0], g[1]))
     for rel, size, mt in rows:
         fam = rel.split(os.sep)[0] if os.sep in rel else "(root)"
         r = rollup.setdefault(fam, [0, 0, 0.0])

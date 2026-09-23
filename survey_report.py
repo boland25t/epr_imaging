@@ -6,7 +6,7 @@ map, anomaly detection, sensor products, and the processing methodology.
 Qt-free.  build_survey_report(workspace_dir, out_path=None) -> str.
 """
 from __future__ import annotations
-import base64, glob, io, json, os
+import base64, glob, io, json, os, re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -113,9 +113,22 @@ def fig_survey_map(B) -> bytes:
     return _fig_bytes(fig, "jpg", 150, "#0e1620")
 
 
+CHANNELS = ["CO2", "CH4", "O2", "Temperature", "Salinity"]
+
+
+def channel_counts(win: pd.DataFrame) -> dict:
+    """Windows implicating each channel (a window may implicate several)."""
+    if not len(win) or "channels" not in win:
+        return {c: 0 for c in CHANNELS}
+    # exact tokens: a substring test counted every "CO2" window as "O2"
+    toks = win["channels"].fillna("").astype(str).map(
+        lambda v: {t.strip() for t in re.split(r"[,/+;]", v) if t.strip()})
+    return {c: int(toks.map(lambda t: c in t).sum()) for c in CHANNELS}
+
+
 def fig_channels(win: pd.DataFrame) -> bytes:
-    chans = ["CO2", "CH4", "O2", "Temperature", "Salinity"]
-    counts = {c: int(win["channels"].fillna("").str.contains(c).sum()) for c in chans}
+    chans = CHANNELS
+    counts = channel_counts(win)
     plt.rcParams["font.family"] = "DejaVu Sans"
     fig, ax = plt.subplots(figsize=(7.2, 2.9), dpi=150)
     fig.patch.set_alpha(0); ax.set_facecolor("none")
@@ -151,7 +164,7 @@ def fig_sensor(B) -> bytes | None:
     ax.set_xticks([]); ax.set_yticks([])
     for s in ax.spines.values(): s.set_color("#2a3846")
     cb = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
-    cb.set_label("CO$_2$ concentration", fontsize=9, color="#5c6b7a")
+    cb.set_label("pCO$_2$ (µatm, partial pressure)", fontsize=9, color="#5c6b7a")
     cb.ax.tick_params(colors="#8a97a3", labelsize=7)
     plt.tight_layout()
     return _fig_bytes(fig, "png", 150, "none")
@@ -164,9 +177,36 @@ def _dive_name(B) -> str:
     return m.group(1) if m else Path(B).name
 
 
+def position_valid(ip: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Rows of interp_full whose POSITION is real, not edge-held.
+
+    interp_full spans the union of every nav source; outside the positional
+    source's own time range the interpolator holds lat/lon/easting/northing/
+    depth constant (reviews 02 P0-1, 06 P1-2), which inflated "bottom time" by
+    15-25 %.  The leading and trailing runs of identical position are dropped,
+    keeping the one real fix at each end of the held run.
+    """
+    cols = [c for c in ("easting", "northing") if c in ip.columns] or \
+        [c for c in ("lat", "lon") if c in ip.columns]
+    if len(ip) < 3 or not cols:
+        return ip, {"held_head": 0, "held_tail": 0, "held_h": 0.0}
+    xy = ip[cols].to_numpy(float)
+    moved = np.any(xy != xy[0], axis=1)
+    i0 = max(int(np.argmax(moved)) - 1, 0) if moved.any() else 0
+    moved_t = np.any(xy != xy[-1], axis=1)
+    j0 = (len(ip) - 1 - int(np.argmax(moved_t[::-1])) + 1) if moved_t.any() else len(ip) - 1
+    j0 = min(j0, len(ip) - 1)
+    valid = ip.iloc[i0:j0 + 1]
+    t = ip.unix_time.to_numpy(float)
+    held_h = ((t[i0] - t[0]) + (t[-1] - t[j0])) / 3600.0
+    return valid, {"held_head": int(i0), "held_tail": int(len(ip) - 1 - j0),
+                   "held_h": float(held_h)}
+
+
 def collect(B, fast_mesh=False) -> dict:
-    ip = pd.read_csv(f"{B}/inputs/interp_full.csv")
-    ip = ip.dropna(subset=["easting", "northing", "depth"]).sort_values("unix_time")
+    ip_all = pd.read_csv(f"{B}/inputs/interp_full.csv")
+    ip_all = ip_all.dropna(subset=["easting", "northing", "depth"]).sort_values("unix_time")
+    ip, held = position_valid(ip_all)
     e, n, d, t = (ip[c].to_numpy() for c in ("easting", "northing", "depth", "unix_time"))
     p3 = np.sqrt(np.diff(e) ** 2 + np.diff(n) ** 2 + np.diff(d) ** 2).sum()
     ph = np.hypot(np.diff(e), np.diff(n)).sum()
@@ -174,6 +214,8 @@ def collect(B, fast_mesh=False) -> dict:
         start=datetime.fromtimestamp(t.min(), timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         end=datetime.fromtimestamp(t.max(), timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         dur_h=(t.max() - t.min()) / 3600, samples=len(ip),
+        held=held, span_all_h=(float(ip_all.unix_time.max() - ip_all.unix_time.min())
+                               / 3600.0),
         path_3d=p3, path_h=ph, dmin=float(d.min()), dmax=float(d.max()),
         e0=float(e.min()), e1=float(e.max()), n0=float(n.min()), n1=float(n.max()),
         utm="UTM 13N (EPSG:32613)",
@@ -183,9 +225,15 @@ def collect(B, fast_mesh=False) -> dict:
     # Chunks live under seg*/ (batch runner) or run_<stamp>__<sampling>/
     # (simple UI).  Globbing only seg*/ reported 0 chunks / 0 orthos / 0 DEMs
     # for every dive processed through the simple UI.
+    from reporting_common import chunk_status
     chunks = [c for c in sorted(_chunk_dirs(PG)) if not _excluded(c)]
+    qc = [chunk_status(c) for c in chunks]
+    ok_chunks = [q["path"] for q in qc if q["status"] == "ok"]
+    failed = [q for q in qc if q["status"] != "ok"]
     orthos = [c for c in chunks if os.path.exists(f"{c}/orthomosaic.tif")
               and os.path.getsize(f"{c}/orthomosaic.tif") > 1e6]
+    meshes = [c for c in chunks if os.path.exists(f"{c}/mesh.obj")
+              and os.path.getsize(f"{c}/mesh.obj") > 0]
     # streaming OBJ line counts are slow on /mnt/f — cache by (size, mtime)
     cache_path = Path(B) / "survey" / ".mesh_vf_cache.json"
     try: _vf_cache = json.loads(cache_path.read_text())
@@ -217,13 +265,15 @@ def collect(B, fast_mesh=False) -> dict:
         cs = [c for c in sorted(glob.glob(f"{PG}/{seg}/chunk_*")) if not _excluded(c)]
         if not cs: continue
         sv = sf = 0; ext = ""
+        n_ok = sum(1 for q in qc if q["run"] == seg and q["status"] == "ok")
         for c in cs:
             v, f_ = vf(f"{c}/mesh.obj"); sv += v; sf += f_
             if not ext and os.path.exists(f"{c}/dem.tif"):
                 with rasterio.open(f"{c}/dem.tif") as ds:
                     ext = f"{ds.width*ds.res[0]:.0f}×{ds.height*ds.res[1]:.0f} m"
         tv += sv; tf += sf
-        segrows.append(dict(seg=seg, chunks=len(cs), verts=sv, faces=sf, ext=ext))
+        segrows.append(dict(seg=seg, chunks=len(cs), ok=n_ok, verts=sv, faces=sf,
+                            ext=ext))
     try: cache_path.write_text(json.dumps(_vf_cache))
     except OSError: pass
     with rasterio.open(f"{PG}/merged/ortho_merged.tif") as ds:
@@ -232,8 +282,19 @@ def collect(B, fast_mesh=False) -> dict:
         _r = ds.res[0]
         _res_txt = f"{_r*1000:.0f} mm" if _r < 0.01 else f"{_r*100:.1f} cm"
         me = f"{ds.width*ds.res[0]:.0f}×{ds.height*ds.res[1]:.0f} m @ {_res_txt}"
-    photo = dict(segments=len(segrows), chunks=len(chunks), orthos=len(orthos),
-                 dems=len([d for d in _chunk_dirs(PG, "/dem.tif") if not _excluded(d)]),
+    run_metas = {}
+    for seg in segset:
+        try:
+            run_metas[seg] = json.loads((Path(PG) / seg / "simple_meta.json").read_text())
+        except (OSError, ValueError):
+            pass
+    photo = dict(segments=len(segrows), chunks=len(chunks), ok=len(ok_chunks),
+                 failed=failed, qc=qc, orthos=len(orthos), meshes=len(meshes),
+                 legacy_segments=any(s.startswith("seg") for s in segset),
+                 runs=[s for s in segset if s.startswith("run_")],
+                 run_metas=run_metas,
+                 dems=len([d for d in _chunk_dirs(PG, "/dem.tif") if not _excluded(d)
+                           and os.path.getsize(d) > 0]),
                  verts=tv, faces=tf, merged_ext=me, rows=segrows)
     # anomaly (optional — the detector may not have run yet)
     anom, win = None, pd.DataFrame()
@@ -247,19 +308,47 @@ def collect(B, fast_mesh=False) -> dict:
             if c in tiers: tiers[c] += 1
         clips = pd.read_csv(f"{B}/survey/anomaly/video_review_clips.csv")
         top = sites.sort_values("window_count", ascending=False).head(8)
+        try:
+            ameta = json.loads((Path(B) / "survey/anomaly/simple_meta.json").read_text())
+        except (OSError, ValueError):
+            ameta = {}
+        seeded = ameta.get("seeded_from")
+        seeded_date = ""
+        if seeded:
+            try:
+                seeded_date = datetime.fromtimestamp(
+                    os.path.getmtime(f"{B}/survey/anomaly/anomaly_windows_all.csv"),
+                    timezone.utc).strftime("%Y-%m-%d")
+            except OSError:
+                pass
         anom = dict(windows=len(win), sites=len(sites), clips=len(clips), tiers=tiers,
-                    site_rows=top.to_dict("records"))
+                    site_rows=top.to_dict("records"), seeded=seeded,
+                    seeded_date=seeded_date)
     # sensors
+    # Formats are listed only when files of that format exist (review 02 P1-4:
+    # the report used to promise netCDF grids that were never written).
+    from reporting_common import channel_label, sensor_units
+    units = sensor_units(B)
     sens = []
-    for lbl, pat in (("3D trackline", "nav_trackline/**/*.ply"),
-                     ("Depth raster", "nav_depth/**/*.tif")):
+    for lbl, pat, fmt in (("3D trackline", "nav_trackline/**/*.ply", "PLY"),
+                          ("Trackline", "nav_trackline/**/*.geojson", "GeoJSON"),
+                          ("Depth raster", "nav_depth/**/*.tif", "GeoTIFF")):
         g = glob.glob(f"{B}/survey/{pat}", recursive=True)
-        if g: sens.append((lbl, "1", sum(os.path.getsize(x) for x in g)))
-    for ch in ("CO2", "CH4", "O2", "Salinity", "Temperature"):
-        t2 = glob.glob(f"{B}/survey/sensor_2d/**/{ch}*2d.tif", recursive=True)
-        nc = glob.glob(f"{B}/survey/sensor_netcdf/**/{ch}*.nc", recursive=True)
-        sens.append((f"{ch}", f"2D raster + netCDF", sum(os.path.getsize(x) for x in t2 + nc)))
-    return dict(dive=dive, photo=photo, anom=anom, win=win, sensors=sens)
+        if g: sens.append((lbl, fmt, "m" if "Depth" in lbl else "",
+                           sum(os.path.getsize(x) for x in g)))
+    n_nc = 0
+    for ch in (list(units) or ["CO2", "CH4", "O2", "Salinity", "Temperature"]):
+        t2 = glob.glob(f"{B}/survey/sensor_2d/**/{glob.escape(ch)}*2d.tif", recursive=True)
+        nc = glob.glob(f"{B}/survey/sensor_netcdf/**/{glob.escape(ch)}*.nc", recursive=True)
+        n_nc += len(nc)
+        fmts = [f for f, g in (("2D GeoTIFF", t2), ("netCDF", nc)) if g]
+        if not fmts:
+            continue
+        sens.append((channel_label(ch, units.get(ch, ""), ascii_only=False),
+                     " + ".join(fmts), units.get(ch, "") or "unknown",
+                     sum(os.path.getsize(x) for x in t2 + nc)))
+    return dict(dive=dive, photo=photo, anom=anom, win=win, sensors=sens,
+                units=units, has_netcdf=n_nc > 0)
 
 
 # ------------------------------------------------------------------- html ----
@@ -572,19 +661,20 @@ def _analysis_section(a, f, dv) -> str:
     {coverage_li}
   </ul>
   <div class="note"><b>Caveats.</b> The cause of bright ground is not established here;
-  overlapping frames are not independent samples; concentrations are in native sensor
-  units; anomaly windows derive from the same sensor record (though independently of the
+  overlapping frames are not independent samples; gas values are in the units
+  recorded in workspace.json (CO&#8322;/CH&#8324; in &micro;atm are partial pressures); anomaly windows derive from the same sensor record (though independently of the
   imagery); and this is a single dive. The altitude-band statistics are the quantities
   designed to survive these concerns.</div>
 </section>"""
 
 
 def _render_html(D, figs, astats=None, afigs=None) -> str:
+    from reporting_common import channel_label, code_version
     dv, ph, an = D["dive"], D["photo"], D["anom"]
     analysis_html = _analysis_section(astats, afigs or {}, dv) if astats else ""
     def mb(x): return f"{x/1e6:.1f} MB" if x >= 1e6 else f"{x/1e3:.0f} KB"
     seg_rows = "\n".join(
-        f"<tr><td class='mono'>{r['seg']}</td><td class='num'>{r['chunks']}</td>"
+        f"<tr><td class='mono'>{r['seg']}</td><td class='num'>{r['ok']}/{r['chunks']}</td>"
         f"<td class='num'>{r['verts']:,}</td><td class='num'>{r['faces']:,}</td>"
         f"<td class='mono dim'>{r['ext']}</td></tr>" for r in ph["rows"])
     site_rows = "\n".join(
@@ -595,8 +685,63 @@ def _render_html(D, figs, astats=None, afigs=None) -> str:
         f"<td class='dim'>{r['channels']}</td></tr>"
         for r in (an["site_rows"] if an else []))
     sens_rows = "\n".join(
-        f"<tr><td>{lbl}</td><td class='dim'>{kind}</td><td class='num'>{mb(sz)}</td></tr>"
-        for lbl, kind, sz in D["sensors"])
+        f"<tr><td>{lbl}</td><td class='dim'>{kind}</td><td class='mono'>{u}</td>"
+        f"<td class='num'>{mb(sz)}</td></tr>"
+        for lbl, kind, u, sz in D["sensors"])
+    # ---- data-backed sentences (review 02 P1-4): nothing below is canned ----
+    held = dv.get("held") or {}
+    held_note = (f" {held['held_h']:.1f}&nbsp;h of edge-held navigation (position "
+                 f"frozen outside the nav source's time range) are excluded; the "
+                 f"interpolated table spans {dv.get('span_all_h', 0):.1f}&nbsp;h."
+                 if held.get("held_h", 0) > 0.01 else "")
+    n_att, n_ok = ph["chunks"], ph["ok"]
+    failed_txt = "; ".join(
+        f"{q['run']}/{q['chunk']}: {q.get('reason', 'failed')}" for q in ph["failed"])
+    qc_note = (f"""<div class="note"><b>Reconstruction QC.</b> {n_att} chunk(s)
+  attempted, <strong>{n_ok} reconstructed</strong>, {n_att - n_ok} failed
+  ({failed_txt}). Failed chunks produced no orthomosaic or DEM and are not
+  counted as reconstructions anywhere in this report.</div>"""
+               if ph["failed"] else "")
+    rm = next(iter(ph.get("run_metas", {}).values()), {}) if ph.get("runs") else {}
+    ps = rm.get("photo_settings") or {}
+    if ph.get("legacy_segments"):
+        scope_sentence = (f"The dive was split into {ph['segments']} traverse "
+                          f"segment(s) by nav-velocity segmentation.")
+        seg_bullet = ("<li><b>Nav-velocity segmentation.</b> The dive track is split "
+                      "into traverse legs by sustained speed, and photogrammetry is "
+                      "run per leg.</li>")
+    else:
+        alt_max = rm.get("alt_max_m")
+        gate = (f"frames with altitude &le;&nbsp;{alt_max:g}&nbsp;m" if alt_max
+                else "altitude-gated frames")
+        samp = rm.get("sampling_label") or "the frame set"
+        scope_sentence = (f"Photogrammetry ran over {gate} from {samp} across the "
+                          f"whole trackline ({len(ph.get('runs') or [])} run(s)).")
+        seg_bullet = (f"<li><b>Altitude-gated chunking.</b> Frames sampled "
+                      f"{samp}; {gate} are kept and split into chunks "
+                      f"(no velocity segmentation).</li>")
+    qthr = ps.get("quality_threshold")
+    gate_txt = (f"an image-quality gate ({float(qthr):g}), " if qthr and float(qthr) > 0
+                else "")
+    mesh_txt = (f"{ps['mesh_surface']} meshing, " if ps.get("mesh_surface") else "")
+    counts = channel_counts(D["win"]) if an else {}
+    ranked = sorted(((c, n) for c, n in counts.items() if n), key=lambda kv: -kv[1])
+    chan_caption = ("Number of anomaly windows implicating each channel (a window may "
+                    "implicate several). Ranked by count: " + ", ".join(
+                        f"{c.replace('CO2', 'CO&#8322;').replace('CH4', 'CH&#8324;').replace('O2', 'O&#8322;')}"
+                        f"&nbsp;{n}" for c, n in ranked) + "."
+                    if ranked else "Number of anomaly windows implicating each channel.")
+    units = D.get("units") or {}
+    units_txt = ", ".join(f"{channel_label(k, v, ascii_only=False)}"
+                          for k, v in units.items() if v) or "not recorded"
+    fmt_sentence = ("Each sensor channel is delivered as a 2D GeoTIFF raster "
+                    f"(IDW-interpolated along the track, {dv['utm']})"
+                    + (" and a volumetric netCDF grid" if D.get("has_netcdf") else "")
+                    + ", alongside the trackline and depth surface &mdash; all in the "
+                    "photogrammetry's coordinate frame. Rasters are interpolated from "
+                    "along-track measurements; they are not a synoptic field. "
+                    f"Units: {units_txt}. CO&#8322; and CH&#8324; in &micro;atm are "
+                    "partial pressures, not concentrations.")
     T = an["tiers"] if an else {}
     hero_anom_stat = (f"""<div class="stat"><div class="v">{an['sites']}</div><div class="k">Anomalous sites</div></div>"""
                       if an else
@@ -616,8 +761,8 @@ def _render_html(D, figs, astats=None, afigs=None) -> str:
                   f"co-registered sensor rasters. Warm tones mark elevated concentration over the "
                   f"vent field.</figcaption></figure>") if figs["sensor"] else ""
     contact_fig = (f"<figure><img alt='Orthomosaic contact sheet' src='{figs['contact']}'>"
-                   f"<figcaption>All {ph['orthos']} orthomosaics — clean traverse ribbons, "
-                   f"dense full-coverage patches, and the curved passes over the vent field.</figcaption>"
+                   f"<figcaption>All {ph['orthos']} chunk orthomosaics (thumbnails, "
+                   f"contrast-stretched for display).</figcaption>"
                    f"</figure>") if figs["contact"] else ""
     gallery_html = ""
     if figs.get("gallery"):
@@ -636,12 +781,20 @@ def _render_html(D, figs, astats=None, afigs=None) -> str:
             "extent in metres, 10&nbsp;m scale bar). Contrast-stretched for display.</p>")
     merged_fig = (f"<figure><img alt='Merged dive-wide orthomosaic' src='{figs['merged']}'>"
                   f"<figcaption>The {ph['orthos']} orthomosaics merged into one dive-wide mosaic "
-                  f"({ph['merged_ext']}); overlapping passes register at their crossings.</figcaption>"
+                  f"({ph['merged_ext']}); where chunks overlap the newest wins.</figcaption>"
                   f"</figure>") if figs["merged"] else ""
+    seeded_note = (f"""<div class="note"><b>Seeded product.</b> These anomaly results
+  were copied from <span class="mono">{an['seeded']}</span> (files dated
+  {an.get('seeded_date') or 'unknown'}), not recomputed in this workspace.</div>"""
+                   if an and an.get("seeded") else "")
+    detector_bullet = ("""<li><b>Detector matrix.</b> Four suppression configurations
+    &times; multiple detector families per channel are fused into signature windows, then
+    clustered into ranked sites with a video-review queue.</li>""" if an else "")
     if an:
         anom_section = f"""<section>
   <p class="sec-label">Anomaly detection</p>
   <h2>Sensor anomalies and ranked sites</h2>
+  {seeded_note}
   <p>A four-configuration detector matrix over the CO&#8322;, CH&#8324;, O&#8322; and temperature
   channels produced {an['windows']} fused signature windows, consolidated
   into <strong>{an['sites']} spatially-ranked anomalous sites</strong> and a
@@ -660,8 +813,7 @@ def _render_html(D, figs, astats=None, afigs=None) -> str:
   </div>
   <h3>Windows by sensor channel</h3>
   <figure style="background:var(--paper)"><img alt="Windows per sensor channel" src="{figs['channels']}">
-  <figcaption>Number of anomaly windows implicating each channel. Temperature and O&#8322;
-  dominate, with CO&#8322; and CH&#8324; corroborating at the strongest sites.</figcaption></figure>
+  <figcaption>{chan_caption}</figcaption></figure>
   <h3>Top anomalous sites</h3>
   <div class="tw"><table>
     <thead><tr><th>Site</th><th class="num">Windows</th><th>Best tier</th>
@@ -820,23 +972,22 @@ sup{{font-size:70%}}
   <p class="eyebrow">ROV Dive Survey &middot; East Pacific Rise 9&deg;N</p>
   <h1>Jason Dive {dv['name']} Survey Report</h1>
   <p class="lede">Photogrammetric seafloor mapping and multi-channel sensor-anomaly
-  detection across the downward traverse legs of a {dv['dur_h']:.1f}-hour hydrothermal
+  detection over {dv['dur_h']:.1f} hours of position-valid navigation on a hydrothermal
   vent-field survey.</p>
 </header>
 
 <div class="stats">
-  <div class="stat"><div class="v">{dv['dur_h']:.1f} h</div><div class="k">Bottom time</div></div>
+  <div class="stat"><div class="v">{dv['dur_h']:.1f} h</div><div class="k">Position-valid time</div></div>
   <div class="stat"><div class="v">{dv['path_3d']/1000:.2f} km</div><div class="k">Vehicle path (3D)</div></div>
   {hero_anom_stat}
-  <div class="stat"><div class="v">{ph['chunks']}</div><div class="k">Reconstructions</div></div>
+  <div class="stat"><div class="v">{ph['ok']}</div><div class="k">Reconstructions ({ph['chunks']} attempted)</div></div>
 </div>
 
 <section class="hero">
   <p class="sec-label">Integrated survey map</p>
   <h2>{hero_h2}</h2>
-  <p>The dive resolved into {ph['segments']} moving traverse legs over the vent field. Every
-  orthomosaic, the ROV trackline{map_para_anom} are co-registered in
-  {dv['utm']}.{map_para_tail}</p>
+  <p>{scope_sentence} Every orthomosaic, the ROV trackline{map_para_anom} are
+  co-registered in {dv['utm']}.{map_para_tail}</p>
   <figure><img alt="Integrated survey map: orthomosaics with colour-coded anomaly windows"
     src="{figs['map']}">
   <figcaption>Survey overview &mdash; dive-wide orthomosaic base with the ROV
@@ -846,15 +997,14 @@ sup{{font-size:70%}}
 <section>
   <p class="sec-label">Survey overview</p>
   <h2>The dive at a glance</h2>
-  <p>{dv['name']} ran from {dv['start']} to {dv['end']} &mdash; {dv['dur_h']:.1f} hours,
-  {dv['samples']:,} navigation samples. The vehicle covered {dv['path_3d']/1000:.2f} km of
-  3D path ({dv['path_h']/1000:.2f} km horizontal) but spent most of the dive
-  station-keeping; photogrammetry was scoped automatically to the {ph['segments']} legs where
-  the vehicle was genuinely traversing.</p>
+  <p>{dv['name']} has position-valid navigation from {dv['start']} to {dv['end']}
+  &mdash; {dv['dur_h']:.1f} hours, {dv['samples']:,} navigation samples.{held_note} The
+  vehicle covered {dv['path_3d']/1000:.2f} km of 3D path ({dv['path_h']/1000:.2f} km
+  horizontal).</p>
   <div class="tw"><table>
     <tbody>
-      <tr><th>Operating window</th><td class="mono">{dv['start']} &rarr; {dv['end']}</td></tr>
-      <tr><th>Depth range</th><td class="mono">{dv['dmin']:.0f} &ndash; {dv['dmax']:.0f} m</td></tr>
+      <tr><th>Position-valid window</th><td class="mono">{dv['start']} &rarr; {dv['end']}</td></tr>
+      <tr><th>Depth range (m, negative down)</th><td class="mono">{dv['dmin']:.0f} &ndash; {dv['dmax']:.0f} m</td></tr>
       <tr><th>Horizontal extent</th><td class="mono">E {dv['e0']:.0f}&ndash;{dv['e1']:.0f} &nbsp; N {dv['n0']:.0f}&ndash;{dv['n1']:.0f}</td></tr>
       <tr><th>Coordinate system</th><td class="mono">{dv['utm']}</td></tr>
     </tbody>
@@ -864,19 +1014,20 @@ sup{{font-size:70%}}
 <section>
   <p class="sec-label">Photogrammetry</p>
   <h2>Seafloor reconstructions</h2>
-  <p>The {ph['segments']} traverse legs yielded <strong>{ph['chunks']} photogrammetric
-  reconstructions</strong> &mdash; {ph['orthos']} orthomosaics, {ph['dems']} digital elevation
-  models and {ph['chunks']} textured 3D meshes ({ph['verts']:,} vertices /
+  <p>{n_att} photogrammetric chunk(s) were attempted and <strong>{n_ok}
+  reconstructed</strong> &mdash; {ph['orthos']} orthomosaic(s), {ph['dems']} digital
+  elevation model(s) and {ph['meshes']} 3D mesh(es) ({ph['verts']:,} vertices /
   {ph['faces']:,} faces in total), each nav-georeferenced in {dv['utm']}.</p>
+  {qc_note}
   {merged_fig}
   {contact_fig}
   {gallery_html}
   <h3>Per-segment inventory</h3>
   <div class="tw"><table>
-    <thead><tr><th>Segment</th><th class="num">Chunks</th><th class="num">Vertices</th>
+    <thead><tr><th>Run / segment</th><th class="num">Reconstructed / attempted</th><th class="num">Vertices</th>
       <th class="num">Faces</th><th>DEM extent</th></tr></thead>
     <tbody>{seg_rows}</tbody>
-    <tfoot><tr><td>{ph['segments']} segments</td><td class="num">{ph['chunks']}</td>
+    <tfoot><tr><td>{ph['segments']} run(s)/segment(s)</td><td class="num">{n_ok}/{n_att}</td>
       <td class="num">{ph['verts']:,}</td><td class="num">{ph['faces']:,}</td>
       <td class="dim mono">merged {ph['merged_ext']}</td></tr></tfoot>
   </table></div>
@@ -887,25 +1038,20 @@ sup{{font-size:70%}}
 <section>
   <p class="sec-label">Sensor products &amp; methodology</p>
   <h2>Co-registered sensor grids</h2>
-  <p>Every sensor channel is delivered as both a 2D GeoTIFF raster (IDW-interpolated, {dv['utm']})
-  and a volumetric netCDF grid, alongside the 3D trackline and depth surface &mdash; all sharing the
-  photogrammetry's coordinate frame.</p>
+  <p>{fmt_sentence}</p>
   {sensor_fig}
   <div class="tw"><table>
-    <thead><tr><th>Product</th><th>Formats</th><th class="num">Size</th></tr></thead>
+    <thead><tr><th>Product</th><th>Formats on disk</th><th>Units</th><th class="num">Size</th></tr></thead>
     <tbody>{sens_rows}</tbody>
   </table></div>
 
   <h2 style="margin-top:38px">How it was produced</h2>
   <ul class="method">
-    <li><b>Nav-velocity segmentation.</b> The dive track is split into traverse legs by sustained
-    speed, so photogrammetry is spent on moving passes rather than station-keeping.</li>
+    {seg_bullet}
     <li><b>Nav-georeferenced photogrammetry.</b> Cameras are seeded from the reference navigation
-    and orientation in {dv['utm']}; an image-quality gate and reference preselection drive
-    alignment, dense matching, Height-Field meshing and DEM/ortho generation per chunk.</li>
-    <li><b>Detector matrix.</b> Four suppression configurations &times; multiple detector families
-    per channel are fused into signature windows, then clustered into ranked sites with a
-    video-review queue.</li>
+    and orientation in {dv['utm']}; {gate_txt}reference preselection drives
+    alignment, then dense matching, {mesh_txt}and DEM/ortho generation per chunk.</li>
+    {detector_bullet}
     <li><b>One coordinate frame.</b> All products &mdash; orthos, DEMs, meshes, sensor grids,
     trackline and anomalies &mdash; are delivered in {dv['utm']} so they overlay without
     reprojection.</li>
@@ -914,8 +1060,9 @@ sup{{font-size:70%}}
 {analysis_html}
 <footer>
   <div class="mono">Jason Dive {dv['name']} &middot; East Pacific Rise 9&deg;N &middot; {dv['utm']}</div>
-  Generated {datetime.now().strftime('%Y-%m-%d')} from the .eprproj workspace &middot;
-  all figures rendered from the delivered products.
+  Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} from the .eprproj
+  workspace &middot; code {code_version()} &middot; all figures rendered from the delivered
+  products.
 </footer>
 
 </article></div></body></html>"""

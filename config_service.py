@@ -22,11 +22,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import socket
+import tempfile
+import threading
+import time
 from datetime import datetime
 from timeutil import utc_now   # naive-UTC drop-ins for the deprecated datetime APIs
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from models import (
     AnnotationConfig,
@@ -90,6 +96,186 @@ def _resolve(path: str | None, base: Path) -> Path | None:
         return p
     # Resolve turns ".." components into canonical absolute paths.
     return (base / p).resolve()
+
+
+# ---------------------------------------------------------------------------
+# Safe workspace.json I/O (review 04 P1-1 / P1-2, 03 P1-2)
+# ---------------------------------------------------------------------------
+
+class WorkspaceFileError(ValueError):
+    """workspace.json exists but cannot be read or parsed.
+
+    Callers that read-modify-write the file MUST let this propagate: treating
+    an unreadable file as "{}" and writing back would wipe the nav, sensor and
+    video configuration.
+    """
+
+
+def atomic_write_text(path: str | Path, text: str, encoding: str = "utf-8") -> None:
+    """Write ``text`` to ``path`` atomically.
+
+    A uniquely named temp file in the SAME directory (so os.replace is a rename,
+    not a copy), flushed and fsync'd, then swapped into place.  A crash, a full
+    disk or a concurrent writer can never leave a truncated file, and two
+    writers never collide on one shared ``.tmp`` name.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(text)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass                      # some DrvFs mounts refuse fsync; rename still atomic
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_workspace_json(path: str | Path) -> dict:
+    """Raw workspace.json as a dict.
+
+    Missing file -> {} (a fresh workspace).  Present but unreadable or not a
+    JSON object -> WorkspaceFileError (never {}).
+    """
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise WorkspaceFileError(
+            f"{path} could not be read ({exc}); refusing to modify it — restore it "
+            "from a backup (or fix the JSON) before changing jobs or settings") from exc
+    if not isinstance(data, dict):
+        raise WorkspaceFileError(f"{path} is not a JSON object; refusing to modify it")
+    return data
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def lock_holder(lock_path: str | Path) -> dict | None:
+    """The lock's owner record, or None when free or stale.
+
+    Stale = the owning pid is dead on THIS host, or the record is unreadable
+    and older than a minute.  A lock from another host is honoured (we cannot
+    probe its pid) unless it is older than ``max_age_s`` recorded in it.
+    """
+    lock_path = Path(lock_path)
+    try:
+        info = json.loads(lock_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        try:
+            age = time.time() - lock_path.stat().st_mtime
+        except OSError:
+            return None
+        return None if age > 60 else {"pid": None, "host": "?", "task": "unknown (unreadable lock)"}
+    if not isinstance(info, dict):
+        return None
+    if info.get("host") == socket.gethostname():
+        if not _pid_alive(info.get("pid")):
+            return None
+    else:
+        max_age = float(info.get("max_age_s") or 0)
+        if max_age and time.time() - float(info.get("started_at") or 0) > max_age:
+            return None
+    return info
+
+
+def try_acquire_lock(lock_path: str | Path, task: str = "", max_age_s: float = 0.0) -> bool:
+    """Create ``lock_path`` exclusively (O_CREAT|O_EXCL).  Clears a stale lock.
+
+    Returns True when this process now holds it (or already did).
+    """
+    lock_path = Path(lock_path)
+    record = {"pid": os.getpid(), "host": socket.gethostname(), "task": task,
+              "started_at": time.time(), "max_age_s": max_age_s}
+    for _attempt in range(2):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            holder = lock_holder(lock_path)
+            if holder is None:                       # stale: remove and retry once
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue
+            return (holder.get("pid") == os.getpid()
+                    and holder.get("host") == socket.gethostname())
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+        return True
+    return False
+
+
+def release_lock(lock_path: str | Path) -> None:
+    """Remove ``lock_path`` if this process holds it."""
+    lock_path = Path(lock_path)
+    try:
+        info = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if info.get("pid") == os.getpid() and info.get("host") == socket.gethostname():
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+_WS_THREAD_LOCK = threading.RLock()
+_WS_LOCK_DEPTH: dict[str, int] = {}
+
+
+@contextlib.contextmanager
+def workspace_json_lock(ws_json: str | Path, timeout_s: float = 15.0) -> Iterator[None]:
+    """Serialise read-modify-write of one workspace.json across processes.
+
+    A short-lived ``workspace.json.lock`` beside the file; waits up to
+    ``timeout_s`` for another writer, clears a lock whose pid is dead, and
+    raises TimeoutError (naming the holder) rather than writing unguarded.
+    Re-entrant within one process.
+    """
+    lock = Path(str(ws_json) + ".lock")
+    key = str(lock.resolve()) if lock.parent.exists() else str(lock)
+    with _WS_THREAD_LOCK:                 # threads of this process queue here
+        if _WS_LOCK_DEPTH.get(key):
+            _WS_LOCK_DEPTH[key] += 1
+            try:
+                yield
+            finally:
+                _WS_LOCK_DEPTH[key] -= 1
+            return
+        deadline = time.time() + timeout_s
+        while not try_acquire_lock(lock, task="workspace.json update"):
+            if time.time() > deadline:
+                raise TimeoutError(f"workspace.json is locked by {lock_holder(lock)} ({lock})")
+            time.sleep(0.05)
+        _WS_LOCK_DEPTH[key] = 1
+        try:
+            yield
+        finally:
+            _WS_LOCK_DEPTH.pop(key, None)
+            release_lock(lock)
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +345,7 @@ class ConfigService:
         }
         output_path = Path(output_path)
         # indent=2 produces a human-readable file; no minification needed here.
-        output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        atomic_write_text(output_path, json.dumps(payload, indent=2))
 
     # ---------------------------------------------------------------------------
     # Workspace save
@@ -328,7 +514,12 @@ class ConfigService:
         for key, value in extra_settings.items():
             payload.setdefault(key, value)
 
-        Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Atomic (temp + fsync + os.replace) under the job-store lock, so a
+        # crash or full disk never leaves a truncated workspace.json and a
+        # concurrent job-store write is never interleaved (review 04 P1-1/P1-2).
+        text = json.dumps(payload, indent=2)
+        with workspace_json_lock(path):
+            atomic_write_text(path, text)
 
     # ---------------------------------------------------------------------------
     # Workspace load

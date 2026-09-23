@@ -36,6 +36,7 @@ from pathlib import Path                   # Cross-platform path handling throug
 from typing import Callable               # Used in the LogFn type alias
 import logging                             # Module-level logger; mirrors progress to the Python log
 import math                                # math.floor() for computing integer sample counts
+import os                                  # os.replace() for atomic interp_full.csv writes
 
 # ---------------------------------------------------------------------------
 # Third-party imports
@@ -54,6 +55,42 @@ from dynamicsampling import create_dynamic_sample_schedule  # Distance-adaptive 
 from models import AnnotationConfig, NavigationConfig, SegmentRecord, SelectedTimeRange, SensorFileConfig, ThresholdConfig, VideoRecord
 from sensor_service import SensorService   # Timeseries loading and linear interpolation helpers
 from video_service import VideoService     # Directory scan + filename-based start-time parsing
+
+# interp_full.csv grid guards (review 10 P0-3).  A dive is < 1 day; a week is
+# already absurd, and 5 M rows is ~2 GB of DataFrame — refuse beyond either.
+MAX_INTERP_SPAN_S = 7 * 86400.0
+MAX_INTERP_ROWS = 5_000_000
+
+# Interpolation gap limits (review 10 P1-3): a target inside a source gap longer
+# than this is NaN, not a straight line across the dropout.  The effective limit
+# is max(this, 5 x the source's median sample interval) so slow instruments are
+# not blanked between their normal samples.
+NAV_MAX_GAP_S = 30.0
+SENSOR_MAX_GAP_S = 60.0
+
+
+def _gap_limit(source_times, floor_s: float) -> float:
+    t = pd.to_numeric(pd.Series(source_times), errors="coerce").dropna().to_numpy(dtype=float)
+    if len(t) < 3:
+        return floor_s
+    d = np.diff(np.sort(t))
+    d = d[d > 0]
+    return max(floor_s, 5.0 * float(np.median(d))) if len(d) else floor_s
+
+
+#: Attitude channels are sparse in the Jason renav (J1758: pitch present on
+#: ~22 % of rows, in blocks) and only seed Metashape's orientation prior at a
+#: 30 deg accuracy; they are interpolated across gaps (never extrapolated past
+#: their coverage) so that prior is not dropped for most cameras.
+_NO_GAP_MASK = frozenset({"heading", "pitch", "roll"})
+
+
+def _nav_interp(target, source: pd.DataFrame, key: str = "") -> np.ndarray:
+    """A nav channel on ``target`` times: NaN outside its coverage and (for
+    position/depth/altitude) inside source gaps longer than the gap limit."""
+    gap = None if key in _NO_GAP_MASK else _gap_limit(source["unix_time"], NAV_MAX_GAP_S)
+    return SensorService.interpolate_series(
+        target, source["unix_time"], source["value"], max_gap_s=gap)
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -449,35 +486,50 @@ class PipelineService:
         self._emit_progress(config, 5)
         self._emit_status(config, "Preparing inputs...")
         nav_sources: dict[str, pd.DataFrame] = {}
+        seen_notes: set[str] = set()
+
+        def _notes(df: pd.DataFrame) -> None:
+            for note in df.attrs.get("ingest_notes") or []:
+                if note not in seen_notes:
+                    seen_notes.add(note)
+                    self._emit_log(config, f"note: {note}")
+
+        def _load_nav(role: str, key: str, src, *, kind: str, optional: bool = False,
+                      negate: bool = False) -> None:
+            """Load one nav source; every failure names the role and file.
+
+            An OPTIONAL source (altitude, heading, pitch, roll) that cannot be
+            read is dropped with a warning instead of blocking every product
+            (review 10 P1-7); lat/lon/depth failures still raise.
+            """
+            self._emit_log(config, f"Loading {role} source: {src.csv_path}")
+            try:
+                df = SensorService.load_time_value_dataframe(src, negate=negate, kind=kind)
+            except Exception as exc:                                # noqa: BLE001
+                message = f"{role} source {src.csv_path}: {exc}"
+                if optional:
+                    self._emit_log(config, f"!! {message} — {role} left blank (NaN)")
+                    return
+                raise ValueError(message) from exc
+            _notes(df)
+            nav_sources[key] = df
+
         if config.navigation_file:
-            self._emit_log(config, f"Loading latitude source: {config.navigation_file.latitude_source.csv_path}")
-            nav_sources["lat"] = SensorService.load_time_value_dataframe(config.navigation_file.latitude_source)
-
-            self._emit_log(config, f"Loading longitude source: {config.navigation_file.longitude_source.csv_path}")
-            nav_sources["lon"] = SensorService.load_time_value_dataframe(config.navigation_file.longitude_source)
-
-            if config.navigation_file.altitude_source:
-                self._emit_log(config, f"Loading altitude source: {config.navigation_file.altitude_source.csv_path}")
-                nav_sources["alt"] = SensorService.load_time_value_dataframe(config.navigation_file.altitude_source)
-
-            if config.navigation_file.depth_source:
-                self._emit_log(config, f"Loading depth source: {config.navigation_file.depth_source.csv_path}")
-                nav_sources["water_depth"] = SensorService.load_time_value_dataframe(
-                    config.navigation_file.depth_source,
-                    negate=getattr(config.navigation_file, "negate_depth", False),
-                )
-
-            if config.navigation_file.heading_source:
-                self._emit_log(config, f"Loading heading source: {config.navigation_file.heading_source.csv_path}")
-                nav_sources["heading"] = SensorService.load_time_value_dataframe(config.navigation_file.heading_source)
-
-            if config.navigation_file.pitch_source:
-                self._emit_log(config, f"Loading pitch source: {config.navigation_file.pitch_source.csv_path}")
-                nav_sources["pitch"] = SensorService.load_time_value_dataframe(config.navigation_file.pitch_source)
-
-            if config.navigation_file.roll_source:
-                self._emit_log(config, f"Loading roll source: {config.navigation_file.roll_source.csv_path}")
-                nav_sources["roll"] = SensorService.load_time_value_dataframe(config.navigation_file.roll_source)
+            nav = config.navigation_file
+            _load_nav("latitude", "lat", nav.latitude_source, kind="lat")
+            _load_nav("longitude", "lon", nav.longitude_source, kind="lon")
+            if nav.altitude_source:
+                _load_nav("altitude", "alt", nav.altitude_source, kind="alt", optional=True)
+            if nav.depth_source:
+                _load_nav("depth", "water_depth", nav.depth_source, kind="depth",
+                          negate=getattr(nav, "negate_depth", False))
+            if nav.heading_source:
+                _load_nav("heading", "heading", nav.heading_source, kind="heading", optional=True)
+            if nav.pitch_source:
+                _load_nav("pitch", "pitch", nav.pitch_source, kind="pitch", optional=True)
+            if nav.roll_source:
+                _load_nav("roll", "roll", nav.roll_source, kind="roll", optional=True)
+            self._drop_null_island(config, nav_sources)
 
         self._emit_progress(config, 15)
         self._emit_status(config, "Navigation sources loaded.")
@@ -490,17 +542,24 @@ class PipelineService:
         # the same interpolation path as regular sensor channels.
         # -----------------------------------------------------------------
         sensor_frames: list[tuple[SensorFileConfig, pd.DataFrame]] = []
+
+        def _load_sensor(role: str, sensor_cfg) -> None:
+            self._emit_log(config, f"Loading {role}: {sensor_cfg.csv_path}")
+            try:
+                df = SensorService.load_sensor_dataframe(sensor_cfg)
+            except Exception as exc:                                # noqa: BLE001
+                raise ValueError(f"{role} {sensor_cfg.csv_path}: {exc}") from exc
+            _notes(df)
+            sensor_frames.append((sensor_cfg, df))
+
         for sensor_cfg in config.sensor_files:
-            self._emit_log(config, f"Loading sensor file: {sensor_cfg.csv_path}")
-            sensor_frames.append((sensor_cfg, SensorService.load_sensor_dataframe(sensor_cfg)))
+            _load_sensor("sensor file", sensor_cfg)
 
         if config.depth_source:
-            self._emit_log(config, f"Loading depth source: {config.depth_source.csv_path}")
-            sensor_frames.append((config.depth_source, SensorService.load_sensor_dataframe(config.depth_source)))
+            _load_sensor("depth source", config.depth_source)
 
         if config.speed_source:
-            self._emit_log(config, f"Loading speed source: {config.speed_source.csv_path}")
-            sensor_frames.append((config.speed_source, SensorService.load_sensor_dataframe(config.speed_source)))
+            _load_sensor("speed source", config.speed_source)
 
         self._emit_progress(config, 25)
         self._emit_status(config, "Sensor sources loaded.")
@@ -1674,28 +1733,77 @@ class PipelineService:
             sensor_frames: Loaded sensor (config, dataframe) pairs.
             output_dir:    Job-level output directory.
         """
-        # Collect the time extent of every nav and sensor source, then take the
-        # union so interp_full.csv covers the full data coverage window without
-        # being bounded by any single source or by video file timestamps.
-        all_mins: list[float] = []
-        all_maxs: list[float] = []
-        for df in nav_sources.values():
-            all_mins.append(float(df["unix_time"].min()))
-            all_maxs.append(float(df["unix_time"].max()))
-        for _, df in sensor_frames:
-            if "unix_time" in df.columns:
-                all_mins.append(float(df["unix_time"].min()))
-                all_maxs.append(float(df["unix_time"].max()))
+        def _span(df: pd.DataFrame) -> tuple[float, float] | None:
+            if df is None or "unix_time" not in df.columns or df.empty:
+                return None
+            t = pd.to_numeric(df["unix_time"], errors="coerce").dropna()
+            return (float(t.min()), float(t.max())) if len(t) else None
 
-        if not all_mins:
+        def _iso(t: float) -> str:
+            return pd.to_datetime(t, unit="s").isoformat()
+
+        sources: list[tuple[str, tuple[float, float]]] = []
+        for key, df in nav_sources.items():
+            s = _span(df)
+            if s:
+                sources.append((f"nav:{key}", s))
+        for sensor_cfg, df in sensor_frames:
+            s = _span(df)
+            if s:
+                sources.append((f"sensor:{Path(str(sensor_cfg.csv_path)).name}", s))
+
+        if not sources:
             self._emit_log(config, "interp_full.csv skipped: no navigation or sensor sources configured.")
             return
 
-        t_min = min(all_mins)
-        t_max = max(all_maxs)
-        hz      = max(config.full_interp_sample_hz, 0.001)
-        step    = 1.0 / hz
-        times   = np.arange(t_min, t_max + step * 0.5, step)
+        # The grid is bounded by the POSITIONAL source (lat ∩ lon): a row with
+        # no real position is not a sample of the dive.  The old union-of-all-
+        # sources grid let the DPA altimeter (which runs ~1.7 h past each end of
+        # the renav) pad every dive with hours of frozen positions (review 02
+        # P0-1 / 06 P1-2).  Sensor-only workspaces keep the union.
+        pos = [_span(nav_sources[k]) for k in ("lat", "lon") if k in nav_sources]
+        pos = [p for p in pos if p]
+        if pos:
+            t_min = max(p[0] for p in pos)
+            t_max = min(p[1] for p in pos)
+            basis = "positional (lat/lon) span"
+            if t_max <= t_min:
+                raise ValueError("latitude and longitude sources do not overlap in time")
+        else:
+            t_min = min(s[0] for _, s in sources)
+            t_max = max(s[1] for _, s in sources)
+            basis = "union of sensor spans (no navigation configured)"
+
+        hz   = max(config.full_interp_sample_hz, 0.001)
+        step = 1.0 / hz
+        span_s = t_max - t_min
+        n_rows = span_s * hz
+        # Hard memory guard (review 10 P0-3): one corrupt timestamp used to
+        # build a decades-long 1 Hz grid (tens of GB) and take the VM down.
+        if span_s > MAX_INTERP_SPAN_S or n_rows > MAX_INTERP_ROWS:
+            detail = "; ".join(f"{name} {_iso(a)} .. {_iso(b)}" for name, (a, b) in sources)
+            raise ValueError(
+                f"interp grid refused: {span_s / 3600:.1f} h ({n_rows:,.0f} rows @ {hz:g} Hz) "
+                f"exceeds the {MAX_INTERP_SPAN_S / 86400:g}-day / {MAX_INTERP_ROWS:,} row limit "
+                f"— check the timestamps in: {detail}")
+
+        # Per-source overlap against the grid (which is the nav span when nav
+        # exists).  A sensor logged in local time, on another day, or read from
+        # a time-only column lands here with 0 % overlap.
+        self._emit_log(config, f"interp grid: {_iso(t_min)} .. {_iso(t_max)} "
+                               f"({span_s / 3600:.2f} h, {basis})")
+        for name, (a, b) in sources:
+            covered = SensorService.span_overlap(t_min, t_max, a, b)
+            spans = f"source {_iso(a)} .. {_iso(b)} vs grid {_iso(t_min)} .. {_iso(t_max)}"
+            if covered <= 0.0:
+                self._emit_log(config, f"!! {name} does NOT overlap the navigation span at all "
+                                       f"({spans}) — its column is entirely NaN. Timezone, "
+                                       "date or timestamp-column mismatch?")
+            elif covered < 0.9:
+                self._emit_log(config, f"note: {name} covers only {covered:.0%} of the "
+                                       f"navigation span ({spans}); rows outside it are NaN")
+
+        times = np.arange(t_min, t_max + step * 0.5, step)
 
         frame_df = pd.DataFrame({"unix_time": times})
         full_df  = self._build_master_dataframe(frame_df, nav_sources, sensor_frames)
@@ -1705,14 +1813,60 @@ class PipelineService:
             if col in full_df.columns:
                 full_df = full_df.drop(columns=[col])
 
+        for col in full_df.columns:
+            if col in ("unix_time", "timestamp_iso", "utm_zone"):
+                continue
+            n_nan = int(full_df[col].isna().sum())
+            if n_nan and n_nan == len(full_df):
+                self._emit_log(config, f"!! interp column '{col}' is 100 % NaN")
+            elif n_nan:
+                self._emit_log(config, f"  '{col}': {n_nan:,} of {len(full_df):,} rows NaN "
+                                       "(outside that source's coverage or inside a gap)")
+
+        # Atomic write: a crash mid-write must never leave a truncated table
+        # that later reads as a shorter dive (review 04 P1-3).
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / "interp_full.csv"
-        full_df.to_csv(out_path, index=False)
+        partial = output_dir / f".interp_full.csv.{os.getpid()}.partial"
+        try:
+            full_df.to_csv(partial, index=False)
+            os.replace(partial, out_path)
+        finally:
+            if partial.exists():
+                try:
+                    partial.unlink()
+                except OSError:
+                    pass
         self._emit_log(
             config,
             f"  interp_full.csv → {out_path}  ({len(full_df)} rows @ {hz:.3g} Hz)"
         )
         self._emit_status(config, f"interp_full.csv written ({len(full_df)} rows).")
+
+    def _drop_null_island(self, config, nav_sources: dict[str, pd.DataFrame]) -> None:
+        """Remove (0, 0) GPS dropouts: timestamps where lat AND lon are both 0.
+
+        A real fix is never at exactly (0, 0); left in, one dropout drew a
+        23,800 km spike in the trackline and asked the depth raster for 3.75 TiB
+        (review 10 P2 / P1-2).
+        """
+        if "lat" not in nav_sources or "lon" not in nav_sources:
+            return
+        lat, lon = nav_sources["lat"], nav_sources["lon"]
+        zero_lat = set(lat.loc[lat["value"] == 0.0, "unix_time"].tolist())
+        if not zero_lat:
+            return
+        both = zero_lat & set(lon.loc[lon["value"] == 0.0, "unix_time"].tolist())
+        if not both:
+            return
+        for key in ("lat", "lon"):
+            df = nav_sources[key]
+            attrs = dict(df.attrs)
+            df = df[~df["unix_time"].isin(both)].copy()
+            df.attrs.update(attrs)
+            nav_sources[key] = df
+        self._emit_log(config, f"note: {len(both):,} (0, 0) position dropout(s) removed "
+                               "from latitude/longitude")
 
     def _build_master_dataframe(
         self,
@@ -1726,7 +1880,8 @@ class PipelineService:
         enriches it with nav and sensor values interpolated at each frame's
         unix_time.  All interpolation is done with numpy.interp() (via
         SensorService.interpolate_series()), which performs linear interpolation
-        and clamps extrapolated values to the boundary values.
+        and returns NaN outside each source's own time coverage (and inside
+        long source gaps) — values are never held constant past a source's end.
 
         Column ordering in the result:
           frame_filename, timestamp_iso, unix_time, lat, lon, alt,
@@ -1770,40 +1925,34 @@ class PipelineService:
                     f"  WARNING: Frame time range ({pd.to_datetime(frame_min, unit='s').isoformat()} – "
                     f"{pd.to_datetime(frame_max, unit='s').isoformat()}) does not overlap with navigation data "
                     f"({pd.to_datetime(nav_min, unit='s').isoformat()} – {pd.to_datetime(nav_max, unit='s').isoformat()}). "
-                    f"Coordinates will be constant. Check that your video filenames and navigation data share the same time reference."
+                    f"Coordinates will be NaN (no real position). Check that your video filenames and navigation data share the same time reference."
                 )
 
         # Interpolate each nav channel at every frame timestamp.
         # If a source isn't configured, fill with NaN (or 0 for altitude) so
         # downstream code doesn't crash on missing columns.
         if "lat" in nav_sources:
-            master["lat"] = SensorService.interpolate_series(
-                master["unix_time"], nav_sources["lat"]["unix_time"], nav_sources["lat"]["value"]
-            )
+            master["lat"] = _nav_interp(master["unix_time"], nav_sources["lat"])
         else:
             master["lat"] = np.nan
 
         if "lon" in nav_sources:
-            master["lon"] = SensorService.interpolate_series(
-                master["unix_time"], nav_sources["lon"]["unix_time"], nav_sources["lon"]["value"]
-            )
+            master["lon"] = _nav_interp(master["unix_time"], nav_sources["lon"])
         else:
             master["lon"] = np.nan
 
         if "alt" in nav_sources:
-            master["alt"] = SensorService.interpolate_series(
-                master["unix_time"], nav_sources["alt"]["unix_time"], nav_sources["alt"]["value"]
-            )
+            master["alt"] = _nav_interp(master["unix_time"], nav_sources["alt"])
         else:
-            # Default to 0.0 so alt is always a valid column even without data.
-            master["alt"] = 0.0
+            # No altimeter configured: the column exists but is NaN.  A 0.0
+            # default read as "on the seafloor" and passed the <= 8 m
+            # photogrammetry gate (review 10 P1-2 / I_empty_dpa).
+            master["alt"] = np.nan
 
         # Interpolate optional nav channels when configured.
         for key in ("water_depth", "heading", "pitch", "roll"):
             if key in nav_sources:
-                master[key] = SensorService.interpolate_series(
-                    master["unix_time"], nav_sources[key]["unix_time"], nav_sources[key]["value"]
-                )
+                master[key] = _nav_interp(master["unix_time"], nav_sources[key], key)
 
         # Interpolate each sensor channel at every frame timestamp.
         # The display_name from the channel config becomes the column header.
@@ -1819,6 +1968,7 @@ class PipelineService:
                     master["unix_time"],
                     sensor_df["unix_time"] - delay,
                     sensor_df[channel.source_column],
+                    max_gap_s=_gap_limit(sensor_df["unix_time"], SENSOR_MAX_GAP_S),
                 )
 
         master = self._add_utm_columns(master)
@@ -1867,33 +2017,31 @@ class PipelineService:
         # Re-interpolate whichever nav channels are now available.
         # Channels whose sources were not provided are left unchanged.
         if "lat" in nav_sources:
-            master["lat"] = SensorService.interpolate_series(
-                master["unix_time"], nav_sources["lat"]["unix_time"], nav_sources["lat"]["value"]
-            )
+            master["lat"] = _nav_interp(master["unix_time"], nav_sources["lat"])
         if "lon" in nav_sources:
-            master["lon"] = SensorService.interpolate_series(
-                master["unix_time"], nav_sources["lon"]["unix_time"], nav_sources["lon"]["value"]
-            )
+            master["lon"] = _nav_interp(master["unix_time"], nav_sources["lon"])
         if "alt" in nav_sources:
-            master["alt"] = SensorService.interpolate_series(
-                master["unix_time"], nav_sources["alt"]["unix_time"], nav_sources["alt"]["value"]
-            )
+            master["alt"] = _nav_interp(master["unix_time"], nav_sources["alt"])
         elif "alt" not in master.columns:
-            master["alt"] = 0.0
+            master["alt"] = np.nan
 
         # Re-interpolate optional nav channels when sources are available.
         for key in ("water_depth", "heading", "pitch", "roll"):
             if key in nav_sources:
-                master[key] = SensorService.interpolate_series(
-                    master["unix_time"], nav_sources[key]["unix_time"], nav_sources[key]["value"]
-                )
+                master[key] = _nav_interp(master["unix_time"], nav_sources[key], key)
 
         # Re-interpolate all sensor channels.
         for sensor_cfg, sensor_df in sensor_frames:
             for channel in sensor_cfg.channels:
                 display_name = channel.display_name or channel.source_column
+                # Same response-delay shift as _build_master_dataframe (review
+                # 06 P2-8): the two paths must agree once a delay is set.
+                delay = float(getattr(channel, "time_delay_s", 0.0) or 0.0)
                 master[display_name] = SensorService.interpolate_series(
-                    master["unix_time"], sensor_df["unix_time"], sensor_df[channel.source_column]
+                    master["unix_time"],
+                    sensor_df["unix_time"] - delay,
+                    sensor_df[channel.source_column],
+                    max_gap_s=_gap_limit(sensor_df["unix_time"], SENSOR_MAX_GAP_S),
                 )
 
         master = self._add_utm_columns(master)

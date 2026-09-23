@@ -157,6 +157,18 @@ NONFAUNA_EXCLUDE = frozenset({
 })
 
 
+# Weights/settings of the most recent detect_frames() call in this process, so
+# the product sidecars written later (to_geojson) can name the model even when
+# the caller concatenated per-segment tables and lost DataFrame.attrs.
+_LAST_RUN: dict = {}
+
+# Shown wherever a model class name reaches a human (review 02 P0-3): the
+# 499-class labels are zero-shot MBARI/FathomNet output on out-of-domain
+# imagery; only the coarse bucket was checked.
+LABEL_CAVEAT = ("Taxon labels are zero-shot FathomNet/MBARI model output, not "
+                "verified; only coarse buckets were checked.")
+
+
 def bucket_of(cls: str, buckets: dict[str, tuple[str, ...]] = BUCKETS) -> str:
     low = str(cls).lower()
     for name, keys in buckets.items():
@@ -193,6 +205,7 @@ def detect_frames(frame_dir, weights=WEIGHTS, conf=CONF, imgsz=IMGSZ,
     log(f"[fathomnet] {len(paths)} frames <- {frame_dir}")
     model = YOLO(str(weights))
     names = model.names
+    _LAST_RUN.update({"weights": str(weights), "conf": conf, "imgsz": imgsz})
 
     rows, t0 = [], time.time()
     for i in range(0, len(paths), batch):
@@ -231,6 +244,7 @@ def detect_frames(frame_dir, weights=WEIGHTS, conf=CONF, imgsz=IMGSZ,
     det.attrs["n_frames"] = len(paths)
     det.attrs["frames"] = [p.name for p in paths]
     det.attrs["runtime_s"] = time.time() - t0
+    det.attrs["weights"] = str(weights)
     log(f"[fathomnet] done: {len(det)} detections on "
         f"{det.fn.nunique() if len(det) else 0}/{len(paths)} frames in "
         f"{det.attrs['runtime_s']:.0f} s GPU")
@@ -287,7 +301,9 @@ def to_geojson(det_df, workspace_dir, out_path, density_path=None,
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": [float(e), float(n)]},
             "properties": {
-                "cls": d.cls, "bucket": d.bucket, "conf": round(float(d.conf), 4),
+                "bucket": d.bucket,
+                "model_label_unaudited": d.cls,
+                "conf": round(float(d.conf), 4),
                 "fn": d.fn, "alt": None if not np.isfinite(a) else round(float(a), 2),
                 "depth_m": None if not np.isfinite(dp) else round(float(dp), 2),
                 "seg": sg, "unix_time": float(ut),
@@ -301,7 +317,8 @@ def to_geojson(det_df, workspace_dir, out_path, density_path=None,
           "features": feats}
     out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(gj))
-    log(f"[fathomnet] {len(feats)} points -> {out_path}")
+    log(f"[fathomnet] {len(feats)} frame-detection points -> {out_path}")
+    _write_fauna_provenance(det_df, workspace_dir, out_path.parent, log)
 
     # per-frame density over ALL scanned frames (zeros included)
     frames = list(frames if frames is not None else det_df.attrs.get("frames", []))
@@ -322,13 +339,37 @@ def to_geojson(det_df, workspace_dir, out_path, density_path=None,
     return dens
 
 
+def _write_fauna_provenance(det_df, workspace_dir, out_dir, log=print) -> None:
+    """survey/fauna/fauna_provenance.json: code version, model weights (path,
+    size, sha256), the frame/nav inputs and the label caveat.  Best effort."""
+    try:
+        from reporting_common import provenance, write_json
+        weights = det_df.attrs.get("weights") or _LAST_RUN.get("weights") or ""
+        ws = Path(workspace_dir)
+        prov = provenance(
+            [ws / "inputs" / "interp_full.csv"],
+            hashed=[weights] if weights and Path(weights).is_file() else [],
+            model={"name": "FathomNet MBARI-315k YOLOv8 (zero-shot)",
+                   "weights": weights or "unknown",
+                   "conf": _LAST_RUN.get("conf"), "imgsz": _LAST_RUN.get("imgsz")},
+            n_frames=int(det_df.attrs.get("n_frames")
+                         or len(det_df.attrs.get("frames") or []) or 0),
+            label_caveat=LABEL_CAVEAT,
+            localisation="frame centre (nav fix), ~+/-3 m",
+            counts_are="frame detections, not individuals")
+        write_json(Path(out_dir) / "fauna_provenance.json", prov)
+    except Exception as exc:                                        # noqa: BLE001
+        log(f"[fathomnet] provenance sidecar not written: {exc}")
+
+
 def fish_frame_shortlist(det_df, workspace_dir, out_path, log=print) -> pd.DataFrame:
     """Frames ranked by likelihood of containing fish — a human-triage product.
 
     The fish bucket is recall-oriented (precision is knowingly poor); the point
     is that a biologist reviews this shortlist top-down instead of 5,000 frames.
-    Midwater/nonfauna exclusions still apply.  One row per frame: n_fish, best
-    confidence, classes seen, nav fix.
+    Midwater/nonfauna exclusions still apply.  One row per frame: the number
+    of fish-bucket frame detections, best confidence, the model's (unaudited)
+    labels, nav fix.
     """
     keep = det_df[(det_df.excluded == "") & (det_df.bucket == "fish")]
     if keep.empty:
@@ -336,9 +377,9 @@ def fish_frame_shortlist(det_df, workspace_dir, out_path, log=print) -> pd.DataF
         return pd.DataFrame()
     g = keep.groupby("fn")
     short = pd.DataFrame({
-        "n_fish": g.size(),
+        "n_fish_detections": g.size(),
         "max_conf": g.conf.max().round(4),
-        "classes": g.cls.agg(lambda s: "; ".join(sorted(set(s)))),
+        "model_labels_unaudited": g.cls.agg(lambda s: "; ".join(sorted(set(s)))),
     })
     nav = load_frame_nav(workspace_dir)
     short = short.join(nav[["unix_time", "easting", "northing", "alt", "depth",
@@ -346,7 +387,8 @@ def fish_frame_shortlist(det_df, workspace_dir, out_path, log=print) -> pd.DataF
     short = short.sort_values("max_conf", ascending=False).reset_index()
     out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
     short.to_csv(out_path, index=False)
-    log(f"[fathomnet] fish shortlist: {len(short)} frames -> {out_path}")
+    log(f"[fathomnet] fish shortlist: {len(short)} frames with fish-bucket "
+        f"detections -> {out_path}")
     return short
 
 
@@ -469,9 +511,10 @@ def _figure(res, dens, out_png, dive):
     fig.suptitle(f"{dive} — FathomNet megafauna density inside gas-anomaly "
                  f"windows vs rest of dive ({res['n_frames']} frames)",
                  color=INK, fontsize=12)
-    fig.text(0.5, 0.008, "frame-level localisation (frame centres, ~+/-3 m); "
-             "Mann-Whitney two-sided on per-frame counts; midwater / non-fauna "
-             "classes excluded", ha="center", color=MUT, fontsize=8)
+    fig.text(0.5, 0.008, "DESCRIPTIVE: overlapping frames re-detect the same "
+             "animal, so per-frame p-values overstate significance; frame-level "
+             "localisation (~+/-3 m); midwater / non-fauna classes excluded",
+             ha="center", color=MUT, fontsize=8)
     fig.tight_layout(rect=[0, 0.025, 1, 0.955])
     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=150, facecolor=BG)

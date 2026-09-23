@@ -44,10 +44,16 @@ Result JSON (always written, even on failure)
        "cameras_total": int, "cameras_aligned": int,
        "products": { "sparse_ply": "C:\\...", "dense_ply": ..., "mesh_obj": ...,
                      "orthomosaic_tif": ..., "dem_tif": ..., "report_pdf": ... },
+       "status": "ok" | "failed",   # ok = at least 2 cameras aligned
        "error": "..."          # present if this chunk failed (others still run)
      }, ...
   ]
 }
+
+Liveness: the first line printed is "[worker] pid <N>" (the Windows PID of
+this metashape.exe, used by the caller's watchdog to kill the process tree),
+and every long stage -- including matchPhotos/alignCameras -- reports
+progress, so a silent worker means a hung one.
 """
 
 import json
@@ -450,8 +456,9 @@ def process_chunk(chunk, spec, opt):
             match_kw["reference_preselection_mode"] = Metashape.ReferencePreselectionSource
         except AttributeError:
             pass  # older API: reference_preselection=True alone uses source coords
-    _call(chunk.matchPhotos, **match_kw)
-    _call(chunk.alignCameras, adaptive_fitting=opt["adaptive_fitting"])
+    _call(chunk.matchPhotos, progress=_progress("matchPhotos"), **match_kw)
+    _call(chunk.alignCameras, adaptive_fitting=opt["adaptive_fitting"],
+          progress=_progress("alignCameras"))
 
     aligned = sum(1 for c in chunk.cameras if c.transform is not None)
     log("aligned %d/%d cameras" % (aligned, len(chunk.cameras)))
@@ -559,16 +566,28 @@ def process_chunk(chunk, spec, opt):
         products["cameras_json"] = j("cameras.json")
     except Exception:                                          # noqa: BLE001
         pass
-    if opt["make_report"]:
+    # A chunk with nothing aligned exports a 0-byte report.pdf that was then
+    # listed as a deliverable (review 02 P1-5): skip it, and drop any empty file.
+    if opt["make_report"] and aligned >= 2:
         try:
             chunk.exportReport(j("report.pdf"))
-            products["report_pdf"] = j("report.pdf")
+            if os.path.getsize(j("report.pdf")) > 0:
+                products["report_pdf"] = j("report.pdf")
+            else:
+                os.remove(j("report.pdf"))
+                log("report export produced an empty file - removed")
         except Exception as e:                                 # noqa: BLE001
             log("report export failed: %r" % e)
 
-    return {"label": spec["label"], "run_dir": run_dir,
-            "cameras_total": len(chunk.cameras), "cameras_aligned": aligned,
-            "products": products}
+    out = {"label": spec["label"], "run_dir": run_dir,
+           "cameras_total": len(chunk.cameras), "cameras_aligned": aligned,
+           "products": products,
+           "status": "ok" if aligned >= 2 else "failed"}
+    if aligned < 2:
+        out["error"] = ("%d/%d cameras aligned - nothing to reconstruct"
+                        % (aligned, len(chunk.cameras)))
+        log("CHUNK '%s' FAILED: %s" % (spec["label"], out["error"]))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -586,6 +605,8 @@ def main():
         _LOG = open(params["log_path"], "w")
     except OSError:
         _LOG = None
+    import os
+    log("pid %d" % os.getpid())             # watchdog kill target (see docstring)
 
     try:
         opt = params["options"]
@@ -620,7 +641,7 @@ def main():
                 result["chunks"].append({
                     "label": spec["label"], "run_dir": spec["run_dir"],
                     "cameras_total": 0, "cameras_aligned": 0,
-                    "products": {}, "error": repr(e)})
+                    "products": {}, "status": "failed", "error": repr(e)})
             if opt["save_project"]:
                 doc.save()
 
