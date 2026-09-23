@@ -3230,7 +3230,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 rel = shown
             body += (f"<b>This REPLACES {len(replaced)} existing canonical file(s)</b> "
-                     "in place (no backup is kept), including:<br>"
+                     "(previous versions are moved to _superseded/&lt;timestamp&gt;/), "
+                     "including:<br>"
                      + "<br>".join(f"&nbsp;&nbsp;• {r}" for r in rel)
                      + (f"<br>&nbsp;&nbsp;… and {len(replaced) - len(shown)} more"
                         if len(replaced) > len(shown) else "")

@@ -603,25 +603,38 @@ def _census_outputs(ws: str) -> list[Path]:
     return [census / n for n in names if (census / n).is_file()]
 
 
-def replacement_preview(ws: str, job: Optional[Job] = None) -> list[str]:
+def replacement_preview(ws: str, job: Optional[Job] = None,
+                        type_keys: Optional[list] = None) -> list[str]:
     """Canonical files a Default run on ``job`` would REPLACE (moved to
     ``<ws>/_superseded/<stamp>/`` first).  Empty list = nothing is replaced.
 
     For the UI's confirmation dialog (review 06 P0-1): whole scope lists the
     fauna census, the anomaly catalog, the merged ortho/DEM and
-    SURVEY_REPORT.html; a job lists its own anomaly directory.
+    SURVEY_REPORT.html; a job lists its own anomaly directory.  ``type_keys``
+    narrows the preview to the product types about to run (a single-type
+    Generate); None means the full default suite.
     """
     scope = job or whole_job()
+    keys = None if type_keys is None else set(type_keys)
+
+    def wanted(*owners: str) -> bool:
+        return keys is None or bool(keys & set(owners))
+
     out: list[Path] = []
     if scope.is_whole:
-        out += _census_outputs(ws)
-        out += _anomaly_outputs(_anomaly_dir(ws, scope))
-        out += _merged_outputs(ws)
-        report = Path(ws) / "SURVEY_REPORT.html"
-        if report.is_file():
-            out.append(report)
+        if wanted("fauna_detection"):
+            out += _census_outputs(ws)
+        if wanted("anomaly_detection", "anomaly_trackline"):
+            out += _anomaly_outputs(_anomaly_dir(ws, scope))
+        if wanted("photogrammetry"):
+            out += _merged_outputs(ws)
+        if wanted("survey_report"):
+            report = Path(ws) / "SURVEY_REPORT.html"
+            if report.is_file():
+                out.append(report)
     else:
-        out += _anomaly_outputs(_anomaly_dir(ws, scope))
+        if wanted("anomaly_detection", "anomaly_trackline"):
+            out += _anomaly_outputs(_anomaly_dir(ws, scope))
     return [str(p) for p in out]
 
 
