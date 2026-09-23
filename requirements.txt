@@ -1,47 +1,42 @@
-# EPR Imaging App — Python dependencies
-# Install with: pip install -r requirements.txt
-# Recommended: Python 3.11 or 3.12
+# EPR Imaging simple UI (simple_main.py) -- Python dependencies
+# Floors = the versions the app was tested with (Python 3.13.13; 3.12 also works).
+# Exact tested set: requirements-lock.txt.
+#
+# Install torch FIRST from the index that matches your hardware, then the rest:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130   # NVIDIA GPU
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu     # CPU only
+#   pip install -r requirements.txt
+#
+# Not pip-installable (see README prerequisites): Agisoft Metashape Pro (Windows),
+# MATLAB + Signal Processing Toolbox, fauna detector weights (mbari_315k_yolov8.pt).
 
-# GUI framework
-PySide6>=6.7
+# --- UI (hard: app will not start without these) ---
+PySide6>=6.11.1
+numpy>=2.4.6
+pandas>=3.0.3
+matplotlib>=3.10.9
 
-# Data handling
-numpy>=1.26
-pandas>=2.2
+# --- Core processing ---
+scipy>=1.17.1             # interpolation, rasters, anomaly site catalogue
+rasterio>=1.5.0           # GeoTIFF rasters, ortho merge, viewers (bundles GDAL)
+opencv-python>=4.13.0     # frame extraction from video (bundles FFmpeg)
+Pillow>=12.2.0            # thumbnails, QC images, catalogue images
+utm>=0.8.1                # lat/lon -> UTM
+pykrige>=1.7.3            # kriging fill for sensor rasters / 3-D fields
+plyfile>=1.1.4            # PLY point-cloud output
+netCDF4>=1.7.4            # CF NetCDF export
+pyproj>=3.7.2             # anomaly UTM layers (sites/segments GeoJSON)
 
-# Video processing (frame extraction)
-opencv-python>=4.10
+# --- 3-D viewer (optional: the 3-D tab is hidden without these) ---
+pyvista>=0.49.0
+pyvistaqt>=0.13.1
+vtk>=9.7.0
 
-# Signal interpolation and scientific computing
-scipy>=1.13
+# --- Fauna detection (install torch/torchvision first, see above) ---
+torch>=2.14.0
+torchvision>=0.29.0
+ultralytics>=8.4.155
 
-# Ordinary Kriging interpolation for 2D and 3D sensor outputs
-pykrige>=1.7
-
-# Geospatial raster output (GeoTIFF generation)
-rasterio>=1.3
-
-# UTM coordinate projection (lat/lon → easting/northing)
-utm>=0.7
-
-# 3D point cloud and PLY file output (used by PointCloudPipeline)
-plyfile>=0.9
-
-# CF-compliant gridded NetCDF export (xarray / QGIS / Panoply interchange)
-netCDF4>=1.6
-
-# PNG image writing for raster slices (thread-safe; avoids pyplot Qt conflict)
-Pillow>=10.0
-
-# Colour mapping for point cloud / raster visualisation
-matplotlib>=3.8
-
-# Timeline plot widget
-pyqtgraph>=0.13
-
-# Anthropic API client (Claude AI assistant panel)
-anthropic>=0.25
-
-# 3D interactive viewer: point cloud / mesh overlay (PyVista + Qt interactor)
-pyvista>=0.44
-pyvistaqt>=0.11
+# --- Document outputs ---
+openpyxl>=3.1.5           # .xlsx table exports
+pypdfium2>=5.13.0         # PDF page rendering / previews
