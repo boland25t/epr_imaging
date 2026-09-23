@@ -41,7 +41,7 @@ grapher_matrix_figs/
 # Keep the curated handbook under docs/reports, but ignore generated PDFs
 # everywhere else.
 *.pdf
-!docs/reports/EPR_Imaging_Complete_Software_Documentation.pdf
+!archive/doc_generators/*.pdf
 # Per-channel classified-event exports (regenerated each run).
 anomaly_events_*.csv
 # Figure PNGs are intentionally KEPT tracked so results are browsable on GitHub.
